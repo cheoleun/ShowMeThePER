@@ -20,7 +20,7 @@ def normalize_stock_code(value: str | None) -> str:
     return code
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class KrxListing:
     base_date: str
     short_code: str
@@ -39,7 +39,7 @@ class KrxListing:
         return self.market in KOREAN_EQUITY_MARKETS
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class DartCompany:
     corp_code: str
     corp_name: str
@@ -55,7 +55,7 @@ class DartCompany:
         return bool(self.normalized_stock_code)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class MatchedCompany:
     corp_code: str
     corp_name: str
@@ -67,13 +67,13 @@ class MatchedCompany:
     corporation_name: str
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class AmbiguousMatch:
     listing: KrxListing
     candidates: tuple[DartCompany, ...]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class MatchResult:
     matched: tuple[MatchedCompany, ...]
     unmatched_listings: tuple[KrxListing, ...]
