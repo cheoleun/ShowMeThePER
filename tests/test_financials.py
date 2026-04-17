@@ -1,10 +1,18 @@
+from __future__ import annotations
+
 import json
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
 
-from show_me_the_per.financials import write_financial_statement_rows
+from show_me_the_per.financials import (
+    build_annual_period_values_from_rows,
+    map_financial_account_to_metric,
+    read_financial_statement_rows,
+    write_financial_period_values,
+    write_financial_statement_rows,
+)
 from show_me_the_per.models import FinancialStatementRow
 
 
@@ -39,6 +47,139 @@ class FinancialOutputTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["rows"], 1)
         self.assertEqual(payload["rows"][0]["current_amount"], "1000")
         self.assertIsNone(payload["rows"][0]["before_previous_amount"])
+
+    def test_read_financial_statement_rows_parses_decimal_amounts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "financials.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "corp_code": "00126380",
+                                "corp_name": "Samsung Electronics",
+                                "stock_code": "005930",
+                                "business_year": "2025",
+                                "report_code": "11011",
+                                "fs_div": "CFS",
+                                "fs_name": "Consolidated financial statements",
+                                "statement_div": "IS",
+                                "statement_name": "Income statement",
+                                "account_id": "ifrs-full_Revenue",
+                                "account_name": "Revenue",
+                                "current_term_name": "Current",
+                                "current_amount": "1,000",
+                                "previous_term_name": "Previous",
+                                "previous_amount": "-",
+                                "before_previous_term_name": "Before previous",
+                                "before_previous_amount": None,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            rows = read_financial_statement_rows(path)
+
+        self.assertEqual(rows[0].current_amount, Decimal("1000"))
+        self.assertIsNone(rows[0].previous_amount)
+
+    def test_build_annual_period_values_from_rows_maps_key_accounts(self) -> None:
+        rows = [
+            financial_row(
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("150"),
+                previous_amount=Decimal("120"),
+                before_previous_amount=Decimal("100"),
+            ),
+            financial_row(
+                account_id="dart_OperatingIncomeLoss",
+                account_name="영업이익",
+                current_amount=Decimal("30"),
+                previous_amount=None,
+                before_previous_amount=None,
+            ),
+            financial_row(
+                account_id="unknown",
+                account_name="Other",
+                current_amount=Decimal("999"),
+                previous_amount=None,
+                before_previous_amount=None,
+            ),
+        ]
+
+        values = build_annual_period_values_from_rows(rows)
+
+        self.assertEqual(len(values), 4)
+        self.assertEqual(
+            [(value.metric, value.fiscal_year, value.amount) for value in values],
+            [
+                ("revenue", 2025, Decimal("150")),
+                ("revenue", 2024, Decimal("120")),
+                ("revenue", 2023, Decimal("100")),
+                ("operating_income", 2025, Decimal("30")),
+            ],
+        )
+
+    def test_map_financial_account_to_metric_uses_name_fallback(self) -> None:
+        self.assertEqual(
+            map_financial_account_to_metric("", "당기순이익"),
+            "net_income",
+        )
+
+    def test_write_financial_period_values_serializes_values(self) -> None:
+        values = build_annual_period_values_from_rows(
+            [
+                financial_row(
+                    account_id="ifrs-full_ProfitLoss",
+                    account_name="Profit",
+                    current_amount=Decimal("20"),
+                    previous_amount=None,
+                    before_previous_amount=None,
+                )
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "values.json"
+            write_financial_period_values(path, values)
+
+            payload = json.loads(path.read_text("utf-8"))
+
+        self.assertEqual(payload["summary"]["values"], 1)
+        self.assertEqual(payload["values"][0]["metric"], "net_income")
+        self.assertEqual(payload["values"][0]["amount"], "20")
+
+
+def financial_row(
+    *,
+    account_id: str,
+    account_name: str,
+    current_amount: Decimal | None,
+    previous_amount: Decimal | None,
+    before_previous_amount: Decimal | None,
+) -> FinancialStatementRow:
+    return FinancialStatementRow(
+        corp_code="00126380",
+        corp_name="Samsung Electronics",
+        stock_code="005930",
+        business_year="2025",
+        report_code="11011",
+        fs_div="CFS",
+        fs_name="Consolidated financial statements",
+        statement_div="IS",
+        statement_name="Income statement",
+        account_id=account_id,
+        account_name=account_name,
+        current_term_name="Current",
+        current_amount=current_amount,
+        previous_term_name="Previous",
+        previous_amount=previous_amount,
+        before_previous_term_name="Before previous",
+        before_previous_amount=before_previous_amount,
+    )
 
 
 if __name__ == "__main__":

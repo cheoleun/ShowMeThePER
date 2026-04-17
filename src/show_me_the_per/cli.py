@@ -7,14 +7,24 @@ from pathlib import Path
 import sys
 
 from .company_master import write_company_master_outputs
-from .financials import write_financial_statement_rows
+from .financials import (
+    build_annual_period_values_from_rows,
+    read_financial_statement_rows,
+    write_financial_period_values,
+    write_financial_statement_rows,
+)
 from .growth import read_financial_period_values, write_growth_metrics_payload
 from .krx import KrxClient
 from .matching import match_listings_to_dart
 from .opendart import OpenDartClient
 
 
-COMMANDS = {"company-master", "financial-statements", "growth-metrics"}
+COMMANDS = {
+    "company-master",
+    "financial-statements",
+    "financial-period-values",
+    "growth-metrics",
+}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -117,6 +127,23 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to write financial statement rows JSON.",
     )
 
+    period_values_parser = subparsers.add_parser(
+        "financial-period-values",
+        help="Normalize collected financial statement rows into growth input values.",
+    )
+    period_values_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Path to financial statement rows JSON.",
+    )
+    period_values_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path to write normalized financial period values JSON.",
+    )
+
     growth_parser = subparsers.add_parser(
         "growth-metrics",
         help="Calculate YoY growth metrics from normalized financial period values.",
@@ -157,6 +184,8 @@ def main(argv: list[str] | None = None) -> None:
         run_company_master(args, parser)
     elif args.command == "financial-statements":
         run_financial_statements(args, parser)
+    elif args.command == "financial-period-values":
+        run_financial_period_values(args)
     elif args.command == "growth-metrics":
         run_growth_metrics(args)
 
@@ -224,6 +253,12 @@ def run_growth_metrics(args: argparse.Namespace) -> None:
         recent_annual_periods=args.recent_annual_periods,
         recent_quarterly_periods=args.recent_quarterly_periods,
     )
+
+
+def run_financial_period_values(args: argparse.Namespace) -> None:
+    rows = read_financial_statement_rows(args.input)
+    values = build_annual_period_values_from_rows(rows)
+    write_financial_period_values(args.output, values)
 
 
 if __name__ == "__main__":

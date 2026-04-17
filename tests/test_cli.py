@@ -60,6 +60,54 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["growth_points"], 2)
         self.assertTrue(payload["filter"]["results"][0]["passed"])
 
+    def test_financial_period_values_command_writes_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "financials.json"
+            output_path = Path(directory) / "values.json"
+            input_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "corp_code": "00126380",
+                                "corp_name": "Samsung Electronics",
+                                "stock_code": "005930",
+                                "business_year": "2025",
+                                "report_code": "11011",
+                                "fs_div": "CFS",
+                                "fs_name": "Consolidated financial statements",
+                                "statement_div": "IS",
+                                "statement_name": "Income statement",
+                                "account_id": "ifrs-full_Revenue",
+                                "account_name": "Revenue",
+                                "current_term_name": "Current",
+                                "current_amount": "130",
+                                "previous_term_name": "Previous",
+                                "previous_amount": "100",
+                                "before_previous_term_name": "Before previous",
+                                "before_previous_amount": None,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            main(
+                [
+                    "financial-period-values",
+                    "--input",
+                    str(input_path),
+                    "--output",
+                    str(output_path),
+                ]
+            )
+
+            payload = json.loads(output_path.read_text("utf-8"))
+
+        self.assertEqual(payload["summary"]["values"], 2)
+        self.assertEqual(payload["values"][0]["metric"], "revenue")
+
 
 if __name__ == "__main__":
     unittest.main()
