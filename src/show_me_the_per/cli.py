@@ -17,6 +17,14 @@ from .growth import read_financial_period_values, write_growth_metrics_payload
 from .krx import KrxClient
 from .matching import match_listings_to_dart
 from .opendart import OpenDartClient
+from .pipeline import (
+    DEFAULT_REPORT_CODES,
+    build_analysis_artifacts,
+    collect_financial_statement_rows,
+    parse_business_years,
+    resolve_corp_codes,
+    write_analysis_outputs,
+)
 from .rankings import (
     read_growth_metrics_payload,
     read_valuation_snapshots,
@@ -30,6 +38,7 @@ COMMANDS = {
     "financial-period-values",
     "growth-metrics",
     "rank-companies",
+    "collect-analysis",
 }
 
 
@@ -241,6 +250,82 @@ def main(argv: list[str] | None = None) -> None:
         help="Valuation ranking metric. Defaults to roe.",
     )
 
+    collect_parser = subparsers.add_parser(
+        "collect-analysis",
+        help="Collect financial statements and write analysis artifacts together.",
+    )
+    collect_parser.add_argument(
+        "--opendart-api-key",
+        default=os.getenv("OPENDART_API_KEY"),
+        help="OpenDART API key. Defaults to OPENDART_API_KEY.",
+    )
+    collect_parser.add_argument(
+        "--corp-code",
+        action="append",
+        default=[],
+        help="OpenDART corp code. May be repeated or comma-separated.",
+    )
+    collect_parser.add_argument(
+        "--corp-code-file",
+        type=Path,
+        help="Optional JSON, CSV, or text file containing corp codes.",
+    )
+    collect_parser.add_argument(
+        "--business-year",
+        action="append",
+        default=[],
+        help="Business year. May be repeated or comma-separated.",
+    )
+    collect_parser.add_argument(
+        "--year-from",
+        help="First business year to collect, for example 2015.",
+    )
+    collect_parser.add_argument(
+        "--year-to",
+        help="Last business year to collect, for example 2025.",
+    )
+    collect_parser.add_argument(
+        "--report-code",
+        action="append",
+        default=[],
+        help="OpenDART report code. Defaults to quarterly and annual reports.",
+    )
+    collect_parser.add_argument(
+        "--fs-div",
+        choices=["CFS", "OFS"],
+        help="Optional financial statement division.",
+    )
+    collect_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=100,
+        help="OpenDART corp code batch size. Defaults to 100.",
+    )
+    collect_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="Directory to write analysis JSON artifacts.",
+    )
+    collect_parser.add_argument(
+        "--threshold-percent",
+        type=Decimal,
+        default=Decimal("20"),
+        help="Minimum growth threshold for filter results. Defaults to 20.",
+    )
+    collect_parser.add_argument(
+        "--recent-annual-periods",
+        type=int,
+        default=3,
+        help="Annual periods that must all pass the threshold. Defaults to 3.",
+    )
+    collect_parser.add_argument(
+        "--recent-quarterly-periods",
+        type=int,
+        default=12,
+        help="Quarterly periods that must all pass the threshold. Defaults to 12.",
+    )
+
     args = parser.parse_args(args_list)
     if args.command == "company-master":
         run_company_master(args, parser)
@@ -252,6 +337,8 @@ def main(argv: list[str] | None = None) -> None:
         run_growth_metrics(args)
     elif args.command == "rank-companies":
         run_rank_companies(args)
+    elif args.command == "collect-analysis":
+        run_collect_analysis(args, parser)
 
 
 def run_company_master(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -344,6 +431,49 @@ def run_rank_companies(args: argparse.Namespace) -> None:
         min_roe=args.min_roe,
         rank_valuation_by=args.rank_valuation_by,
     )
+
+
+def run_collect_analysis(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> None:
+    if not args.opendart_api_key:
+        parser.error("--opendart-api-key or OPENDART_API_KEY is required.")
+
+    corp_codes = resolve_corp_codes(args.corp_code, args.corp_code_file)
+    if not corp_codes:
+        parser.error("--corp-code or --corp-code-file is required.")
+
+    try:
+        business_years = parse_business_years(
+            args.business_year,
+            year_from=args.year_from,
+            year_to=args.year_to,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if not business_years:
+        parser.error("--business-year or --year-from/--year-to is required.")
+
+    report_codes = parse_corp_code_args(args.report_code) or list(DEFAULT_REPORT_CODES)
+    rows = collect_financial_statement_rows(
+        OpenDartClient(args.opendart_api_key),
+        corp_codes=corp_codes,
+        business_years=business_years,
+        report_codes=report_codes,
+        fs_div=args.fs_div,
+        batch_size=args.batch_size,
+    )
+    artifacts = build_analysis_artifacts(
+        rows,
+        expected_corp_codes=corp_codes,
+        expected_business_years=business_years,
+        expected_report_codes=report_codes,
+        threshold_percent=args.threshold_percent,
+        recent_annual_periods=args.recent_annual_periods,
+        recent_quarterly_periods=args.recent_quarterly_periods,
+    )
+    write_analysis_outputs(args.output_dir, artifacts)
 
 
 if __name__ == "__main__":
