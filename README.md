@@ -12,6 +12,7 @@
 - 매칭 성공, 미매칭, 중복 후보 분리
 - 기업 마스터 JSON, CSV, Markdown 리포트 출력
 - OpenDART 다중회사 주요 재무계정 응답 파싱
+- OpenDART 주요 재무계정 row를 연간 성장률 계산용 기간값으로 정규화
 - 연간 YoY, 분기 YoY, 최근 4분기 합산 YoY 성장률 계산
 - 최근 N개 성장률이 모두 기준 이상인지 판정하는 기본 성장률 필터
 - API 키 없이 실행 가능한 단위 테스트
@@ -45,6 +46,15 @@ python -m show_me_the_per.cli financial-statements `
   --report-code 11011 `
   --fs-div CFS `
   --output data/financial-statements.json
+```
+
+수집한 주요 재무계정 row에서 매출, 영업이익, 순이익의 연간 기간값을 만들 수 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli financial-period-values `
+  --input data/financial-statements.json `
+  --output data/financial-period-values.json
 ```
 
 정규화된 기간별 재무값 JSON에서 성장률 지표와 기본 필터 결과를 계산할 수 있습니다.
