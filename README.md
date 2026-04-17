@@ -207,6 +207,18 @@ python -m show_me_the_per.cli company-growth-report `
   --output data/samsung-growth-report.html
 ```
 
+DB에 저장된 성장률 필터 결과를 여러 회사 기준으로 비교하는 정적 HTML 랭킹 리포트도 생성할 수 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli growth-ranking-report `
+  --database data/show-me-the-per.sqlite3 `
+  --growth-metric revenue `
+  --growth-series-type annual_yoy `
+  --limit 50 `
+  --output data/growth-ranking-report.html
+```
+
 ## 테스트
 
 ```powershell

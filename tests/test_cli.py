@@ -374,6 +374,57 @@ class CliTests(unittest.TestCase):
         self.assertIn("<html", html)
         self.assertIn("005930", html)
 
+    def test_growth_ranking_report_command_writes_html(self) -> None:
+        original_client = cli.OpenDartClient
+        cli.OpenDartClient = FakeOpenDartClient
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                output_dir = Path(directory) / "analysis"
+                database_path = Path(directory) / "analysis.sqlite3"
+                report_path = Path(directory) / "ranking.html"
+
+                main(
+                    [
+                        "collect-analysis",
+                        "--opendart-api-key",
+                        "test-key",
+                        "--corp-code",
+                        "00126380",
+                        "--business-year",
+                        "2025",
+                        "--report-code",
+                        "11011",
+                        "--output-dir",
+                        str(output_dir),
+                        "--database",
+                        str(database_path),
+                        "--recent-annual-periods",
+                        "1",
+                        "--recent-quarterly-periods",
+                        "1",
+                    ]
+                )
+                main(
+                    [
+                        "growth-ranking-report",
+                        "--database",
+                        str(database_path),
+                        "--growth-metric",
+                        "revenue",
+                        "--growth-series-type",
+                        "annual_yoy",
+                        "--output",
+                        str(report_path),
+                    ]
+                )
+                html = report_path.read_text("utf-8")
+        finally:
+            cli.OpenDartClient = original_client
+
+        self.assertIn("<html", html)
+        self.assertIn("성장률 랭킹 리포트", html)
+        self.assertIn("005930", html)
+
     def test_collect_analysis_command_records_partial_failures(self) -> None:
         original_client = cli.OpenDartClient
         cli.OpenDartClient = PartiallyFailingOpenDartClient
