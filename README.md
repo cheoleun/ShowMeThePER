@@ -13,8 +13,10 @@
 - 기업 마스터 JSON, CSV, Markdown 리포트 출력
 - OpenDART 다중회사 주요 재무계정 응답 파싱
 - OpenDART 주요 재무계정 row를 연간 성장률 계산용 기간값으로 정규화
+- 보고서별 누적값에서 분기별 표준 재무값 산출
 - 연간 YoY, 분기 YoY, 최근 4분기 합산 YoY 성장률 계산
 - 최근 N개 성장률이 모두 기준 이상인지 판정하는 기본 성장률 필터
+- 성장률, PER, PBR, ROE 기반 순위 JSON 출력
 - API 키 없이 실행 가능한 단위 테스트
 
 ## CLI
@@ -88,6 +90,39 @@ python -m show_me_the_per.cli growth-metrics `
       "fiscal_year": 2025,
       "fiscal_quarter": 1,
       "amount": "79000000000000"
+    }
+  ]
+}
+```
+
+성장률 결과와 선택적인 PER/PBR/ROE JSON을 조합해 순위를 만들 수 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli rank-companies `
+  --growth-input data/growth-metrics.json `
+  --valuation-input data/valuation-metrics.json `
+  --output data/rankings.json `
+  --growth-metric revenue `
+  --growth-series-type annual_yoy `
+  --max-per 15 `
+  --max-pbr 1 `
+  --min-roe 20 `
+  --rank-valuation-by roe
+```
+
+PER/PBR/ROE 입력 JSON은 다음처럼 `companies` 배열을 사용합니다.
+
+```json
+{
+  "companies": [
+    {
+      "corp_code": "00126380",
+      "corp_name": "삼성전자",
+      "stock_code": "005930",
+      "per": "12.5",
+      "pbr": "1.2",
+      "roe": "18.4"
     }
   ]
 }

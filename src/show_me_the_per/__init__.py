@@ -8,4 +8,5 @@ __all__ = [
     "company_master",
     "financials",
     "growth",
+    "rankings",
 ]

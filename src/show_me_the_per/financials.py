@@ -15,6 +15,23 @@ from .models import (
 METRIC_REVENUE = "revenue"
 METRIC_OPERATING_INCOME = "operating_income"
 METRIC_NET_INCOME = "net_income"
+METRIC_ORDER = {
+    METRIC_REVENUE: 0,
+    METRIC_OPERATING_INCOME: 1,
+    METRIC_NET_INCOME: 2,
+}
+
+REPORT_CODE_ANNUAL = "11011"
+REPORT_CODE_Q1 = "11013"
+REPORT_CODE_HALF = "11012"
+REPORT_CODE_Q3 = "11014"
+
+REPORT_CODE_QUARTERS = {
+    REPORT_CODE_Q1: 1,
+    REPORT_CODE_HALF: 2,
+    REPORT_CODE_Q3: 3,
+    REPORT_CODE_ANNUAL: 4,
+}
 
 ACCOUNT_ID_METRICS = {
     "ifrs-full_Revenue": METRIC_REVENUE,
@@ -72,8 +89,11 @@ def read_financial_statement_rows(path: Path) -> list[FinancialStatementRow]:
 def build_annual_period_values_from_rows(
     rows: list[FinancialStatementRow],
 ) -> list[FinancialPeriodValue]:
-    values: list[FinancialPeriodValue] = []
+    selected_values: dict[tuple[str, str, int], tuple[int, FinancialPeriodValue]] = {}
     for row in rows:
+        if row.report_code != REPORT_CODE_ANNUAL:
+            continue
+
         metric = map_financial_account_to_metric(row.account_id, row.account_name)
         if metric is None:
             continue
@@ -83,15 +103,89 @@ def build_annual_period_values_from_rows(
         except ValueError:
             continue
 
-        values.extend(
-            _annual_values_for_amounts(
-                row=row,
-                metric=metric,
-                current_year=current_year,
-            )
+        for source_year, value in _annual_values_for_amounts(
+            row=row,
+            metric=metric,
+            current_year=current_year,
+        ):
+            key = (value.corp_code, value.metric, value.fiscal_year)
+            previous = selected_values.get(key)
+            if previous is None or source_year > previous[0]:
+                selected_values[key] = (source_year, value)
+
+    return [
+        value
+        for _, value in sorted(
+            selected_values.values(),
+            key=lambda item: (
+                item[1].corp_code,
+                METRIC_ORDER.get(item[1].metric, 999),
+                -item[1].fiscal_year,
+            ),
         )
+    ]
+
+
+def build_quarterly_period_values_from_rows(
+    rows: list[FinancialStatementRow],
+) -> list[FinancialPeriodValue]:
+    cumulative_values: dict[tuple[str, str, int], dict[int, Decimal]] = {}
+
+    for row in rows:
+        quarter = REPORT_CODE_QUARTERS.get(row.report_code)
+        if quarter is None or row.current_amount is None:
+            continue
+
+        metric = map_financial_account_to_metric(row.account_id, row.account_name)
+        if metric is None:
+            continue
+
+        try:
+            fiscal_year = int(row.business_year)
+        except ValueError:
+            continue
+
+        key = (row.corp_code, metric, fiscal_year)
+        cumulative_values.setdefault(key, {})[quarter] = row.current_amount
+
+    values: list[FinancialPeriodValue] = []
+    for (corp_code, metric, fiscal_year), by_quarter in sorted(
+        cumulative_values.items(),
+        key=lambda item: (
+            item[0][0],
+            METRIC_ORDER.get(item[0][1], 999),
+            item[0][2],
+        ),
+    ):
+        previous_cumulative = Decimal("0")
+        for quarter in range(1, 5):
+            cumulative_amount = by_quarter.get(quarter)
+            if cumulative_amount is None:
+                break
+
+            amount = cumulative_amount - previous_cumulative
+            values.append(
+                FinancialPeriodValue(
+                    corp_code=corp_code,
+                    metric=metric,
+                    period_type="quarter",
+                    fiscal_year=fiscal_year,
+                    fiscal_quarter=quarter,
+                    amount=amount,
+                )
+            )
+            previous_cumulative = cumulative_amount
 
     return values
+
+
+def build_period_values_from_rows(
+    rows: list[FinancialStatementRow],
+) -> list[FinancialPeriodValue]:
+    return [
+        *build_annual_period_values_from_rows(rows),
+        *build_quarterly_period_values_from_rows(rows),
+    ]
 
 
 def map_financial_account_to_metric(
@@ -145,19 +239,22 @@ def _annual_values_for_amounts(
     row: FinancialStatementRow,
     metric: str,
     current_year: int,
-) -> list[FinancialPeriodValue]:
+) -> list[tuple[int, FinancialPeriodValue]]:
     amounts = (
         (current_year, row.current_amount),
         (current_year - 1, row.previous_amount),
         (current_year - 2, row.before_previous_amount),
     )
     return [
-        FinancialPeriodValue(
-            corp_code=row.corp_code,
-            metric=metric,
-            period_type="annual",
-            fiscal_year=year,
-            amount=amount,
+        (
+            current_year,
+            FinancialPeriodValue(
+                corp_code=row.corp_code,
+                metric=metric,
+                period_type="annual",
+                fiscal_year=year,
+                amount=amount,
+            ),
         )
         for year, amount in amounts
         if amount is not None
