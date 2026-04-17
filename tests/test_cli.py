@@ -105,8 +105,71 @@ class CliTests(unittest.TestCase):
 
             payload = json.loads(output_path.read_text("utf-8"))
 
-        self.assertEqual(payload["summary"]["values"], 2)
+        self.assertEqual(payload["summary"]["values"], 3)
         self.assertEqual(payload["values"][0]["metric"], "revenue")
+
+    def test_rank_companies_command_writes_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            growth_path = Path(directory) / "growth.json"
+            valuation_path = Path(directory) / "valuation.json"
+            output_path = Path(directory) / "rankings.json"
+            growth_path.write_text(
+                json.dumps(
+                    {
+                        "filter": {
+                            "results": [
+                                {
+                                    "corp_code": "00126380",
+                                    "metric": "revenue",
+                                    "series_type": "annual_yoy",
+                                    "recent_periods": 3,
+                                    "minimum_growth_rate": "25",
+                                    "passed": True,
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            valuation_path.write_text(
+                json.dumps(
+                    {
+                        "companies": [
+                            {
+                                "corp_code": "00126380",
+                                "corp_name": "Samsung Electronics",
+                                "stock_code": "005930",
+                                "per": "8",
+                                "pbr": "0.9",
+                                "roe": "22",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            main(
+                [
+                    "rank-companies",
+                    "--growth-input",
+                    str(growth_path),
+                    "--valuation-input",
+                    str(valuation_path),
+                    "--output",
+                    str(output_path),
+                    "--max-per",
+                    "10",
+                    "--min-roe",
+                    "20",
+                ]
+            )
+
+            payload = json.loads(output_path.read_text("utf-8"))
+
+        self.assertEqual(payload["growth_rankings"][0]["corp_code"], "00126380")
+        self.assertEqual(payload["valuation_rankings"][0]["rank_value"], "22")
 
 
 if __name__ == "__main__":
