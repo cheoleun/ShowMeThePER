@@ -10,4 +10,5 @@ __all__ = [
     "growth",
     "rankings",
     "pipeline",
+    "storage",
 ]

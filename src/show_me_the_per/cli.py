@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from decimal import Decimal
+import json
 import os
 from pathlib import Path
 import sys
@@ -20,7 +21,7 @@ from .opendart import OpenDartClient
 from .pipeline import (
     DEFAULT_REPORT_CODES,
     build_analysis_artifacts,
-    collect_financial_statement_rows,
+    collect_financial_statement_run,
     parse_business_years,
     resolve_corp_codes,
     write_analysis_outputs,
@@ -29,6 +30,12 @@ from .rankings import (
     read_growth_metrics_payload,
     read_valuation_snapshots,
     write_ranking_payload,
+)
+from .storage import (
+    build_database_growth_ranking_payload,
+    store_analysis_artifacts,
+    store_analysis_directory,
+    summarize_database,
 )
 
 
@@ -39,6 +46,9 @@ COMMANDS = {
     "growth-metrics",
     "rank-companies",
     "collect-analysis",
+    "analysis-to-db",
+    "database-summary",
+    "rank-growth-from-db",
 }
 
 
@@ -302,10 +312,20 @@ def main(argv: list[str] | None = None) -> None:
         help="OpenDART corp code batch size. Defaults to 100.",
     )
     collect_parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop immediately when an OpenDART collection request fails.",
+    )
+    collect_parser.add_argument(
         "--output-dir",
         type=Path,
         required=True,
         help="Directory to write analysis JSON artifacts.",
+    )
+    collect_parser.add_argument(
+        "--database",
+        type=Path,
+        help="Optional SQLite database path to store collected analysis artifacts.",
     )
     collect_parser.add_argument(
         "--threshold-percent",
@@ -326,6 +346,78 @@ def main(argv: list[str] | None = None) -> None:
         help="Quarterly periods that must all pass the threshold. Defaults to 12.",
     )
 
+    db_parser = subparsers.add_parser(
+        "analysis-to-db",
+        help="Store an existing analysis output directory into a SQLite database.",
+    )
+    db_parser.add_argument(
+        "--input-dir",
+        type=Path,
+        required=True,
+        help="Directory containing collect-analysis JSON artifacts.",
+    )
+    db_parser.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path.",
+    )
+    db_parser.add_argument(
+        "--summary-output",
+        type=Path,
+        help="Optional path to write database summary JSON.",
+    )
+
+    db_summary_parser = subparsers.add_parser(
+        "database-summary",
+        help="Show SQLite database table counts.",
+    )
+    db_summary_parser.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path.",
+    )
+    db_summary_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional path to write database summary JSON.",
+    )
+
+    db_growth_rank_parser = subparsers.add_parser(
+        "rank-growth-from-db",
+        help="Build growth rankings from stored SQLite growth filter results.",
+    )
+    db_growth_rank_parser.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path.",
+    )
+    db_growth_rank_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional path to write growth ranking JSON.",
+    )
+    db_growth_rank_parser.add_argument(
+        "--growth-metric",
+        help="Optional growth metric to rank, for example revenue.",
+    )
+    db_growth_rank_parser.add_argument(
+        "--growth-series-type",
+        help="Optional growth series to rank, for example annual_yoy.",
+    )
+    db_growth_rank_parser.add_argument(
+        "--include-failed-growth",
+        action="store_true",
+        help="Include failed growth filters in DB growth rankings.",
+    )
+    db_growth_rank_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Optional maximum number of ranking rows.",
+    )
+
     args = parser.parse_args(args_list)
     if args.command == "company-master":
         run_company_master(args, parser)
@@ -339,6 +431,12 @@ def main(argv: list[str] | None = None) -> None:
         run_rank_companies(args)
     elif args.command == "collect-analysis":
         run_collect_analysis(args, parser)
+    elif args.command == "analysis-to-db":
+        run_analysis_to_db(args)
+    elif args.command == "database-summary":
+        run_database_summary(args)
+    elif args.command == "rank-growth-from-db":
+        run_rank_growth_from_db(args)
 
 
 def run_company_master(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -456,16 +554,18 @@ def run_collect_analysis(
         parser.error("--business-year or --year-from/--year-to is required.")
 
     report_codes = parse_corp_code_args(args.report_code) or list(DEFAULT_REPORT_CODES)
-    rows = collect_financial_statement_rows(
+    run = collect_financial_statement_run(
         OpenDartClient(args.opendart_api_key),
         corp_codes=corp_codes,
         business_years=business_years,
         report_codes=report_codes,
         fs_div=args.fs_div,
         batch_size=args.batch_size,
+        continue_on_error=not args.fail_fast,
     )
     artifacts = build_analysis_artifacts(
-        rows,
+        run.rows,
+        collection_errors=run.errors,
         expected_corp_codes=corp_codes,
         expected_business_years=business_years,
         expected_report_codes=report_codes,
@@ -474,6 +574,38 @@ def run_collect_analysis(
         recent_quarterly_periods=args.recent_quarterly_periods,
     )
     write_analysis_outputs(args.output_dir, artifacts)
+    if args.database is not None:
+        store_analysis_artifacts(args.database, artifacts)
+
+
+def run_analysis_to_db(args: argparse.Namespace) -> None:
+    summary = store_analysis_directory(args.database, args.input_dir)
+    write_or_print_json(summary, args.summary_output)
+
+
+def run_database_summary(args: argparse.Namespace) -> None:
+    summary = summarize_database(args.database)
+    write_or_print_json(summary, args.output)
+
+
+def run_rank_growth_from_db(args: argparse.Namespace) -> None:
+    payload = build_database_growth_ranking_payload(
+        args.database,
+        growth_metric=args.growth_metric,
+        growth_series_type=args.growth_series_type,
+        include_failed_growth=args.include_failed_growth,
+        limit=args.limit,
+    )
+    write_or_print_json(payload, args.output)
+
+
+def write_or_print_json(payload: dict[str, object], output: Path | None) -> None:
+    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if output is None:
+        print(content, end="")
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(content, encoding="utf-8")
 
 
 if __name__ == "__main__":

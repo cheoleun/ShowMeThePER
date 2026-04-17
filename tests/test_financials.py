@@ -152,7 +152,7 @@ class FinancialOutputTests(unittest.TestCase):
         value_2024 = [value for value in values if value.fiscal_year == 2024][0]
         self.assertEqual(value_2024.amount, Decimal("105"))
 
-    def test_build_quarterly_period_values_from_cumulative_reports(self) -> None:
+    def test_build_quarterly_period_values_from_period_reports(self) -> None:
         rows = [
             financial_row(
                 report_code="11013",
@@ -166,7 +166,7 @@ class FinancialOutputTests(unittest.TestCase):
                 report_code="11012",
                 account_id="ifrs-full_Revenue",
                 account_name="Revenue",
-                current_amount=Decimal("250"),
+                current_amount=Decimal("150"),
                 previous_amount=None,
                 before_previous_amount=None,
             ),
@@ -174,7 +174,7 @@ class FinancialOutputTests(unittest.TestCase):
                 report_code="11014",
                 account_id="ifrs-full_Revenue",
                 account_name="Revenue",
-                current_amount=Decimal("450"),
+                current_amount=Decimal("200"),
                 previous_amount=None,
                 before_previous_amount=None,
             ),
@@ -199,6 +199,32 @@ class FinancialOutputTests(unittest.TestCase):
                 (4, Decimal("250")),
             ],
         )
+
+    def test_build_quarterly_period_values_prefers_consolidated_rows(self) -> None:
+        rows = [
+            financial_row(
+                report_code="11013",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("80"),
+                previous_amount=None,
+                before_previous_amount=None,
+                fs_div="CFS",
+            ),
+            financial_row(
+                report_code="11013",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("55"),
+                previous_amount=None,
+                before_previous_amount=None,
+                fs_div="OFS",
+            ),
+        ]
+
+        values = build_quarterly_period_values_from_rows(rows)
+
+        self.assertEqual(values[0].amount, Decimal("80"))
 
     def test_build_period_values_includes_annual_and_quarterly_values(self) -> None:
         rows = [
@@ -266,6 +292,7 @@ def financial_row(
     before_previous_amount: Decimal | None,
     report_code: str = "11011",
     business_year: str = "2025",
+    fs_div: str = "CFS",
 ) -> FinancialStatementRow:
     return FinancialStatementRow(
         corp_code="00126380",
@@ -273,7 +300,7 @@ def financial_row(
         stock_code="005930",
         business_year=business_year,
         report_code=report_code,
-        fs_div="CFS",
+        fs_div=fs_div,
         fs_name="Consolidated financial statements",
         statement_div="IS",
         statement_name="Income statement",

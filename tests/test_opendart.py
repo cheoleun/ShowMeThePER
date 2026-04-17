@@ -1,9 +1,13 @@
 from io import BytesIO
+import json
 from zipfile import ZipFile
 import unittest
+
 from decimal import Decimal
 
+from show_me_the_per import opendart
 from show_me_the_per.opendart import (
+    OpenDartClient,
     chunked,
     parse_corp_code_xml,
     parse_corp_code_zip,
@@ -92,8 +96,70 @@ class OpenDartParserTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
+    def test_fetch_major_accounts_filters_rows_by_requested_fs_div(self) -> None:
+        original_urlopen = opendart.urlopen
+        payload = {
+            "status": "000",
+            "list": [
+                major_account_item("CFS", "100"),
+                major_account_item("OFS", "80"),
+            ],
+        }
+        opendart.urlopen = lambda url, timeout: FakeResponse(
+            json.dumps(payload).encode("utf-8")
+        )
+        try:
+            rows = OpenDartClient("test-key").fetch_major_accounts(
+                ["00126380"],
+                business_year="2025",
+                report_code="11011",
+                fs_div="CFS",
+            )
+        finally:
+            opendart.urlopen = original_urlopen
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].fs_div, "CFS")
+        self.assertEqual(rows[0].current_amount, Decimal("100"))
+
     def test_chunked_splits_values(self) -> None:
         self.assertEqual(chunked(["a", "b", "c"], 2), [["a", "b"], ["c"]])
+
+
+class FakeResponse:
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self.content
+
+
+def major_account_item(fs_div: str, amount: str) -> dict[str, str]:
+    return {
+        "corp_code": "00126380",
+        "corp_name": "Samsung Electronics",
+        "stock_code": "005930",
+        "bsns_year": "2025",
+        "reprt_code": "11011",
+        "fs_div": fs_div,
+        "fs_nm": "Financial statements",
+        "sj_div": "IS",
+        "sj_nm": "Income statement",
+        "account_id": "ifrs-full_Revenue",
+        "account_nm": "Revenue",
+        "thstrm_nm": "Current",
+        "thstrm_amount": amount,
+        "frmtrm_nm": "Previous",
+        "frmtrm_amount": "90",
+        "bfefrmtrm_nm": "Before previous",
+        "bfefrmtrm_amount": "80",
+    }
 
 
 if __name__ == "__main__":
