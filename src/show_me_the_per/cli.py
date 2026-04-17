@@ -8,7 +8,7 @@ import sys
 
 from .company_master import write_company_master_outputs
 from .financials import (
-    build_annual_period_values_from_rows,
+    build_period_values_from_rows,
     read_financial_statement_rows,
     write_financial_period_values,
     write_financial_statement_rows,
@@ -17,6 +17,11 @@ from .growth import read_financial_period_values, write_growth_metrics_payload
 from .krx import KrxClient
 from .matching import match_listings_to_dart
 from .opendart import OpenDartClient
+from .rankings import (
+    read_growth_metrics_payload,
+    read_valuation_snapshots,
+    write_ranking_payload,
+)
 
 
 COMMANDS = {
@@ -24,6 +29,7 @@ COMMANDS = {
     "financial-statements",
     "financial-period-values",
     "growth-metrics",
+    "rank-companies",
 }
 
 
@@ -179,6 +185,62 @@ def main(argv: list[str] | None = None) -> None:
         help="Quarterly periods that must all pass the threshold. Defaults to 12.",
     )
 
+    ranking_parser = subparsers.add_parser(
+        "rank-companies",
+        help="Build growth and valuation rankings from analysis JSON files.",
+    )
+    ranking_parser.add_argument(
+        "--growth-input",
+        type=Path,
+        required=True,
+        help="Path to growth metrics JSON.",
+    )
+    ranking_parser.add_argument(
+        "--valuation-input",
+        type=Path,
+        help="Optional path to PER/PBR/ROE valuation JSON.",
+    )
+    ranking_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path to write ranking JSON.",
+    )
+    ranking_parser.add_argument(
+        "--growth-metric",
+        help="Optional growth metric to rank, for example revenue.",
+    )
+    ranking_parser.add_argument(
+        "--growth-series-type",
+        help="Optional growth series to rank, for example annual_yoy.",
+    )
+    ranking_parser.add_argument(
+        "--include-failed-growth",
+        action="store_true",
+        help="Include failed growth filters in growth rankings.",
+    )
+    ranking_parser.add_argument(
+        "--max-per",
+        type=Decimal,
+        help="Optional PER upper bound for valuation filtering.",
+    )
+    ranking_parser.add_argument(
+        "--max-pbr",
+        type=Decimal,
+        help="Optional PBR upper bound for valuation filtering.",
+    )
+    ranking_parser.add_argument(
+        "--min-roe",
+        type=Decimal,
+        help="Optional ROE lower bound for valuation filtering.",
+    )
+    ranking_parser.add_argument(
+        "--rank-valuation-by",
+        choices=["per", "pbr", "roe"],
+        default="roe",
+        help="Valuation ranking metric. Defaults to roe.",
+    )
+
     args = parser.parse_args(args_list)
     if args.command == "company-master":
         run_company_master(args, parser)
@@ -188,6 +250,8 @@ def main(argv: list[str] | None = None) -> None:
         run_financial_period_values(args)
     elif args.command == "growth-metrics":
         run_growth_metrics(args)
+    elif args.command == "rank-companies":
+        run_rank_companies(args)
 
 
 def run_company_master(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -257,8 +321,29 @@ def run_growth_metrics(args: argparse.Namespace) -> None:
 
 def run_financial_period_values(args: argparse.Namespace) -> None:
     rows = read_financial_statement_rows(args.input)
-    values = build_annual_period_values_from_rows(rows)
+    values = build_period_values_from_rows(rows)
     write_financial_period_values(args.output, values)
+
+
+def run_rank_companies(args: argparse.Namespace) -> None:
+    growth_payload = read_growth_metrics_payload(args.growth_input)
+    valuations = (
+        read_valuation_snapshots(args.valuation_input)
+        if args.valuation_input is not None
+        else []
+    )
+    write_ranking_payload(
+        args.output,
+        growth_payload,
+        valuations,
+        growth_metric=args.growth_metric,
+        growth_series_type=args.growth_series_type,
+        include_failed_growth=args.include_failed_growth,
+        max_per=args.max_per,
+        max_pbr=args.max_pbr,
+        min_roe=args.min_roe,
+        rank_valuation_by=args.rank_valuation_by,
+    )
 
 
 if __name__ == "__main__":
