@@ -110,6 +110,40 @@ class FinancialStatementRow:
     before_previous_amount: Decimal | None
 
 
+@dataclass(frozen=True)
+class FinancialPeriodValue:
+    corp_code: str
+    metric: str
+    period_type: str
+    fiscal_year: int
+    amount: Decimal
+    fiscal_quarter: int | None = None
+
+    @property
+    def period_label(self) -> str:
+        if self.period_type == "quarter":
+            return f"{self.fiscal_year}Q{self.fiscal_quarter}"
+        return str(self.fiscal_year)
+
+
+@dataclass(frozen=True)
+class GrowthPoint:
+    corp_code: str
+    metric: str
+    series_type: str
+    fiscal_year: int
+    fiscal_quarter: int | None
+    amount: Decimal
+    base_amount: Decimal | None
+    growth_rate: Decimal | None
+
+    @property
+    def period_label(self) -> str:
+        if self.fiscal_quarter is not None:
+            return f"{self.fiscal_year}Q{self.fiscal_quarter}"
+        return str(self.fiscal_year)
+
+
 def parse_decimal_amount(value: str | None) -> Decimal | None:
     if value is None:
         return None
