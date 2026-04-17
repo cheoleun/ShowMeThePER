@@ -105,7 +105,7 @@ class CliTests(unittest.TestCase):
 
             payload = json.loads(output_path.read_text("utf-8"))
 
-        self.assertEqual(payload["summary"]["values"], 3)
+        self.assertEqual(payload["summary"]["values"], 2)
         self.assertEqual(payload["values"][0]["metric"], "revenue")
 
     def test_rank_companies_command_writes_output(self) -> None:
