@@ -5,4 +5,6 @@ __all__ = [
     "krx",
     "opendart",
     "matching",
+    "company_master",
+    "financials",
 ]

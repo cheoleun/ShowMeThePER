@@ -10,17 +10,39 @@
 - OpenDART 고유번호 ZIP/XML 응답 파싱
 - KRX 단축코드와 OpenDART `stock_code` 기반 매칭
 - 매칭 성공, 미매칭, 중복 후보 분리
+- 기업 마스터 JSON, CSV, Markdown 리포트 출력
+- OpenDART 다중회사 주요 재무계정 응답 파싱
 - API 키 없이 실행 가능한 단위 테스트
 
 ## CLI
 
-환경 변수 또는 인자로 API 키를 넘겨 기업 마스터 JSON을 생성할 수 있습니다.
+환경 변수 또는 인자로 API 키를 넘겨 기업 마스터 파일을 생성할 수 있습니다.
 
 ```powershell
 $env:KRX_SERVICE_KEY="..."
 $env:OPENDART_API_KEY="..."
 $env:PYTHONPATH="src"
-python -m show_me_the_per.cli --output data/company-master.json
+python -m show_me_the_per.cli company-master `
+  --output data/company-master.json `
+  --matched-csv data/company-master-matched.csv `
+  --unmatched-csv data/company-master-unmatched.csv `
+  --ambiguous-json data/company-master-ambiguous.json `
+  --report data/company-master-report.md
+```
+
+하위 호환을 위해 `company-master` 서브커맨드는 생략할 수 있습니다.
+
+OpenDART 주요 재무계정도 기업 고유번호 기준으로 수집할 수 있습니다.
+
+```powershell
+$env:OPENDART_API_KEY="..."
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli financial-statements `
+  --corp-code 00126380 `
+  --business-year 2025 `
+  --report-code 11011 `
+  --fs-div CFS `
+  --output data/financial-statements.json
 ```
 
 ## 테스트
