@@ -8,6 +8,8 @@ from pathlib import Path
 
 from show_me_the_per.financials import (
     build_annual_period_values_from_rows,
+    build_period_values_from_rows,
+    build_quarterly_period_values_from_rows,
     map_financial_account_to_metric,
     read_financial_statement_rows,
     write_financial_period_values,
@@ -123,6 +125,108 @@ class FinancialOutputTests(unittest.TestCase):
             ],
         )
 
+    def test_build_annual_period_values_prefers_latest_restated_amount(self) -> None:
+        rows = [
+            financial_row(
+                report_code="11011",
+                business_year="2024",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("100"),
+                previous_amount=None,
+                before_previous_amount=None,
+            ),
+            financial_row(
+                report_code="11011",
+                business_year="2025",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("130"),
+                previous_amount=Decimal("105"),
+                before_previous_amount=None,
+            ),
+        ]
+
+        values = build_annual_period_values_from_rows(rows)
+
+        value_2024 = [value for value in values if value.fiscal_year == 2024][0]
+        self.assertEqual(value_2024.amount, Decimal("105"))
+
+    def test_build_quarterly_period_values_from_cumulative_reports(self) -> None:
+        rows = [
+            financial_row(
+                report_code="11013",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("100"),
+                previous_amount=None,
+                before_previous_amount=None,
+            ),
+            financial_row(
+                report_code="11012",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("250"),
+                previous_amount=None,
+                before_previous_amount=None,
+            ),
+            financial_row(
+                report_code="11014",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("450"),
+                previous_amount=None,
+                before_previous_amount=None,
+            ),
+            financial_row(
+                report_code="11011",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("700"),
+                previous_amount=None,
+                before_previous_amount=None,
+            ),
+        ]
+
+        values = build_quarterly_period_values_from_rows(rows)
+
+        self.assertEqual(
+            [(value.fiscal_quarter, value.amount) for value in values],
+            [
+                (1, Decimal("100")),
+                (2, Decimal("150")),
+                (3, Decimal("200")),
+                (4, Decimal("250")),
+            ],
+        )
+
+    def test_build_period_values_includes_annual_and_quarterly_values(self) -> None:
+        rows = [
+            financial_row(
+                report_code="11013",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("100"),
+                previous_amount=None,
+                before_previous_amount=None,
+            ),
+            financial_row(
+                report_code="11011",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_amount=Decimal("700"),
+                previous_amount=Decimal("500"),
+                before_previous_amount=None,
+            ),
+        ]
+
+        values = build_period_values_from_rows(rows)
+
+        self.assertEqual(
+            sorted({value.period_type for value in values}),
+            ["annual", "quarter"],
+        )
+
     def test_map_financial_account_to_metric_uses_name_fallback(self) -> None:
         self.assertEqual(
             map_financial_account_to_metric("", "당기순이익"),
@@ -160,13 +264,15 @@ def financial_row(
     current_amount: Decimal | None,
     previous_amount: Decimal | None,
     before_previous_amount: Decimal | None,
+    report_code: str = "11011",
+    business_year: str = "2025",
 ) -> FinancialStatementRow:
     return FinancialStatementRow(
         corp_code="00126380",
         corp_name="Samsung Electronics",
         stock_code="005930",
-        business_year="2025",
-        report_code="11011",
+        business_year=business_year,
+        report_code=report_code,
         fs_div="CFS",
         fs_name="Consolidated financial statements",
         statement_div="IS",
