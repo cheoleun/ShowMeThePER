@@ -565,6 +565,17 @@ def build_database_growth_ranking_payload(
     }
 
 
+def read_company_profile_from_database(
+    database_path: Path,
+    corp_code: str,
+) -> dict[str, str]:
+    company_index = _read_company_index(database_path)
+    return {
+        "corp_code": corp_code,
+        **company_index.get(corp_code, {"corp_name": "", "stock_code": ""}),
+    }
+
+
 def read_collection_errors(path: Path) -> list[CollectionError]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     raw_errors = payload.get("errors", []) if isinstance(payload, dict) else payload

@@ -20,6 +20,7 @@
 - 수집 요청 일부가 실패해도 계속 진행하고 오류 리포트 출력
 - 분석 산출물을 SQLite DB에 저장하고 요약 조회
 - SQLite DB에 저장된 성장률 필터 결과로 성장률 랭킹 조회
+- SQLite DB에 저장된 회사별 성장률을 정적 HTML 리포트로 출력
 - 성장률, PER, PBR, ROE 기반 순위 JSON 출력
 - API 키 없이 실행 가능한 단위 테스트
 
@@ -194,6 +195,17 @@ python -m show_me_the_per.cli rank-growth-from-db `
 기본값은 성장률 필터를 통과한 결과만 대상으로 삼습니다. 통과하지 못한 결과까지 함께 비교하려면 `--include-failed-growth`를 추가합니다.
 
 SQLite DB에는 원천 주요 재무계정 row, 표준 기간값, 성장률 포인트, 성장률 필터 결과, 수집 오류가 저장됩니다. `data/`와 DB 파일은 로컬 산출물로 보고 `.gitignore`에 포함합니다.
+
+회사별 성장률 숫자와 차트는 정적 HTML 리포트로 확인할 수 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli company-growth-report `
+  --database data/show-me-the-per.sqlite3 `
+  --corp-code 00126380 `
+  --recent-years 10 `
+  --output data/samsung-growth-report.html
+```
 
 ## 테스트
 
