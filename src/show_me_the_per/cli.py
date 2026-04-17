@@ -31,6 +31,10 @@ from .rankings import (
     read_valuation_snapshots,
     write_ranking_payload,
 )
+from .reports import (
+    build_company_growth_report_payload,
+    write_company_growth_report_html,
+)
 from .storage import (
     build_database_growth_ranking_payload,
     store_analysis_artifacts,
@@ -49,6 +53,7 @@ COMMANDS = {
     "analysis-to-db",
     "database-summary",
     "rank-growth-from-db",
+    "company-growth-report",
 }
 
 
@@ -418,6 +423,34 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional maximum number of ranking rows.",
     )
 
+    company_report_parser = subparsers.add_parser(
+        "company-growth-report",
+        help="Build a static HTML growth report for one company from SQLite data.",
+    )
+    company_report_parser.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path.",
+    )
+    company_report_parser.add_argument(
+        "--corp-code",
+        required=True,
+        help="OpenDART corp code.",
+    )
+    company_report_parser.add_argument(
+        "--recent-years",
+        type=int,
+        default=10,
+        help="Recent fiscal years to include. Defaults to 10.",
+    )
+    company_report_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path to write static HTML report.",
+    )
+
     args = parser.parse_args(args_list)
     if args.command == "company-master":
         run_company_master(args, parser)
@@ -437,6 +470,8 @@ def main(argv: list[str] | None = None) -> None:
         run_database_summary(args)
     elif args.command == "rank-growth-from-db":
         run_rank_growth_from_db(args)
+    elif args.command == "company-growth-report":
+        run_company_growth_report(args)
 
 
 def run_company_master(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -597,6 +632,15 @@ def run_rank_growth_from_db(args: argparse.Namespace) -> None:
         limit=args.limit,
     )
     write_or_print_json(payload, args.output)
+
+
+def run_company_growth_report(args: argparse.Namespace) -> None:
+    payload = build_company_growth_report_payload(
+        args.database,
+        corp_code=args.corp_code,
+        recent_years=args.recent_years,
+    )
+    write_company_growth_report_html(args.output, payload)
 
 
 def write_or_print_json(payload: dict[str, object], output: Path | None) -> None:

@@ -125,3 +125,13 @@ python -m show_me_the_per.cli rank-growth-from-db `
   --include-failed-growth `
   --output data/db-growth-ranking-all.json
 ```
+
+회사별 성장률 숫자와 차트는 HTML 리포트로 생성합니다.
+
+```powershell
+python -m show_me_the_per.cli company-growth-report `
+  --database data/show-me-the-per.sqlite3 `
+  --corp-code 00126380 `
+  --recent-years 10 `
+  --output data/samsung-growth-report.html
+```
