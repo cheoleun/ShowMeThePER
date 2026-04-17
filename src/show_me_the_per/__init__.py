@@ -7,4 +7,5 @@ __all__ = [
     "matching",
     "company_master",
     "financials",
+    "growth",
 ]

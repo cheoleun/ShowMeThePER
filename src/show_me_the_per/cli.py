@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal
 import os
 from pathlib import Path
 import sys
 
 from .company_master import write_company_master_outputs
 from .financials import write_financial_statement_rows
+from .growth import read_financial_period_values, write_growth_metrics_payload
 from .krx import KrxClient
 from .matching import match_listings_to_dart
 from .opendart import OpenDartClient
 
 
-COMMANDS = {"company-master", "financial-statements"}
+COMMANDS = {"company-master", "financial-statements", "growth-metrics"}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -115,11 +117,48 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to write financial statement rows JSON.",
     )
 
+    growth_parser = subparsers.add_parser(
+        "growth-metrics",
+        help="Calculate YoY growth metrics from normalized financial period values.",
+    )
+    growth_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Path to financial period values JSON.",
+    )
+    growth_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path to write growth metrics JSON.",
+    )
+    growth_parser.add_argument(
+        "--threshold-percent",
+        type=Decimal,
+        default=Decimal("20"),
+        help="Minimum growth threshold for filter results. Defaults to 20.",
+    )
+    growth_parser.add_argument(
+        "--recent-annual-periods",
+        type=int,
+        default=3,
+        help="Annual periods that must all pass the threshold. Defaults to 3.",
+    )
+    growth_parser.add_argument(
+        "--recent-quarterly-periods",
+        type=int,
+        default=12,
+        help="Quarterly periods that must all pass the threshold. Defaults to 12.",
+    )
+
     args = parser.parse_args(args_list)
     if args.command == "company-master":
         run_company_master(args, parser)
     elif args.command == "financial-statements":
         run_financial_statements(args, parser)
+    elif args.command == "growth-metrics":
+        run_growth_metrics(args)
 
 
 def run_company_master(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -174,6 +213,17 @@ def parse_corp_code_args(values: list[str]) -> list[str]:
             if code.strip()
         )
     return corp_codes
+
+
+def run_growth_metrics(args: argparse.Namespace) -> None:
+    values = read_financial_period_values(args.input)
+    write_growth_metrics_payload(
+        args.output,
+        values,
+        threshold_percent=args.threshold_percent,
+        recent_annual_periods=args.recent_annual_periods,
+        recent_quarterly_periods=args.recent_quarterly_periods,
+    )
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@
 - 매칭 성공, 미매칭, 중복 후보 분리
 - 기업 마스터 JSON, CSV, Markdown 리포트 출력
 - OpenDART 다중회사 주요 재무계정 응답 파싱
+- 연간 YoY, 분기 YoY, 최근 4분기 합산 YoY 성장률 계산
+- 최근 N개 성장률이 모두 기준 이상인지 판정하는 기본 성장률 필터
 - API 키 없이 실행 가능한 단위 테스트
 
 ## CLI
@@ -43,6 +45,42 @@ python -m show_me_the_per.cli financial-statements `
   --report-code 11011 `
   --fs-div CFS `
   --output data/financial-statements.json
+```
+
+정규화된 기간별 재무값 JSON에서 성장률 지표와 기본 필터 결과를 계산할 수 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli growth-metrics `
+  --input data/financial-period-values.json `
+  --output data/growth-metrics.json `
+  --threshold-percent 20 `
+  --recent-annual-periods 3 `
+  --recent-quarterly-periods 12
+```
+
+입력 JSON은 다음처럼 `values` 배열을 사용합니다.
+
+```json
+{
+  "values": [
+    {
+      "corp_code": "00126380",
+      "metric": "revenue",
+      "period_type": "annual",
+      "fiscal_year": 2024,
+      "amount": "300000000000000"
+    },
+    {
+      "corp_code": "00126380",
+      "metric": "revenue",
+      "period_type": "quarter",
+      "fiscal_year": 2025,
+      "fiscal_quarter": 1,
+      "amount": "79000000000000"
+    }
+  ]
+}
 ```
 
 ## 테스트
