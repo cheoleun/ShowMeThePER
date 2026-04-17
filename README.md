@@ -17,6 +17,9 @@
 - 연간 YoY, 분기 YoY, 최근 4분기 합산 YoY 성장률 계산
 - 최근 N개 성장률이 모두 기준 이상인지 판정하는 기본 성장률 필터
 - 여러 연도와 보고서 코드를 한 번에 수집해 분석 산출물과 커버리지 리포트 출력
+- 수집 요청 일부가 실패해도 계속 진행하고 오류 리포트 출력
+- 분석 산출물을 SQLite DB에 저장하고 요약 조회
+- SQLite DB에 저장된 성장률 필터 결과로 성장률 랭킹 조회
 - 성장률, PER, PBR, ROE 기반 순위 JSON 출력
 - API 키 없이 실행 가능한 단위 테스트
 
@@ -140,6 +143,7 @@ python -m show_me_the_per.cli collect-analysis `
   --year-to 2025 `
   --fs-div CFS `
   --output-dir data/analysis `
+  --database data/show-me-the-per.sqlite3 `
   --threshold-percent 20 `
   --recent-annual-periods 3 `
   --recent-quarterly-periods 12
@@ -151,6 +155,45 @@ python -m show_me_the_per.cli collect-analysis `
 - `financial-period-values.json`: 연간/분기별 표준 재무값
 - `growth-metrics.json`: 연간 YoY, 분기 YoY, 최근 4분기 합산 YoY 성장률과 기본 필터 결과
 - `coverage-report.json`: 기업별 수집 연도, 보고서 코드, 지표별 연간/분기 데이터 확보 여부, 성장률 필터 결과
+- `collection-errors.json`: 수집 요청별 실패 연도, 보고서 코드, 오류 유형과 메시지
+
+일부 OpenDART 요청이 실패하면 기본적으로 나머지 요청을 계속 진행하고 오류를 `collection-errors.json`에 기록합니다. 실패 즉시 중단하려면 `--fail-fast`를 추가합니다.
+
+실제 API 키로 빠르게 점검하는 절차는 [실데이터 수집 스모크런](docs/smoke-run.md)에 정리되어 있습니다.
+
+이미 만들어둔 분석 산출물 디렉터리를 SQLite DB에 저장할 수도 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli analysis-to-db `
+  --input-dir data/smoke-analysis-10y `
+  --database data/show-me-the-per.sqlite3 `
+  --summary-output data/db-summary.json
+```
+
+DB 요약은 다음 명령으로 확인할 수 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli database-summary `
+  --database data/show-me-the-per.sqlite3 `
+  --output data/db-summary.json
+```
+
+DB에 저장된 성장률 필터 결과로 랭킹을 조회할 수 있습니다.
+
+```powershell
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli rank-growth-from-db `
+  --database data/show-me-the-per.sqlite3 `
+  --growth-metric revenue `
+  --growth-series-type annual_yoy `
+  --output data/db-growth-ranking.json
+```
+
+기본값은 성장률 필터를 통과한 결과만 대상으로 삼습니다. 통과하지 못한 결과까지 함께 비교하려면 `--include-failed-growth`를 추가합니다.
+
+SQLite DB에는 원천 주요 재무계정 row, 표준 기간값, 성장률 포인트, 성장률 필터 결과, 수집 오류가 저장됩니다. `data/`와 DB 파일은 로컬 산출물로 보고 `.gitignore`에 포함합니다.
 
 ## 테스트
 

@@ -10,6 +10,8 @@ from show_me_the_per.models import FinancialStatementRow
 from show_me_the_per.pipeline import (
     build_analysis_artifacts,
     build_coverage_report,
+    build_collection_error_payload,
+    collect_financial_statement_run,
     collect_financial_statement_rows,
     parse_business_years,
     read_corp_codes_from_file,
@@ -44,6 +46,35 @@ class FinancialCollectionPipelineTests(unittest.TestCase):
             ],
         )
 
+    def test_collect_financial_statement_run_records_errors_and_continues(
+        self,
+    ) -> None:
+        client = FailingMajorAccountClient()
+
+        run = collect_financial_statement_run(
+            client,
+            corp_codes=["00126380"],
+            business_years=["2025"],
+            report_codes=["11013", "11011"],
+        )
+
+        self.assertEqual(len(run.rows), 1)
+        self.assertEqual(len(run.errors), 1)
+        self.assertEqual(run.errors[0].business_year, "2025")
+        self.assertEqual(run.errors[0].report_code, "11013")
+        self.assertEqual(run.errors[0].error_type, "ValueError")
+
+    def test_collect_financial_statement_rows_raises_on_collection_error(
+        self,
+    ) -> None:
+        with self.assertRaises(ValueError):
+            collect_financial_statement_rows(
+                FailingMajorAccountClient(),
+                corp_codes=["00126380"],
+                business_years=["2025"],
+                report_codes=["11013"],
+            )
+
     def test_build_coverage_report_marks_missing_metric_entries(self) -> None:
         rows = [
             financial_row("00126380", "ifrs-full_Revenue", "Revenue", "130"),
@@ -67,6 +98,7 @@ class FinancialCollectionPipelineTests(unittest.TestCase):
 
         self.assertEqual(report["summary"]["corp_codes"], 2)
         self.assertEqual(report["summary"]["missing_metric_entries"], 4)
+        self.assertEqual(report["summary"]["companies_without_rows"], 1)
         samsung = report["companies"][0]
         empty_company = report["companies"][1]
         self.assertEqual(samsung["missing_metrics"], ["net_income"])
@@ -74,6 +106,8 @@ class FinancialCollectionPipelineTests(unittest.TestCase):
             empty_company["missing_metrics"],
             ["revenue", "operating_income", "net_income"],
         )
+        self.assertEqual(empty_company["missing_business_years"], ["2025"])
+        self.assertEqual(empty_company["missing_report_codes"], ["11011"])
 
     def test_build_coverage_report_includes_growth_filter_results(self) -> None:
         rows = [
@@ -100,6 +134,59 @@ class FinancialCollectionPipelineTests(unittest.TestCase):
         self.assertEqual(revenue["metric"], "revenue")
         self.assertEqual(revenue["annual_years"], [2023, 2024, 2025])
         self.assertTrue(revenue["growth_filter_results"])
+
+    def test_build_coverage_report_includes_missing_quarter_periods(self) -> None:
+        rows = [
+            financial_row(
+                "00126380",
+                "ifrs-full_Revenue",
+                "Revenue",
+                "100",
+                report_code="11013",
+            )
+        ]
+        artifacts = build_analysis_artifacts(
+            rows,
+            expected_corp_codes=["00126380"],
+            expected_business_years=["2025"],
+            expected_report_codes=["11013", "11012", "11014", "11011"],
+            recent_annual_periods=1,
+            recent_quarterly_periods=1,
+        )
+
+        revenue = artifacts.coverage_report["companies"][0]["metrics"][0]
+
+        self.assertEqual(revenue["quarter_periods"], ["2025Q1"])
+        self.assertEqual(
+            revenue["missing_quarter_periods"],
+            ["2025Q2", "2025Q3", "2025Q4"],
+        )
+
+    def test_build_coverage_report_includes_collection_errors(self) -> None:
+        run = collect_financial_statement_run(
+            FailingMajorAccountClient(),
+            corp_codes=["00126380"],
+            business_years=["2025"],
+            report_codes=["11013", "11011"],
+        )
+        artifacts = build_analysis_artifacts(
+            run.rows,
+            collection_errors=run.errors,
+            expected_corp_codes=["00126380"],
+            expected_business_years=["2025"],
+            expected_report_codes=["11013", "11011"],
+            recent_annual_periods=1,
+            recent_quarterly_periods=1,
+        )
+
+        report = artifacts.coverage_report
+
+        self.assertEqual(report["summary"]["collection_errors"], 1)
+        self.assertEqual(report["collection_errors"][0]["report_code"], "11013")
+        self.assertEqual(
+            report["companies"][0]["collection_errors"][0]["error_type"],
+            "ValueError",
+        )
 
     def test_write_analysis_outputs_writes_all_artifacts(self) -> None:
         rows = [
@@ -132,6 +219,20 @@ class FinancialCollectionPipelineTests(unittest.TestCase):
         self.assertEqual(payloads["financial_period_values"]["summary"]["values"], 2)
         self.assertEqual(payloads["growth_metrics"]["summary"]["growth_points"], 2)
         self.assertEqual(payloads["coverage_report"]["summary"]["corp_codes"], 1)
+        self.assertEqual(payloads["collection_errors"]["summary"]["errors"], 0)
+
+    def test_build_collection_error_payload_summarizes_errors(self) -> None:
+        run = collect_financial_statement_run(
+            FailingMajorAccountClient(),
+            corp_codes=["00126380"],
+            business_years=["2025"],
+            report_codes=["11013"],
+        )
+
+        payload = build_collection_error_payload(run.errors)
+
+        self.assertEqual(payload["summary"]["errors"], 1)
+        self.assertEqual(payload["summary"]["report_codes"], ["11013"])
 
     def test_read_corp_codes_from_company_master_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -202,6 +303,29 @@ class FakeMajorAccountClient:
         self.calls.append(
             (corp_codes, business_year, report_code, fs_div, batch_size)
         )
+        return [
+            financial_row(
+                corp_codes[0],
+                "ifrs-full_Revenue",
+                "Revenue",
+                "100",
+                business_year=business_year,
+                report_code=report_code,
+            )
+        ]
+
+
+class FailingMajorAccountClient:
+    def fetch_major_accounts(
+        self,
+        corp_codes: list[str],
+        business_year: str,
+        report_code: str,
+        fs_div: str | None = None,
+        batch_size: int = 100,
+    ) -> list[FinancialStatementRow]:
+        if report_code == "11013":
+            raise ValueError("temporary OpenDART failure")
         return [
             financial_row(
                 corp_codes[0],

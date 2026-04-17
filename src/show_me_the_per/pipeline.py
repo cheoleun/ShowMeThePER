@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -13,6 +13,7 @@ from .financials import (
     REPORT_CODE_HALF,
     REPORT_CODE_Q1,
     REPORT_CODE_Q3,
+    REPORT_CODE_QUARTERS,
     build_period_values_from_rows,
     write_financial_period_values,
     write_financial_statement_rows,
@@ -42,11 +43,28 @@ class MajorAccountClient(Protocol):
 
 
 @dataclass(frozen=True)
+class CollectionError:
+    corp_codes: tuple[str, ...]
+    business_year: str
+    report_code: str
+    fs_div: str | None
+    error_type: str
+    message: str
+
+
+@dataclass(frozen=True)
+class CollectionRun:
+    rows: list[FinancialStatementRow]
+    errors: list[CollectionError] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class AnalysisArtifacts:
     financial_statement_rows: list[FinancialStatementRow]
     financial_period_values: list[FinancialPeriodValue]
     growth_metrics: dict[str, object]
     coverage_report: dict[str, object]
+    collection_errors: list[CollectionError] = field(default_factory=list)
 
 
 def collect_financial_statement_rows(
@@ -58,6 +76,27 @@ def collect_financial_statement_rows(
     fs_div: str | None = None,
     batch_size: int = 100,
 ) -> list[FinancialStatementRow]:
+    return collect_financial_statement_run(
+        client,
+        corp_codes=corp_codes,
+        business_years=business_years,
+        report_codes=report_codes,
+        fs_div=fs_div,
+        batch_size=batch_size,
+        continue_on_error=False,
+    ).rows
+
+
+def collect_financial_statement_run(
+    client: MajorAccountClient,
+    *,
+    corp_codes: Iterable[str],
+    business_years: Iterable[str | int],
+    report_codes: Iterable[str] = DEFAULT_REPORT_CODES,
+    fs_div: str | None = None,
+    batch_size: int = 100,
+    continue_on_error: bool = True,
+) -> CollectionRun:
     unique_corp_codes = _dedupe_strings(str(code) for code in corp_codes)
     if not unique_corp_codes:
         raise ValueError("at least one corp code is required")
@@ -71,24 +110,40 @@ def collect_financial_statement_rows(
         raise ValueError("at least one report code is required")
 
     rows: list[FinancialStatementRow] = []
+    errors: list[CollectionError] = []
     for business_year in unique_business_years:
         for report_code in unique_report_codes:
-            rows.extend(
-                client.fetch_major_accounts(
-                    corp_codes=unique_corp_codes,
-                    business_year=business_year,
-                    report_code=report_code,
-                    fs_div=fs_div,
-                    batch_size=batch_size,
+            try:
+                rows.extend(
+                    client.fetch_major_accounts(
+                        corp_codes=unique_corp_codes,
+                        business_year=business_year,
+                        report_code=report_code,
+                        fs_div=fs_div,
+                        batch_size=batch_size,
+                    )
                 )
-            )
+            except Exception as error:
+                if not continue_on_error:
+                    raise
+                errors.append(
+                    CollectionError(
+                        corp_codes=tuple(unique_corp_codes),
+                        business_year=business_year,
+                        report_code=report_code,
+                        fs_div=fs_div,
+                        error_type=type(error).__name__,
+                        message=str(error),
+                    )
+                )
 
-    return rows
+    return CollectionRun(rows=rows, errors=errors)
 
 
 def build_analysis_artifacts(
     rows: Iterable[FinancialStatementRow],
     *,
+    collection_errors: Iterable[CollectionError] = (),
     expected_corp_codes: Iterable[str] | None = None,
     expected_business_years: Iterable[str | int] | None = None,
     expected_report_codes: Iterable[str] | None = DEFAULT_REPORT_CODES,
@@ -97,6 +152,7 @@ def build_analysis_artifacts(
     recent_quarterly_periods: int = 12,
 ) -> AnalysisArtifacts:
     copied_rows = list(rows)
+    copied_errors = list(collection_errors)
     period_values = build_period_values_from_rows(copied_rows)
     growth_metrics = build_growth_metrics_payload(
         period_values,
@@ -111,12 +167,14 @@ def build_analysis_artifacts(
         expected_corp_codes=expected_corp_codes,
         expected_business_years=expected_business_years,
         expected_report_codes=expected_report_codes,
+        collection_errors=copied_errors,
     )
     return AnalysisArtifacts(
         financial_statement_rows=copied_rows,
         financial_period_values=period_values,
         growth_metrics=growth_metrics,
         coverage_report=coverage_report,
+        collection_errors=copied_errors,
     )
 
 
@@ -125,6 +183,7 @@ def build_coverage_report(
     period_values: Iterable[FinancialPeriodValue],
     *,
     growth_metrics: dict[str, object] | None = None,
+    collection_errors: Iterable[CollectionError] = (),
     expected_corp_codes: Iterable[str] | None = None,
     expected_business_years: Iterable[str | int] | None = None,
     expected_report_codes: Iterable[str] | None = DEFAULT_REPORT_CODES,
@@ -132,6 +191,7 @@ def build_coverage_report(
 ) -> dict[str, object]:
     copied_rows = list(rows)
     copied_values = list(period_values)
+    copied_errors = list(collection_errors)
     metrics = list(expected_metrics)
 
     corp_codes = _dedupe_strings(
@@ -154,6 +214,7 @@ def build_coverage_report(
         ]
     )
     growth_results = _index_growth_filter_results(growth_metrics)
+    errors_by_corp_code = _index_collection_errors(copied_errors)
 
     companies = [
         _build_company_coverage(
@@ -162,6 +223,9 @@ def build_coverage_report(
             values=[value for value in copied_values if value.corp_code == corp_code],
             metrics=metrics,
             growth_results=growth_results,
+            collection_errors=errors_by_corp_code.get(corp_code, []),
+            expected_business_years=business_years,
+            expected_report_codes=report_codes,
         )
         for corp_code in corp_codes
     ]
@@ -178,12 +242,20 @@ def build_coverage_report(
             "business_years": business_years,
             "report_codes": report_codes,
             "expected_metrics": metrics,
+            "collection_errors": len(copied_errors),
             "missing_metric_entries": missing_metric_entries,
             "companies_with_all_metrics": sum(
                 1 for company in companies if not company["missing_metrics"]
             ),
+            "companies_without_rows": sum(
+                1 for company in companies if company["raw_rows"] == 0
+            ),
+            "companies_with_collection_errors": sum(
+                1 for company in companies if company["collection_errors"]
+            ),
         },
         "companies": companies,
+        "collection_errors": _collection_errors_json(copied_errors),
     }
 
 
@@ -197,6 +269,7 @@ def write_analysis_outputs(
         "financial_period_values": output_dir / "financial-period-values.json",
         "growth_metrics": output_dir / "growth-metrics.json",
         "coverage_report": output_dir / "coverage-report.json",
+        "collection_errors": output_dir / "collection-errors.json",
     }
 
     write_financial_statement_rows(
@@ -209,8 +282,31 @@ def write_analysis_outputs(
     )
     _write_json(paths["growth_metrics"], artifacts.growth_metrics)
     _write_json(paths["coverage_report"], artifacts.coverage_report)
+    _write_json(
+        paths["collection_errors"],
+        build_collection_error_payload(artifacts.collection_errors),
+    )
 
     return paths
+
+
+def build_collection_error_payload(
+    errors: Iterable[CollectionError],
+) -> dict[str, object]:
+    copied_errors = list(errors)
+    return {
+        "summary": {
+            "errors": len(copied_errors),
+            "business_years": _sorted_strings(
+                error.business_year for error in copied_errors
+            ),
+            "report_codes": _sorted_strings(
+                error.report_code for error in copied_errors
+            ),
+            "error_types": _sorted_strings(error.error_type for error in copied_errors),
+        },
+        "errors": _collection_errors_json(copied_errors),
+    }
 
 
 def read_corp_codes_from_file(path: Path) -> list[str]:
@@ -270,6 +366,9 @@ def _build_company_coverage(
     values: list[FinancialPeriodValue],
     metrics: list[str],
     growth_results: dict[tuple[str, str], list[dict[str, object]]],
+    collection_errors: list[CollectionError],
+    expected_business_years: list[str],
+    expected_report_codes: list[str],
 ) -> dict[str, object]:
     annual_by_metric: dict[str, list[FinancialPeriodValue]] = {
         metric: [] for metric in metrics
@@ -291,12 +390,16 @@ def _build_company_coverage(
             annual_values=annual_by_metric[metric],
             quarter_values=quarter_by_metric[metric],
             growth_results=growth_results.get((corp_code, metric), []),
+            expected_business_years=expected_business_years,
+            expected_report_codes=expected_report_codes,
         )
         for metric in metrics
     ]
 
     corp_name = _first_non_empty(row.corp_name for row in rows)
     stock_code = _first_non_empty(row.stock_code for row in rows)
+    business_years = _sorted_strings(row.business_year for row in rows)
+    report_codes = _sorted_strings(row.report_code for row in rows)
     missing_metrics = [
         item["metric"]
         for item in metric_coverages
@@ -308,9 +411,16 @@ def _build_company_coverage(
         "corp_name": corp_name,
         "stock_code": stock_code,
         "raw_rows": len(rows),
-        "business_years": _sorted_strings(row.business_year for row in rows),
-        "report_codes": _sorted_strings(row.report_code for row in rows),
+        "business_years": business_years,
+        "missing_business_years": [
+            year for year in expected_business_years if year not in business_years
+        ],
+        "report_codes": report_codes,
+        "missing_report_codes": [
+            code for code in expected_report_codes if code not in report_codes
+        ],
         "fs_divs": _sorted_strings(row.fs_div for row in rows if row.fs_div),
+        "collection_errors": _collection_errors_json(collection_errors),
         "missing_metrics": missing_metrics,
         "metrics": metric_coverages,
     }
@@ -322,6 +432,8 @@ def _build_metric_coverage(
     annual_values: list[FinancialPeriodValue],
     quarter_values: list[FinancialPeriodValue],
     growth_results: list[dict[str, object]],
+    expected_business_years: list[str],
+    expected_report_codes: list[str],
 ) -> dict[str, object]:
     annual_years = sorted({value.fiscal_year for value in annual_values})
     quarter_periods = sorted(
@@ -332,16 +444,69 @@ def _build_metric_coverage(
         ),
         key=_quarter_label_sort_key,
     )
+    expected_annual_years = _expected_annual_years(expected_business_years, expected_report_codes)
+    expected_quarter_periods = _expected_quarter_periods(
+        expected_business_years,
+        expected_report_codes,
+    )
     return {
         "metric": metric,
         "has_annual_data": bool(annual_values),
         "has_quarter_data": bool(quarter_values),
         "annual_count": len(annual_values),
         "annual_years": annual_years,
+        "missing_annual_years": [
+            year for year in expected_annual_years if year not in annual_years
+        ],
         "quarter_count": len(quarter_values),
         "quarter_periods": quarter_periods,
+        "missing_quarter_periods": [
+            period for period in expected_quarter_periods if period not in quarter_periods
+        ],
         "growth_filter_results": growth_results,
     }
+
+
+def _index_collection_errors(
+    errors: Iterable[CollectionError],
+) -> dict[str, list[CollectionError]]:
+    indexed: dict[str, list[CollectionError]] = {}
+    for error in errors:
+        for corp_code in error.corp_codes:
+            indexed.setdefault(corp_code, []).append(error)
+    return indexed
+
+
+def _collection_errors_json(errors: Iterable[CollectionError]) -> list[dict[str, object]]:
+    return [_json_ready(asdict(error)) for error in errors]
+
+
+def _expected_annual_years(
+    expected_business_years: list[str],
+    expected_report_codes: list[str],
+) -> list[int]:
+    if REPORT_CODE_ANNUAL not in expected_report_codes:
+        return []
+    return sorted(int(year) for year in expected_business_years if year.isdigit())
+
+
+def _expected_quarter_periods(
+    expected_business_years: list[str],
+    expected_report_codes: list[str],
+) -> list[str]:
+    quarters = sorted(
+        {
+            REPORT_CODE_QUARTERS[report_code]
+            for report_code in expected_report_codes
+            if report_code in REPORT_CODE_QUARTERS
+        }
+    )
+    return [
+        f"{year}Q{quarter}"
+        for year in expected_business_years
+        if year.isdigit()
+        for quarter in quarters
+    ]
 
 
 def _index_growth_filter_results(
@@ -441,3 +606,15 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _json_ready(value: object) -> object:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    return value

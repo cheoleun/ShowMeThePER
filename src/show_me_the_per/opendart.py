@@ -58,7 +58,12 @@ class OpenDartClient:
             url = f"{self.multi_account_endpoint}?{urlencode(params)}"
             with urlopen(url, timeout=self.timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            rows.extend(parse_major_accounts_payload(payload))
+            parsed_rows = parse_major_accounts_payload(payload)
+            if fs_div:
+                parsed_rows = [
+                    row for row in parsed_rows if row.fs_div.upper() == fs_div.upper()
+                ]
+            rows.extend(parsed_rows)
 
         return rows
 

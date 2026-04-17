@@ -32,6 +32,10 @@ REPORT_CODE_QUARTERS = {
     REPORT_CODE_Q3: 3,
     REPORT_CODE_ANNUAL: 4,
 }
+FS_DIV_PREFERENCE = {
+    "CFS": 0,
+    "OFS": 1,
+}
 
 ACCOUNT_ID_METRICS = {
     "ifrs-full_Revenue": METRIC_REVENUE,
@@ -89,7 +93,10 @@ def read_financial_statement_rows(path: Path) -> list[FinancialStatementRow]:
 def build_annual_period_values_from_rows(
     rows: list[FinancialStatementRow],
 ) -> list[FinancialPeriodValue]:
-    selected_values: dict[tuple[str, str, int], tuple[int, FinancialPeriodValue]] = {}
+    selected_values: dict[
+        tuple[str, str, int],
+        tuple[int, int, FinancialPeriodValue],
+    ] = {}
     for row in rows:
         if row.report_code != REPORT_CODE_ANNUAL:
             continue
@@ -110,17 +117,23 @@ def build_annual_period_values_from_rows(
         ):
             key = (value.corp_code, value.metric, value.fiscal_year)
             previous = selected_values.get(key)
-            if previous is None or source_year > previous[0]:
-                selected_values[key] = (source_year, value)
+            fs_preference = _fs_div_preference(row.fs_div)
+            if previous is None or _is_preferred_period_value(
+                source_year,
+                fs_preference,
+                previous_source_year=previous[0],
+                previous_fs_preference=previous[1],
+            ):
+                selected_values[key] = (source_year, fs_preference, value)
 
     return [
         value
-        for _, value in sorted(
+        for _, _, value in sorted(
             selected_values.values(),
             key=lambda item: (
-                item[1].corp_code,
-                METRIC_ORDER.get(item[1].metric, 999),
-                -item[1].fiscal_year,
+                item[2].corp_code,
+                METRIC_ORDER.get(item[2].metric, 999),
+                -item[2].fiscal_year,
             ),
         )
     ]
@@ -129,11 +142,13 @@ def build_annual_period_values_from_rows(
 def build_quarterly_period_values_from_rows(
     rows: list[FinancialStatementRow],
 ) -> list[FinancialPeriodValue]:
-    cumulative_values: dict[tuple[str, str, int], dict[int, Decimal]] = {}
+    selected_rows: dict[
+        tuple[str, str, int, str],
+        tuple[int, FinancialStatementRow],
+    ] = {}
 
     for row in rows:
-        quarter = REPORT_CODE_QUARTERS.get(row.report_code)
-        if quarter is None or row.current_amount is None:
+        if row.report_code not in REPORT_CODE_QUARTERS or row.current_amount is None:
             continue
 
         metric = map_financial_account_to_metric(row.account_id, row.account_name)
@@ -145,25 +160,49 @@ def build_quarterly_period_values_from_rows(
         except ValueError:
             continue
 
-        key = (row.corp_code, metric, fiscal_year)
-        cumulative_values.setdefault(key, {})[quarter] = row.current_amount
+        key = (row.corp_code, metric, fiscal_year, row.report_code)
+        fs_preference = _fs_div_preference(row.fs_div)
+        previous = selected_rows.get(key)
+        if previous is None or fs_preference < previous[0]:
+            selected_rows[key] = (fs_preference, row)
+
+    rows_by_identity: dict[
+        tuple[str, str, int],
+        dict[str, FinancialStatementRow],
+    ] = {}
+    for (corp_code, metric, fiscal_year, report_code), (_, row) in selected_rows.items():
+        rows_by_identity.setdefault((corp_code, metric, fiscal_year), {})[
+            report_code
+        ] = row
 
     values: list[FinancialPeriodValue] = []
-    for (corp_code, metric, fiscal_year), by_quarter in sorted(
-        cumulative_values.items(),
+    for (corp_code, metric, fiscal_year), by_report_code in sorted(
+        rows_by_identity.items(),
         key=lambda item: (
             item[0][0],
             METRIC_ORDER.get(item[0][1], 999),
             item[0][2],
         ),
     ):
-        previous_cumulative = Decimal("0")
-        for quarter in range(1, 5):
-            cumulative_amount = by_quarter.get(quarter)
-            if cumulative_amount is None:
-                break
+        current_quarter_amounts: dict[int, Decimal] = {}
+        for report_code in (REPORT_CODE_Q1, REPORT_CODE_HALF, REPORT_CODE_Q3):
+            row = by_report_code.get(report_code)
+            if row is not None and row.current_amount is not None:
+                current_quarter_amounts[REPORT_CODE_QUARTERS[report_code]] = (
+                    row.current_amount
+                )
 
-            amount = cumulative_amount - previous_cumulative
+        annual_row = by_report_code.get(REPORT_CODE_ANNUAL)
+        if (
+            annual_row is not None
+            and annual_row.current_amount is not None
+            and all(quarter in current_quarter_amounts for quarter in (1, 2, 3))
+        ):
+            current_quarter_amounts[4] = annual_row.current_amount - sum(
+                current_quarter_amounts[quarter] for quarter in (1, 2, 3)
+            )
+
+        for quarter in sorted(current_quarter_amounts):
             values.append(
                 FinancialPeriodValue(
                     corp_code=corp_code,
@@ -171,10 +210,9 @@ def build_quarterly_period_values_from_rows(
                     period_type="quarter",
                     fiscal_year=fiscal_year,
                     fiscal_quarter=quarter,
-                    amount=amount,
+                    amount=current_quarter_amounts[quarter],
                 )
             )
-            previous_cumulative = cumulative_amount
 
     return values
 
@@ -259,6 +297,22 @@ def _annual_values_for_amounts(
         for year, amount in amounts
         if amount is not None
     ]
+
+
+def _fs_div_preference(fs_div: str) -> int:
+    return FS_DIV_PREFERENCE.get(fs_div.upper(), 99)
+
+
+def _is_preferred_period_value(
+    source_year: int,
+    fs_preference: int,
+    *,
+    previous_source_year: int,
+    previous_fs_preference: int,
+) -> bool:
+    if source_year != previous_source_year:
+        return source_year > previous_source_year
+    return fs_preference < previous_fs_preference
 
 
 def _parse_financial_statement_row(item: dict[str, object]) -> FinancialStatementRow:

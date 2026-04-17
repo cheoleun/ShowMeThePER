@@ -9,6 +9,7 @@ from pathlib import Path
 from show_me_the_per import cli
 from show_me_the_per.cli import main, parse_corp_code_args
 from show_me_the_per.models import FinancialStatementRow
+from show_me_the_per.storage import summarize_database
 
 
 class CliTests(unittest.TestCase):
@@ -182,6 +183,7 @@ class CliTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 output_dir = Path(directory) / "analysis"
+                database_path = Path(directory) / "analysis.sqlite3"
 
                 main(
                     [
@@ -198,6 +200,8 @@ class CliTests(unittest.TestCase):
                         "11011",
                         "--output-dir",
                         str(output_dir),
+                        "--database",
+                        str(database_path),
                         "--recent-annual-periods",
                         "1",
                         "--recent-quarterly-periods",
@@ -211,11 +215,153 @@ class CliTests(unittest.TestCase):
                 growth = json.loads(
                     (output_dir / "growth-metrics.json").read_text("utf-8")
                 )
+                errors = json.loads(
+                    (output_dir / "collection-errors.json").read_text("utf-8")
+                )
+                database_summary = summarize_database(database_path)
         finally:
             cli.OpenDartClient = original_client
 
         self.assertEqual(coverage["summary"]["corp_codes"], 1)
         self.assertEqual(growth["summary"]["growth_points"], 2)
+        self.assertEqual(errors["summary"]["errors"], 0)
+        self.assertEqual(database_summary["financial_statement_rows"], 1)
+        self.assertEqual(database_summary["financial_period_values"], 2)
+
+    def test_analysis_to_db_command_stores_existing_outputs(self) -> None:
+        original_client = cli.OpenDartClient
+        cli.OpenDartClient = FakeOpenDartClient
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                output_dir = Path(directory) / "analysis"
+                database_path = Path(directory) / "analysis.sqlite3"
+                summary_path = Path(directory) / "summary.json"
+
+                main(
+                    [
+                        "collect-analysis",
+                        "--opendart-api-key",
+                        "test-key",
+                        "--corp-code",
+                        "00126380",
+                        "--business-year",
+                        "2025",
+                        "--report-code",
+                        "11011",
+                        "--output-dir",
+                        str(output_dir),
+                        "--recent-annual-periods",
+                        "1",
+                        "--recent-quarterly-periods",
+                        "1",
+                    ]
+                )
+                main(
+                    [
+                        "analysis-to-db",
+                        "--input-dir",
+                        str(output_dir),
+                        "--database",
+                        str(database_path),
+                        "--summary-output",
+                        str(summary_path),
+                    ]
+                )
+                summary = json.loads(summary_path.read_text("utf-8"))
+        finally:
+            cli.OpenDartClient = original_client
+
+        self.assertEqual(summary["financial_statement_rows"], 1)
+        self.assertEqual(summary["growth_filter_results"], 1)
+
+    def test_rank_growth_from_db_command_writes_output(self) -> None:
+        original_client = cli.OpenDartClient
+        cli.OpenDartClient = FakeOpenDartClient
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                output_dir = Path(directory) / "analysis"
+                database_path = Path(directory) / "analysis.sqlite3"
+                ranking_path = Path(directory) / "db-growth-ranking.json"
+
+                main(
+                    [
+                        "collect-analysis",
+                        "--opendart-api-key",
+                        "test-key",
+                        "--corp-code",
+                        "00126380",
+                        "--business-year",
+                        "2025",
+                        "--report-code",
+                        "11011",
+                        "--output-dir",
+                        str(output_dir),
+                        "--database",
+                        str(database_path),
+                        "--recent-annual-periods",
+                        "1",
+                        "--recent-quarterly-periods",
+                        "1",
+                    ]
+                )
+                main(
+                    [
+                        "rank-growth-from-db",
+                        "--database",
+                        str(database_path),
+                        "--growth-metric",
+                        "revenue",
+                        "--growth-series-type",
+                        "annual_yoy",
+                        "--output",
+                        str(ranking_path),
+                    ]
+                )
+                payload = json.loads(ranking_path.read_text("utf-8"))
+        finally:
+            cli.OpenDartClient = original_client
+
+        self.assertEqual(payload["summary"]["growth_rankings"], 1)
+        self.assertEqual(payload["growth_rankings"][0]["corp_code"], "00126380")
+
+    def test_collect_analysis_command_records_partial_failures(self) -> None:
+        original_client = cli.OpenDartClient
+        cli.OpenDartClient = PartiallyFailingOpenDartClient
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                output_dir = Path(directory) / "analysis"
+
+                main(
+                    [
+                        "collect-analysis",
+                        "--opendart-api-key",
+                        "test-key",
+                        "--corp-code",
+                        "00126380",
+                        "--business-year",
+                        "2025",
+                        "--report-code",
+                        "11013,11011",
+                        "--output-dir",
+                        str(output_dir),
+                        "--recent-annual-periods",
+                        "1",
+                        "--recent-quarterly-periods",
+                        "1",
+                    ]
+                )
+
+                coverage = json.loads(
+                    (output_dir / "coverage-report.json").read_text("utf-8")
+                )
+                errors = json.loads(
+                    (output_dir / "collection-errors.json").read_text("utf-8")
+                )
+        finally:
+            cli.OpenDartClient = original_client
+
+        self.assertEqual(coverage["summary"]["collection_errors"], 1)
+        self.assertEqual(errors["errors"][0]["report_code"], "11013")
 
 
 class FakeOpenDartClient:
@@ -251,6 +397,26 @@ class FakeOpenDartClient:
                 before_previous_amount=None,
             )
         ]
+
+
+class PartiallyFailingOpenDartClient(FakeOpenDartClient):
+    def fetch_major_accounts(
+        self,
+        corp_codes: list[str],
+        business_year: str,
+        report_code: str,
+        fs_div: str | None = None,
+        batch_size: int = 100,
+    ) -> list[FinancialStatementRow]:
+        if report_code == "11013":
+            raise ValueError("temporary OpenDART failure")
+        return super().fetch_major_accounts(
+            corp_codes,
+            business_year,
+            report_code,
+            fs_div,
+            batch_size,
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Local virtual environments and secrets
+.env
+.env.*
+.venv/
+venv/
+
+# Local collection outputs
+data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Local Codex/GitHub working copy
+.codex-pr-worktree/
