@@ -16,6 +16,7 @@
 - 보고서별 누적값에서 분기별 표준 재무값 산출
 - 연간 YoY, 분기 YoY, 최근 4분기 합산 YoY 성장률 계산
 - 최근 N개 성장률이 모두 기준 이상인지 판정하는 기본 성장률 필터
+- 여러 연도와 보고서 코드를 한 번에 수집해 분석 산출물과 커버리지 리포트 출력
 - 성장률, PER, PBR, ROE 기반 순위 JSON 출력
 - API 키 없이 실행 가능한 단위 테스트
 
@@ -127,6 +128,29 @@ PER/PBR/ROE 입력 JSON은 다음처럼 `companies` 배열을 사용합니다.
   ]
 }
 ```
+
+여러 기업과 여러 연도를 한 번에 수집한 뒤 표준 기간값, 성장률, 커버리지 리포트까지 생성할 수 있습니다. 기본 보고서 코드는 1분기, 반기, 3분기, 사업보고서입니다.
+
+```powershell
+$env:OPENDART_API_KEY="..."
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli collect-analysis `
+  --corp-code-file data/company-master.json `
+  --year-from 2015 `
+  --year-to 2025 `
+  --fs-div CFS `
+  --output-dir data/analysis `
+  --threshold-percent 20 `
+  --recent-annual-periods 3 `
+  --recent-quarterly-periods 12
+```
+
+`collect-analysis`는 다음 파일을 생성합니다.
+
+- `financial-statements.json`: OpenDART 주요 재무계정 원천 row
+- `financial-period-values.json`: 연간/분기별 표준 재무값
+- `growth-metrics.json`: 연간 YoY, 분기 YoY, 최근 4분기 합산 YoY 성장률과 기본 필터 결과
+- `coverage-report.json`: 기업별 수집 연도, 보고서 코드, 지표별 연간/분기 데이터 확보 여부, 성장률 필터 결과
 
 ## 테스트
 
