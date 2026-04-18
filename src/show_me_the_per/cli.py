@@ -33,7 +33,9 @@ from .rankings import (
 )
 from .reports import (
     build_company_growth_report_payload,
+    build_growth_ranking_report_payload,
     write_company_growth_report_html,
+    write_growth_ranking_report_html,
 )
 from .storage import (
     build_database_growth_ranking_payload,
@@ -54,6 +56,7 @@ COMMANDS = {
     "database-summary",
     "rank-growth-from-db",
     "company-growth-report",
+    "growth-ranking-report",
 }
 
 
@@ -451,6 +454,41 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to write static HTML report.",
     )
 
+    growth_ranking_report_parser = subparsers.add_parser(
+        "growth-ranking-report",
+        help="Build a static HTML growth ranking report from SQLite data.",
+    )
+    growth_ranking_report_parser.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path.",
+    )
+    growth_ranking_report_parser.add_argument(
+        "--growth-metric",
+        help="Optional growth metric to rank, for example revenue.",
+    )
+    growth_ranking_report_parser.add_argument(
+        "--growth-series-type",
+        help="Optional growth series to rank, for example annual_yoy.",
+    )
+    growth_ranking_report_parser.add_argument(
+        "--include-failed-growth",
+        action="store_true",
+        help="Include failed growth filters in the HTML ranking report.",
+    )
+    growth_ranking_report_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Optional maximum number of ranking rows.",
+    )
+    growth_ranking_report_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Path to write static HTML ranking report.",
+    )
+
     args = parser.parse_args(args_list)
     if args.command == "company-master":
         run_company_master(args, parser)
@@ -472,6 +510,8 @@ def main(argv: list[str] | None = None) -> None:
         run_rank_growth_from_db(args)
     elif args.command == "company-growth-report":
         run_company_growth_report(args)
+    elif args.command == "growth-ranking-report":
+        run_growth_ranking_report(args)
 
 
 def run_company_master(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -641,6 +681,17 @@ def run_company_growth_report(args: argparse.Namespace) -> None:
         recent_years=args.recent_years,
     )
     write_company_growth_report_html(args.output, payload)
+
+
+def run_growth_ranking_report(args: argparse.Namespace) -> None:
+    payload = build_growth_ranking_report_payload(
+        args.database,
+        growth_metric=args.growth_metric,
+        growth_series_type=args.growth_series_type,
+        include_failed_growth=args.include_failed_growth,
+        limit=args.limit,
+    )
+    write_growth_ranking_report_html(args.output, payload)
 
 
 def write_or_print_json(payload: dict[str, object], output: Path | None) -> None:

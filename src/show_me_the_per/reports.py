@@ -13,6 +13,7 @@ from .growth import (
 )
 from .models import GrowthPoint
 from .storage import (
+    build_database_growth_ranking_payload,
     read_company_profile_from_database,
     read_growth_filter_results_from_database,
     read_growth_points_from_database,
@@ -112,6 +113,65 @@ def write_company_growth_report_html(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         render_company_growth_report_html(payload),
+        encoding="utf-8",
+    )
+
+
+def build_growth_ranking_report_payload(
+    database_path: Path,
+    *,
+    growth_metric: str | None = None,
+    growth_series_type: str | None = None,
+    include_failed_growth: bool = False,
+    limit: int | None = None,
+) -> dict[str, object]:
+    payload = build_database_growth_ranking_payload(
+        database_path,
+        growth_metric=growth_metric,
+        growth_series_type=growth_series_type,
+        include_failed_growth=include_failed_growth,
+        limit=limit,
+    )
+    rankings = [
+        {
+            **_dict(ranking),
+            "metric_label": METRIC_LABELS.get(
+                str(_dict(ranking).get("metric", "")),
+                str(_dict(ranking).get("metric", "")),
+            ),
+            "series_label": SERIES_LABELS.get(
+                str(_dict(ranking).get("series_type", "")),
+                str(_dict(ranking).get("series_type", "")),
+            ),
+        }
+        for ranking in _list(payload.get("growth_rankings"))
+    ]
+
+    return {
+        **payload,
+        "display": {
+            "metric_label": (
+                METRIC_LABELS.get(growth_metric, growth_metric)
+                if growth_metric is not None
+                else "전체 지표"
+            ),
+            "series_label": (
+                SERIES_LABELS.get(growth_series_type, growth_series_type)
+                if growth_series_type is not None
+                else "전체 기준"
+            ),
+        },
+        "growth_rankings": rankings,
+    }
+
+
+def write_growth_ranking_report_html(
+    output_path: Path,
+    payload: dict[str, object],
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        render_growth_ranking_report_html(payload),
         encoding="utf-8",
     )
 
@@ -252,6 +312,132 @@ def render_company_growth_report_html(payload: dict[str, object]) -> str:
 """
 
 
+def render_growth_ranking_report_html(payload: dict[str, object]) -> str:
+    summary = _dict(payload.get("summary"))
+    filters = _dict(payload.get("filters"))
+    display = _dict(payload.get("display"))
+    rankings = [_dict(ranking) for ranking in _list(payload.get("growth_rankings"))]
+
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>성장률 랭킹 리포트</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --ink: #172026;
+      --muted: #5d6972;
+      --line: #d7dde2;
+      --surface: #f5f7f9;
+      --accent: #0b6b5c;
+      --accent-2: #b3261e;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: Arial, "Malgun Gothic", sans-serif;
+      color: var(--ink);
+      background: #ffffff;
+      line-height: 1.5;
+    }}
+    header {{
+      padding: 28px 24px 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }}
+    main {{
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px;
+    }}
+    h1, h2 {{
+      margin: 0 0 10px;
+      letter-spacing: 0;
+    }}
+    h1 {{ font-size: 28px; }}
+    h2 {{ font-size: 22px; margin-top: 26px; }}
+    p {{ margin: 6px 0 14px; color: var(--muted); }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin: 10px 0 18px;
+      font-size: 14px;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      text-align: right;
+      vertical-align: top;
+      white-space: nowrap;
+    }}
+    th:nth-child(2), td:nth-child(2),
+    th:nth-child(3), td:nth-child(3),
+    th:nth-child(4), td:nth-child(4),
+    th:nth-child(5), td:nth-child(5) {{
+      text-align: left;
+    }}
+    th {{
+      background: #eef2f5;
+      color: #25313a;
+      font-weight: 700;
+    }}
+    .meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }}
+    .pill {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 10px;
+      background: #ffffff;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .ranking-chart {{
+      width: 100%;
+      min-height: 240px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+    }}
+    .positive {{ color: var(--accent); font-weight: 700; }}
+    .negative {{ color: var(--accent-2); font-weight: 700; }}
+    .empty {{ color: var(--muted); }}
+    @media (max-width: 720px) {{
+      main {{ padding: 16px; }}
+      header {{ padding: 22px 16px 14px; }}
+      h1 {{ font-size: 24px; }}
+      table {{ display: block; overflow-x: auto; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>성장률 랭킹 리포트</h1>
+    <p>DB에 저장된 성장률 필터 결과를 기준으로 최소 성장률이 높은 순서대로 정렬했습니다.</p>
+    <div class="meta">
+      <span class="pill">지표 {escape(str(display.get("metric_label", "")))}</span>
+      <span class="pill">기준 {escape(str(display.get("series_label", "")))}</span>
+      <span class="pill">필터 결과 {escape(str(summary.get("filter_results", 0)))}개</span>
+      <span class="pill">랭킹 {escape(str(summary.get("growth_rankings", 0)))}개</span>
+      <span class="pill">실패 포함 {'예' if filters.get("include_failed_growth") is True else '아니오'}</span>
+    </div>
+  </header>
+  <main>
+    <h2>상위 성장률</h2>
+    {_render_ranking_bar_chart(rankings)}
+    <h2>랭킹 목록</h2>
+    {_render_ranking_table(rankings)}
+  </main>
+</body>
+</html>
+"""
+
+
 def _render_filter_table(filter_results: list[object]) -> str:
     if not filter_results:
         return "<p>저장된 성장률 필터 결과가 없습니다.</p>"
@@ -274,6 +460,97 @@ def _render_filter_table(filter_results: list[object]) -> str:
         f"<tbody>{''.join(rows)}</tbody>"
         "</table>"
     )
+
+
+def _render_ranking_table(rankings: list[dict[str, object]]) -> str:
+    if not rankings:
+        return "<p>표시할 성장률 랭킹이 없습니다.</p>"
+
+    rows = []
+    for ranking in rankings:
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(ranking.get('rank', '')))}</td>"
+            f"<td>{escape(_ranking_company_name(ranking))}</td>"
+            f"<td>{escape(str(ranking.get('stock_code', '')))}</td>"
+            f"<td>{escape(str(ranking.get('corp_code', '')))}</td>"
+            f"<td>{escape(str(ranking.get('metric_label', ranking.get('metric', ''))))}</td>"
+            f"<td>{escape(str(ranking.get('series_label', ranking.get('series_type', ''))))}</td>"
+            f"<td>{escape(str(ranking.get('recent_periods', '')))}</td>"
+            f"<td>{_format_percent(ranking.get('minimum_growth_rate'))}</td>"
+            f"<td>{'통과' if ranking.get('passed') is True else '미통과'}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<table>"
+        "<thead><tr><th>순위</th><th>회사</th><th>종목코드</th><th>고유번호</th>"
+        "<th>지표</th><th>기준</th><th>기간 수</th><th>최소 성장률</th><th>판정</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+    )
+
+
+def _render_ranking_bar_chart(rankings: list[dict[str, object]]) -> str:
+    chart_rows = [
+        (ranking, _to_decimal(ranking.get("minimum_growth_rate")))
+        for ranking in rankings[:25]
+    ]
+    numeric_rows = [
+        (ranking, value)
+        for ranking, value in chart_rows
+        if value is not None
+    ]
+    if not numeric_rows:
+        return '<p class="empty">차트로 표시할 성장률 랭킹이 없습니다.</p>'
+
+    width = 900
+    row_height = 30
+    top = 30
+    left = 220
+    right = 78
+    bottom = 30
+    height = top + bottom + row_height * len(numeric_rows)
+    values = [value for _, value in numeric_rows]
+    min_value = min(values + [Decimal("0")])
+    max_value = max(values + [Decimal("0")])
+    if min_value == max_value:
+        min_value -= Decimal("1")
+        max_value += Decimal("1")
+    padding = (max_value - min_value) * Decimal("0.08")
+    min_value -= padding
+    max_value += padding
+
+    def x_for(value: Decimal) -> Decimal:
+        return Decimal(left) + (
+            (value - min_value)
+            / (max_value - min_value)
+            * Decimal(width - left - right)
+        )
+
+    zero_x = x_for(Decimal("0"))
+    rows = []
+    for index, (ranking, value) in enumerate(numeric_rows):
+        y = Decimal(top + index * row_height + 6)
+        value_x = x_for(value)
+        bar_x = min(zero_x, value_x)
+        bar_width = abs(value_x - zero_x)
+        label = escape(_truncate_label(_ranking_company_name(ranking), 22))
+        color = "#0b6b5c" if value >= 0 else "#b3261e"
+        rows.append(
+            f'<text x="12" y="{_svg_number(y + Decimal("14"))}" font-size="13" fill="#172026">{label}</text>'
+            f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(y)}" width="{_svg_number(bar_width)}" height="18" fill="{color}" rx="4" />'
+            f'<text x="{_svg_number(value_x + Decimal("6") if value >= 0 else value_x - Decimal("6"))}" '
+            f'y="{_svg_number(y + Decimal("14"))}" font-size="12" fill="#5d6972" '
+            f'text-anchor="{"start" if value >= 0 else "end"}">{escape(_format_percent(value))}</text>'
+        )
+
+    return f"""
+      <svg class="ranking-chart" viewBox="0 0 {width} {height}" role="img" aria-label="성장률 랭킹 차트">
+        <line x1="{_svg_number(zero_x)}" y1="{top}" x2="{_svg_number(zero_x)}" y2="{height - bottom}" stroke="#b7c0c8" stroke-dasharray="4 4" />
+        {''.join(rows)}
+      </svg>
+    """
 
 
 def _render_metric_section(metric: dict[str, object]) -> str:
@@ -449,6 +726,21 @@ def _report_title(company: dict[str, object]) -> str:
     if identifier:
         return f"{identifier} 성장률 리포트"
     return "성장률 리포트"
+
+
+def _ranking_company_name(ranking: dict[str, object]) -> str:
+    name = str(ranking.get("corp_name") or "").strip()
+    stock_code = str(ranking.get("stock_code") or "").strip()
+    corp_code = str(ranking.get("corp_code") or "").strip()
+    if name:
+        return name
+    return stock_code or corp_code
+
+
+def _truncate_label(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 1] + "…"
 
 
 def _polyline_segments(

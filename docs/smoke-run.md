@@ -135,3 +135,14 @@ python -m show_me_the_per.cli company-growth-report `
   --recent-years 10 `
   --output data/samsung-growth-report.html
 ```
+
+여러 회사를 성장률 조건으로 비교할 때는 HTML 랭킹 리포트를 생성합니다.
+
+```powershell
+python -m show_me_the_per.cli growth-ranking-report `
+  --database data/show-me-the-per.sqlite3 `
+  --growth-metric revenue `
+  --growth-series-type annual_yoy `
+  --limit 50 `
+  --output data/growth-ranking-report.html
+```
