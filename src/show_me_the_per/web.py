@@ -10,7 +10,12 @@ from typing import Callable, Iterable
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-from .models import FinancialPeriodValue, FinancialStatementRow
+from .models import (
+    DartCompany,
+    FinancialPeriodValue,
+    FinancialStatementRow,
+    normalize_stock_code,
+)
 from .opendart import OpenDartClient
 from .pipeline import (
     DEFAULT_REPORT_CODES,
@@ -37,7 +42,7 @@ MIN_OPENDART_YEAR = 2015
 
 @dataclass(frozen=True)
 class AnalysisForm:
-    corp_code: str = ""
+    company_query: str = ""
     recent_years: str = str(DEFAULT_RECENT_YEARS)
     end_year: str = ""
     fs_div: str = "CFS"
@@ -56,6 +61,7 @@ def create_app(
 
     @app.get("/analysis", response_class=HTMLResponse)
     def analysis(
+        company_query: str = "",
         corp_code: str = "",
         recent_years: str = str(DEFAULT_RECENT_YEARS),
         end_year: str = "",
@@ -63,7 +69,7 @@ def create_app(
         threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
     ) -> HTMLResponse:
         form = AnalysisForm(
-            corp_code=corp_code.strip(),
+            company_query=(company_query or corp_code).strip(),
             recent_years=recent_years.strip(),
             end_year=end_year.strip() or str(default_end_year()),
             fs_div=fs_div.strip().upper() or "CFS",
@@ -84,9 +90,15 @@ def create_app(
                 )
             )
 
+        client = client_factory(api_key)
+        try:
+            company = resolve_company_query(client.fetch_companies(), request["company_query"])
+        except ValueError as error:
+            return HTMLResponse(render_page(form=form, error=str(error)))
+
         run = collect_financial_statement_run(
-            client_factory(api_key),
-            corp_codes=[request["corp_code"]],
+            client,
+            corp_codes=[company.corp_code],
             business_years=request["business_years"],
             report_codes=DEFAULT_REPORT_CODES,
             fs_div=request["fs_div"],
@@ -95,7 +107,7 @@ def create_app(
         artifacts = build_analysis_artifacts(
             run.rows,
             collection_errors=run.errors,
-            expected_corp_codes=[request["corp_code"]],
+            expected_corp_codes=[company.corp_code],
             expected_business_years=request["business_years"],
             expected_report_codes=DEFAULT_REPORT_CODES,
             threshold_percent=request["threshold_percent"],
@@ -104,7 +116,7 @@ def create_app(
         )
         payload = build_browser_report_payload(
             artifacts,
-            corp_code=request["corp_code"],
+            company=company,
             start_year=request["start_year"],
             end_year=request["end_year"],
             recent_years=request["recent_years"],
@@ -125,9 +137,9 @@ def default_end_year(today: date | None = None) -> int:
 
 
 def parse_analysis_request(form: AnalysisForm) -> dict[str, object]:
-    corp_code = form.corp_code.strip()
-    if not corp_code:
-        raise ValueError("OpenDART 고유번호를 입력해 주세요.")
+    company_query = form.company_query.strip()
+    if not company_query:
+        raise ValueError("기업 이름을 입력해 주세요.")
 
     recent_years = _parse_int(form.recent_years, field_name="조회 연수")
     if recent_years <= 0:
@@ -145,7 +157,7 @@ def parse_analysis_request(form: AnalysisForm) -> dict[str, object]:
     fs_div = _parse_fs_div(form.fs_div)
 
     return {
-        "corp_code": corp_code,
+        "company_query": company_query,
         "recent_years": recent_years,
         "start_year": start_year,
         "end_year": end_year,
@@ -155,10 +167,67 @@ def parse_analysis_request(form: AnalysisForm) -> dict[str, object]:
     }
 
 
+def resolve_company_query(
+    companies: Iterable[DartCompany],
+    query: str,
+) -> DartCompany:
+    normalized_query = _normalize_company_name(query)
+    copied_companies = list(companies)
+    if not normalized_query:
+        raise ValueError("기업 이름을 입력해 주세요.")
+
+    corp_code_matches = [
+        company for company in copied_companies if company.corp_code == query.strip()
+    ]
+    if len(corp_code_matches) == 1:
+        return corp_code_matches[0]
+    if not corp_code_matches and query.strip().isdigit() and len(query.strip()) == 8:
+        return DartCompany(
+            corp_code=query.strip(),
+            corp_name="",
+            stock_code="",
+            modify_date="",
+        )
+
+    stock_code = normalize_stock_code(query)
+    stock_matches = [
+        company
+        for company in copied_companies
+        if company.normalized_stock_code
+        and company.normalized_stock_code == stock_code
+    ]
+    if len(stock_matches) == 1:
+        return stock_matches[0]
+    if len(stock_matches) > 1:
+        raise ValueError(_ambiguous_company_message(query, stock_matches))
+
+    exact_name_matches = [
+        company
+        for company in copied_companies
+        if _normalize_company_name(company.corp_name) == normalized_query
+    ]
+    if len(exact_name_matches) == 1:
+        return exact_name_matches[0]
+    if len(exact_name_matches) > 1:
+        raise ValueError(_ambiguous_company_message(query, exact_name_matches))
+
+    partial_name_matches = [
+        company
+        for company in copied_companies
+        if normalized_query in _normalize_company_name(company.corp_name)
+    ]
+    if len(partial_name_matches) == 1:
+        return partial_name_matches[0]
+    if len(partial_name_matches) > 1:
+        raise ValueError(_ambiguous_company_message(query, partial_name_matches))
+
+    raise ValueError(f"'{query}'에 해당하는 상장기업을 찾지 못했습니다.")
+
+
 def build_browser_report_payload(
     artifacts: AnalysisArtifacts,
     *,
-    corp_code: str,
+    company: DartCompany,
     start_year: int,
     end_year: int,
     recent_years: int,
@@ -178,9 +247,10 @@ def build_browser_report_payload(
     filter_results = _filter_results_from_payload(artifacts.growth_metrics)
 
     return {
-        "company": _company_from_rows(corp_code, artifacts.financial_statement_rows),
+        "company": _company_from_rows(company, artifacts.financial_statement_rows),
         "summary": {
-            "corp_code": corp_code,
+            "corp_code": company.corp_code,
+            "company_query": company.corp_name or company.stock_code or company.corp_code,
             "start_year": start_year,
             "end_year": end_year,
             "recent_years": recent_years,
@@ -379,7 +449,7 @@ def render_page(
 <body>
   <header>
     <h1>ShowMeThePER</h1>
-    <p>OpenDART 고유번호와 조회 기간을 입력하면 매출, 영업이익, 순이익과 성장률을 바로 계산합니다.</p>
+    <p>기업 이름과 조회 기간을 입력하면 매출, 영업이익, 순이익과 성장률을 바로 계산합니다.</p>
   </header>
   <main>
     {render_form(form)}
@@ -394,8 +464,8 @@ def render_form(form: AnalysisForm) -> str:
     return f"""
     <form method="get" action="/analysis">
       <label>
-        OpenDART 고유번호
-        <input name="corp_code" value="{escape(form.corp_code)}" placeholder="00126380" required>
+        기업 이름
+        <input name="company_query" value="{escape(form.company_query)}" placeholder="삼성전자" required>
       </label>
       <label>
         조회 연수
@@ -648,17 +718,21 @@ def _filter_results_from_payload(payload: dict[str, object]) -> list[dict[str, o
 
 
 def _company_from_rows(
-    corp_code: str,
+    company: DartCompany,
     rows: list[FinancialStatementRow],
 ) -> dict[str, str]:
     for row in rows:
-        if row.corp_code == corp_code:
+        if row.corp_code == company.corp_code:
             return {
                 "corp_code": row.corp_code,
                 "corp_name": row.corp_name,
                 "stock_code": row.stock_code,
             }
-    return {"corp_code": corp_code, "corp_name": "", "stock_code": ""}
+    return {
+        "corp_code": company.corp_code,
+        "corp_name": company.corp_name,
+        "stock_code": company.stock_code,
+    }
 
 
 def _company_title(company: dict[str, object]) -> str:
@@ -696,6 +770,21 @@ def _parse_fs_div(value: str) -> str | None:
     if normalized not in {"CFS", "OFS"}:
         raise ValueError("재무제표는 연결, 별도, 전체 중 하나를 선택해 주세요.")
     return normalized
+
+
+def _normalize_company_name(value: str) -> str:
+    return "".join(value.casefold().split())
+
+
+def _ambiguous_company_message(
+    query: str,
+    companies: list[DartCompany],
+) -> str:
+    candidates = ", ".join(
+        f"{company.corp_name}({company.stock_code or company.corp_code})"
+        for company in companies[:5]
+    )
+    return f"'{query}'에 해당하는 기업이 여러 개입니다: {candidates}"
 
 
 def _option(value: str, label: str, selected: str) -> str:

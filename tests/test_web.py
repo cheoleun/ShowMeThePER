@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from show_me_the_per.models import FinancialStatementRow
-from show_me_the_per.web import create_app, default_end_year
+from show_me_the_per.models import DartCompany, FinancialStatementRow
+from show_me_the_per.web import create_app, default_end_year, resolve_company_query
 
 
 class WebTests(TestCase):
@@ -18,7 +18,7 @@ class WebTests(TestCase):
         response = client.get("/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("OpenDART 고유번호", response.text)
+        self.assertIn("기업 이름", response.text)
         self.assertIn("조회", response.text)
         self.assertIn(str(default_end_year()), response.text)
 
@@ -29,7 +29,7 @@ class WebTests(TestCase):
             response = client.get(
                 "/analysis",
                 params={
-                    "corp_code": "00126380",
+                    "company_query": "Samsung Electronics",
                     "recent_years": "2",
                     "end_year": "2025",
                 },
@@ -45,7 +45,7 @@ class WebTests(TestCase):
             response = client.get(
                 "/analysis",
                 params={
-                    "corp_code": "00126380",
+                    "company_query": "Samsung Electronics",
                     "recent_years": "2",
                     "end_year": "2025",
                     "fs_div": "CFS",
@@ -66,21 +66,42 @@ class WebTests(TestCase):
         client = TestClient(create_app(FakeOpenDartClient))
 
         response = client.get(
-            "/analysis",
-            params={
-                "corp_code": "",
-                "recent_years": "abc",
-                "end_year": "2025",
-            },
+                "/analysis",
+                params={
+                    "company_query": "",
+                    "recent_years": "abc",
+                    "end_year": "2025",
+                },
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("OpenDART 고유번호를 입력해 주세요.", response.text)
+        self.assertIn("기업 이름을 입력해 주세요.", response.text)
+
+    def test_resolve_company_query_accepts_name_stock_code_and_corp_code(self) -> None:
+        companies = FakeOpenDartClient("test-key").fetch_companies()
+
+        by_name = resolve_company_query(companies, "Samsung Electronics")
+        by_stock_code = resolve_company_query(companies, "005930")
+        by_corp_code = resolve_company_query(companies, "00126380")
+
+        self.assertEqual(by_name.corp_code, "00126380")
+        self.assertEqual(by_stock_code.corp_code, "00126380")
+        self.assertEqual(by_corp_code.stock_code, "005930")
 
 
 class FakeOpenDartClient:
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
+
+    def fetch_companies(self) -> list[DartCompany]:
+        return [
+            DartCompany(
+                corp_code="00126380",
+                corp_name="Samsung Electronics",
+                stock_code="005930",
+                modify_date="20260419",
+            )
+        ]
 
     def fetch_major_accounts(
         self,
