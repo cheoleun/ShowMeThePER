@@ -54,6 +54,14 @@ python -m show_me_the_per.cli collect-analysis `
 - `coverage-report.json`에서 요청한 기업의 `missing_report_codes`, `missing_business_years`를 확인합니다.
 - `coverage-report.json`의 지표별 `missing_annual_years`, `missing_quarter_periods`를 확인합니다.
 
+같은 입력을 브라우저에서 확인하려면 FastAPI 화면을 실행합니다.
+
+```powershell
+python -m show_me_the_per.cli web --host 127.0.0.1 --port 8000
+```
+
+브라우저에서 `http://127.0.0.1:8000`을 열고 OpenDART 고유번호 `00126380`, 조회 연수 `1`, 기준 연도 `2025`, 재무제표 `연결`을 입력합니다. 결과 화면에서 연간 금액, 분기 금액, 성장률 필터 결과, 성장률 차트를 확인합니다.
+
 ## 최근 10년 확인
 
 1년 스모크런이 성공하면 최근 10년 이상 기간을 실행합니다.

@@ -57,6 +57,7 @@ COMMANDS = {
     "rank-growth-from-db",
     "company-growth-report",
     "growth-ranking-report",
+    "web",
 }
 
 
@@ -489,6 +490,27 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to write static HTML ranking report.",
     )
 
+    web_parser = subparsers.add_parser(
+        "web",
+        help="Run the browser UI with FastAPI.",
+    )
+    web_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host for the FastAPI server. Defaults to 127.0.0.1.",
+    )
+    web_parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port for the FastAPI server. Defaults to 8000.",
+    )
+    web_parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Enable uvicorn reload for local development.",
+    )
+
     args = parser.parse_args(args_list)
     if args.command == "company-master":
         run_company_master(args, parser)
@@ -512,6 +534,8 @@ def main(argv: list[str] | None = None) -> None:
         run_company_growth_report(args)
     elif args.command == "growth-ranking-report":
         run_growth_ranking_report(args)
+    elif args.command == "web":
+        run_web(args)
 
 
 def run_company_master(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -692,6 +716,17 @@ def run_growth_ranking_report(args: argparse.Namespace) -> None:
         limit=args.limit,
     )
     write_growth_ranking_report_html(args.output, payload)
+
+
+def run_web(args: argparse.Namespace) -> None:
+    import uvicorn
+
+    uvicorn.run(
+        "show_me_the_per.web:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+    )
 
 
 def write_or_print_json(payload: dict[str, object], output: Path | None) -> None:
