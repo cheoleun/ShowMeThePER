@@ -26,6 +26,7 @@ class WebTests(TestCase):
         self.assertIn("기업 이름", response.text)
         self.assertIn("조회", response.text)
         self.assertIn(str(default_end_year()), response.text)
+        self.assertIn("loading-indicator", response.text)
 
     def test_analysis_requires_api_key(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
@@ -69,6 +70,7 @@ class WebTests(TestCase):
         self.assertIn("<svg", response.text)
         self.assertIn("150 (25.00%)", response.text)
         self.assertIn("rgb(62, 230, 165)", response.text)
+        self.assertIn("YoY 성장률", response.text)
 
     def test_amount_chart_shows_x_axis_labels_and_change_colors(self) -> None:
         chart = render_metric_amount_chart(
@@ -93,12 +95,17 @@ class WebTests(TestCase):
                     },
                 },
             ],
+            growth_label="YoY 성장률",
+            include_qoq=True,
         )
 
         self.assertIn("rgb(62, 230, 165)", chart)
         self.assertIn("rgb(240, 81, 81)", chart)
         self.assertIn(">2024</text>", chart)
         self.assertIn(">2025</text>", chart)
+        self.assertIn("YoY 성장률", chart)
+        self.assertIn("QoQ 성장률", chart)
+        self.assertIn("<polyline", chart)
 
     def test_analysis_validation_errors_stay_in_browser(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))

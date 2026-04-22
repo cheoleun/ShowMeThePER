@@ -410,6 +410,10 @@ def render_page(
       font-weight: 700;
       cursor: pointer;
     }}
+    button[disabled] {{
+      opacity: 0.75;
+      cursor: wait;
+    }}
     table {{
       width: 100%;
       border-collapse: collapse;
@@ -499,6 +503,59 @@ def render_page(
       margin-bottom: 10px;
     }}
     .empty {{ color: var(--muted); }}
+    .loading-indicator {{
+      display: none;
+      align-items: center;
+      gap: 12px;
+      border-color: #b7d9d0;
+      background: #f2fbf8;
+      color: #16423b;
+    }}
+    .spinner {{
+      width: 18px;
+      height: 18px;
+      border: 2px solid #c5ddd6;
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+      flex: 0 0 auto;
+    }}
+    .loading-copy {{
+      margin: 0;
+      color: #16423b;
+    }}
+    .legend {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin: 8px 0 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .legend-item {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .legend-swatch {{
+      width: 12px;
+      height: 12px;
+      border-radius: 4px;
+      background: #b7c0c8;
+    }}
+    .legend-line {{
+      width: 18px;
+      height: 0;
+      border-top: 3px solid #2563eb;
+      border-radius: 999px;
+    }}
+    body.is-loading .loading-indicator {{
+      display: flex;
+    }}
+    @keyframes spin {{
+      from {{ transform: rotate(0deg); }}
+      to {{ transform: rotate(360deg); }}
+    }}
     @media (max-width: 840px) {{
       main {{ padding: 16px; }}
       header {{ padding: 22px 16px 14px; }}
@@ -514,9 +571,83 @@ def render_page(
     <p>기업 이름과 조회 기간을 입력하면 매출, 영업이익, 순이익과 성장률을 바로 계산합니다.</p>
   </header>
   <main>
+    <section class="notice loading-indicator" id="loading-indicator" aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <div>
+        <strong>조회 요청을 처리하고 있습니다.</strong>
+        <p class="loading-copy" id="loading-status">OpenDART에서 기업 목록과 재무 데이터를 가져오는 중입니다.</p>
+      </div>
+    </section>
     {render_form(form)}
     {result_html}
   </main>
+  <script>
+    (() => {{
+      const form = document.getElementById("analysis-form");
+      const submitButton = document.getElementById("submit-button");
+      const submitLabel = document.querySelector("[data-submit-label]");
+      const submitLoading = document.querySelector("[data-submit-loading]");
+      const loadingStatus = document.getElementById("loading-status");
+      const loadingMessages = [
+        "OpenDART에서 기업 목록을 확인하고 있습니다.",
+        "연도별 재무제표 데이터를 가져오고 있습니다.",
+        "성장률을 계산하고 차트를 준비하고 있습니다.",
+      ];
+      let loadingTimer = null;
+
+      const resetLoading = () => {{
+        document.body.classList.remove("is-loading");
+        if (submitButton) {{
+          submitButton.disabled = false;
+        }}
+        if (submitLabel) {{
+          submitLabel.hidden = false;
+        }}
+        if (submitLoading) {{
+          submitLoading.hidden = true;
+        }}
+        if (loadingStatus) {{
+          loadingStatus.textContent = loadingMessages[0];
+        }}
+        if (loadingTimer !== null) {{
+          window.clearInterval(loadingTimer);
+          loadingTimer = null;
+        }}
+      }};
+
+      if (form) {{
+        form.addEventListener("submit", () => {{
+          document.body.classList.add("is-loading");
+          if (submitButton) {{
+            submitButton.disabled = true;
+          }}
+          if (submitLabel) {{
+            submitLabel.hidden = true;
+          }}
+          if (submitLoading) {{
+            submitLoading.hidden = false;
+          }}
+          let messageIndex = 0;
+          if (loadingStatus) {{
+            loadingStatus.textContent = loadingMessages[messageIndex];
+          }}
+          if (loadingTimer !== null) {{
+            window.clearInterval(loadingTimer);
+          }}
+          loadingTimer = window.setInterval(() => {{
+            if (messageIndex < loadingMessages.length - 1) {{
+              messageIndex += 1;
+              if (loadingStatus) {{
+                loadingStatus.textContent = loadingMessages[messageIndex];
+              }}
+            }}
+          }}, 2500);
+        }});
+      }}
+
+      window.addEventListener("pageshow", resetLoading);
+    }})();
+  </script>
 </body>
 </html>
 """
@@ -524,7 +655,7 @@ def render_page(
 
 def render_form(form: AnalysisForm) -> str:
     return f"""
-    <form method="get" action="/analysis">
+    <form id="analysis-form" method="get" action="/analysis">
       <label>
         기업 이름
         <input name="company_query" value="{escape(form.company_query)}" placeholder="삼성전자" required>
@@ -549,7 +680,10 @@ def render_form(form: AnalysisForm) -> str:
         성장률 기준
         <input name="threshold_percent" value="{escape(form.threshold_percent)}" inputmode="decimal">
       </label>
-      <button type="submit">조회</button>
+      <button id="submit-button" type="submit">
+        <span data-submit-label>조회</span>
+        <span data-submit-loading hidden>조회 중...</span>
+      </button>
     </form>
     """
 
@@ -568,9 +702,9 @@ def render_browser_report(payload: dict[str, object]) -> str:
         <span class="pill">성장률 {escape(str(summary.get("growth_points", 0)))}개</span>
       </div>
       {render_collection_errors(_list(payload.get("collection_errors")))}
-      {render_amount_section("연간 금액", _list(payload.get("annual_rows")))}
-      {render_amount_section("분기 금액", _list(payload.get("quarterly_rows")))}
-      {render_amount_section("최근 4분기 누적 금액", _list(payload.get("trailing_rows")))}
+      {render_amount_section("연간 금액", _list(payload.get("annual_rows")), growth_label="YoY 성장률", include_qoq=False)}
+      {render_amount_section("분기 금액", _list(payload.get("quarterly_rows")), growth_label="YoY 성장률", include_qoq=True)}
+      {render_amount_section("최근 4분기 누적 금액", _list(payload.get("trailing_rows")), growth_label="YoY 성장률", include_qoq=False)}
       <h2>성장률 필터 결과</h2>
       {render_filter_results(_list(payload.get("filter_results")))}
       {render_optional_growth_details(_list(payload.get("growth_sections")))}
@@ -578,11 +712,17 @@ def render_browser_report(payload: dict[str, object]) -> str:
     """
 
 
-def render_amount_section(title: str, rows: list[object]) -> str:
+def render_amount_section(
+    title: str,
+    rows: list[object],
+    *,
+    growth_label: str,
+    include_qoq: bool,
+) -> str:
     return f"""
     <section>
       <h2>{escape(title)}</h2>
-      {render_amount_charts(rows)}
+      {render_amount_charts(rows, growth_label=growth_label, include_qoq=include_qoq)}
       <details>
         <summary>표 보기</summary>
         {render_amount_table(rows)}
@@ -616,9 +756,19 @@ def render_amount_table(rows: list[object]) -> str:
     )
 
 
-def render_amount_charts(rows: list[object]) -> str:
+def render_amount_charts(
+    rows: list[object],
+    *,
+    growth_label: str,
+    include_qoq: bool,
+) -> str:
     charts = [
-        render_metric_amount_chart(metric, rows)
+        render_metric_amount_chart(
+            metric,
+            rows,
+            growth_label=growth_label,
+            include_qoq=include_qoq,
+        )
         for metric in ("revenue", "operating_income", "net_income")
     ]
     rendered = [chart for chart in charts if chart]
@@ -627,7 +777,13 @@ def render_amount_charts(rows: list[object]) -> str:
     return f'<div class="chart-group">{"".join(rendered)}</div>'
 
 
-def render_metric_amount_chart(metric: str, rows: list[object]) -> str:
+def render_metric_amount_chart(
+    metric: str,
+    rows: list[object],
+    *,
+    growth_label: str,
+    include_qoq: bool,
+) -> str:
     chart_rows = []
     for item in reversed(rows[:12]):
         row = _dict(item)
@@ -641,18 +797,31 @@ def render_metric_amount_chart(metric: str, rows: list[object]) -> str:
                 "period": str(row.get("period", "")),
                 "amount": amount,
                 "growth_rate": cell.get("growth_rate"),
+                "qoq_growth_rate": None,
             }
         )
 
     if not chart_rows:
         return ""
 
+    if include_qoq:
+        previous_amount: Decimal | None = None
+        for row in chart_rows:
+            if previous_amount is None:
+                row["qoq_growth_rate"] = None
+            else:
+                row["qoq_growth_rate"] = _calculate_growth_rate(
+                    row["amount"],
+                    previous_amount,
+                )
+            previous_amount = row["amount"]
+
     width = 920
-    height = 320
-    top = 28
+    height = 360
+    top = 48
     left = 48
-    right = 24
-    bottom = 74
+    right = 86
+    bottom = 84
     chart_width = Decimal(width - left - right)
     chart_height = Decimal(height - top - bottom)
     values = [row["amount"] for row in chart_rows]
@@ -675,6 +844,52 @@ def render_metric_amount_chart(metric: str, rows: list[object]) -> str:
     zero_y = y_for(Decimal("0"))
     slot_width = chart_width / Decimal(len(chart_rows))
     bar_width = min(Decimal("52"), slot_width * Decimal("0.62"))
+    growth_series = [
+        {
+            "key": "growth_rate",
+            "label": growth_label,
+            "color": "#2563eb",
+        }
+    ]
+    if include_qoq:
+        growth_series.append(
+            {
+                "key": "qoq_growth_rate",
+                "label": "QoQ 성장률",
+                "color": "#f59e0b",
+            }
+        )
+
+    growth_values = [
+        rate
+        for row in chart_rows
+        for series in growth_series
+        for rate in [_to_decimal(row.get(series["key"]))]
+        if rate is not None
+    ]
+    growth_zero_y: Decimal | None = None
+    growth_min: Decimal | None = None
+    growth_max: Decimal | None = None
+    growth_y_for = None
+    if growth_values:
+        growth_min = min(growth_values + [Decimal("0")])
+        growth_max = max(growth_values + [Decimal("0")])
+        if growth_min == growth_max:
+            growth_min -= Decimal("1")
+            growth_max += Decimal("1")
+        growth_padding = (growth_max - growth_min) * Decimal("0.12")
+        growth_min -= growth_padding
+        growth_max += growth_padding
+
+        def growth_y_for(value: Decimal) -> Decimal:
+            return Decimal(top) + chart_height - (
+                (value - growth_min)
+                / (growth_max - growth_min)
+                * chart_height
+            )
+
+        growth_zero_y = growth_y_for(Decimal("0"))
+
     bars = []
     for index, row in enumerate(chart_rows):
         amount = row["amount"]
@@ -701,16 +916,112 @@ def render_metric_amount_chart(metric: str, rows: list[object]) -> str:
             f'font-size="12" fill="#5d6972" text-anchor="middle">{escape(row["period"])}</text>'
         )
 
+    growth_ticks: list[str] = []
+    growth_lines: list[str] = []
+    if growth_values and growth_y_for is not None and growth_min is not None and growth_max is not None:
+        for tick in _build_growth_axis_ticks(growth_min, growth_max):
+            y = growth_y_for(tick)
+            growth_ticks.append(
+                f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#eef2f5" />'
+                f'<text x="{width - right + 8}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#5d6972">{escape(_format_percent(tick))}</text>'
+            )
+
+        for series in growth_series:
+            growth_lines.append(
+                _render_amount_growth_series(
+                    chart_rows,
+                    value_key=str(series["key"]),
+                    color=str(series["color"]),
+                    left=left,
+                    slot_width=slot_width,
+                    growth_y_for=growth_y_for,
+                )
+            )
+
+    legend_items = [
+        '<span class="legend-item"><span class="legend-swatch"></span><span>금액 막대</span></span>'
+    ]
+    for series in growth_series:
+        legend_items.append(
+            f'<span class="legend-item"><span class="legend-line" style="border-top-color: {escape(str(series["color"]))};"></span><span>{escape(str(series["label"]))}</span></span>'
+        )
+
     return f"""
     <section class="series">
       <h3>{escape(METRIC_LABELS.get(metric, metric))}</h3>
+      <div class="legend">{"".join(legend_items)}</div>
       <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(METRIC_LABELS.get(metric, metric))} 금액 차트">
+        {''.join(growth_ticks)}
+        {''.join(growth_lines)}
+        {(
+            f'<line x1="{left}" y1="{_svg_number(growth_zero_y)}" x2="{width - right}" y2="{_svg_number(growth_zero_y)}" stroke="#d9e4ff" stroke-dasharray="3 4" />'
+            if growth_zero_y is not None
+            else ""
+        )}
         <line x1="{left}" y1="{_svg_number(zero_y)}" x2="{width - right}" y2="{_svg_number(zero_y)}" stroke="#b7c0c8" stroke-dasharray="4 4" />
         <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#d7dde2" />
         {''.join(bars)}
       </svg>
     </section>
     """
+
+
+def _build_growth_axis_ticks(growth_min: Decimal, growth_max: Decimal) -> list[Decimal]:
+    ticks: list[Decimal] = []
+    seen: set[str] = set()
+    for value in (growth_max, Decimal("0"), growth_min):
+        key = str(value.quantize(Decimal("0.1")))
+        if key in seen:
+            continue
+        seen.add(key)
+        ticks.append(value)
+    return ticks
+
+
+def _render_amount_growth_series(
+    chart_rows: list[dict[str, object]],
+    *,
+    value_key: str,
+    color: str,
+    left: int,
+    slot_width: Decimal,
+    growth_y_for: Callable[[Decimal], Decimal],
+) -> str:
+    segments: list[str] = []
+    markers: list[str] = []
+    points: list[str] = []
+
+    def flush_points() -> None:
+        nonlocal points
+        if len(points) >= 2:
+            segments.append(
+                f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />'
+            )
+        points = []
+
+    for index, row in enumerate(chart_rows):
+        rate = _to_decimal(row.get(value_key))
+        if rate is None:
+            flush_points()
+            continue
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        y = growth_y_for(rate)
+        points.append(f'{_svg_number(center_x)},{_svg_number(y)}')
+        markers.append(
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="4" fill="{color}" stroke="#ffffff" stroke-width="1.5" />'
+        )
+
+    flush_points()
+    return ''.join(segments + markers)
+
+
+def _calculate_growth_rate(
+    current_amount: Decimal,
+    previous_amount: Decimal | None,
+) -> Decimal | None:
+    if previous_amount is None or previous_amount <= 0:
+        return None
+    return (current_amount - previous_amount) / previous_amount * Decimal("100")
 
 
 def render_filter_results(results: list[object]) -> str:
