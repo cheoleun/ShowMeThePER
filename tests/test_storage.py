@@ -13,6 +13,8 @@ from show_me_the_per.pipeline import (
 )
 from show_me_the_per.storage import (
     build_database_growth_ranking_payload,
+    read_dart_companies_from_database,
+    read_financial_statement_rows_from_database,
     read_financial_period_values_from_database,
     read_growth_filter_results_from_database,
     read_growth_points_from_database,
@@ -55,6 +57,80 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(second_summary["growth_filter_results"], 1)
         self.assertEqual(len(values), 2)
         self.assertEqual(len(growth_points), 2)
+
+    def test_read_financial_statement_rows_from_database_filters_years(self) -> None:
+        artifacts = build_analysis_artifacts(
+            [
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "130",
+                    business_year="2024",
+                    previous_amount=Decimal("100"),
+                ),
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "150",
+                    business_year="2025",
+                    previous_amount=Decimal("130"),
+                ),
+            ],
+            expected_corp_codes=["00126380"],
+            expected_business_years=["2024", "2025"],
+            expected_report_codes=["11011"],
+            recent_annual_periods=1,
+            recent_quarterly_periods=1,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            store_analysis_artifacts(database_path, artifacts)
+            rows = read_financial_statement_rows_from_database(
+                database_path,
+                corp_code="00126380",
+                business_years=["2025"],
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].business_year, "2025")
+        self.assertEqual(rows[0].current_amount, Decimal("150"))
+
+    def test_read_dart_companies_from_database_returns_unique_companies(self) -> None:
+        artifacts = build_analysis_artifacts(
+            [
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "130",
+                    stock_code="005930",
+                ),
+                financial_row(
+                    "00434003",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "150",
+                    stock_code="000660",
+                ),
+            ],
+            expected_corp_codes=["00126380", "00434003"],
+            expected_business_years=["2025"],
+            expected_report_codes=["11011"],
+            recent_annual_periods=1,
+            recent_quarterly_periods=1,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            store_analysis_artifacts(database_path, artifacts)
+            companies = read_dart_companies_from_database(database_path)
+
+        self.assertEqual(len(companies), 2)
+        self.assertEqual(companies[0].corp_name, "Samsung Electronics")
+        self.assertEqual({company.stock_code for company in companies}, {"005930", "000660"})
 
     def test_store_analysis_directory_loads_written_json_outputs(self) -> None:
         artifacts = build_analysis_artifacts(

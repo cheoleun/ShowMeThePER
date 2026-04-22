@@ -8,7 +8,7 @@ from typing import Iterable
 
 from .financials import read_financial_statement_rows
 from .growth import read_financial_period_values
-from .models import FinancialPeriodValue, FinancialStatementRow, GrowthPoint
+from .models import DartCompany, FinancialPeriodValue, FinancialStatementRow, GrowthPoint
 from .pipeline import AnalysisArtifacts, CollectionError
 from .rankings import rank_growth_filter_results
 
@@ -362,6 +362,79 @@ def store_collection_errors(
     )
 
 
+def read_financial_statement_rows_from_database(
+    database_path: Path,
+    *,
+    corp_code: str | None = None,
+    business_years: Iterable[str] | None = None,
+) -> list[FinancialStatementRow]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if corp_code is not None:
+        clauses.append("corp_code = ?")
+        params.append(corp_code)
+    if business_years is not None:
+        years = [str(year) for year in business_years]
+        if years:
+            placeholders = ", ".join("?" for _ in years)
+            clauses.append(f"business_year IN ({placeholders})")
+            params.extend(years)
+
+    query = """
+        SELECT
+            corp_code,
+            corp_name,
+            stock_code,
+            business_year,
+            report_code,
+            fs_div,
+            fs_name,
+            statement_div,
+            statement_name,
+            account_id,
+            account_name,
+            current_term_name,
+            current_amount,
+            previous_term_name,
+            previous_amount,
+            before_previous_term_name,
+            before_previous_amount
+        FROM financial_statement_rows
+    """
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += (
+        " ORDER BY corp_code, business_year, report_code, fs_div, "
+        "statement_div, statement_name, account_id, account_name, current_term_name"
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(query, params).fetchall()
+
+    return [
+        FinancialStatementRow(
+            corp_code=row[0],
+            corp_name=row[1],
+            stock_code=row[2],
+            business_year=row[3],
+            report_code=row[4],
+            fs_div=row[5],
+            fs_name=row[6],
+            statement_div=row[7],
+            statement_name=row[8],
+            account_id=row[9],
+            account_name=row[10],
+            current_term_name=row[11],
+            current_amount=_parse_decimal(row[12]),
+            previous_term_name=row[13],
+            previous_amount=_parse_decimal(row[14]),
+            before_previous_term_name=row[15],
+            before_previous_amount=_parse_decimal(row[16]),
+        )
+        for row in rows
+    ]
+
+
 def read_financial_period_values_from_database(
     database_path: Path,
     *,
@@ -574,6 +647,22 @@ def read_company_profile_from_database(
         "corp_code": corp_code,
         **company_index.get(corp_code, {"corp_name": "", "stock_code": ""}),
     }
+
+
+def read_dart_companies_from_database(database_path: Path) -> list[DartCompany]:
+    company_index = _read_company_index(database_path)
+    return [
+        DartCompany(
+            corp_code=corp_code,
+            corp_name=profile.get("corp_name", ""),
+            stock_code=profile.get("stock_code", ""),
+            modify_date="",
+        )
+        for corp_code, profile in sorted(
+            company_index.items(),
+            key=lambda item: (item[1].get("corp_name", ""), item[0]),
+        )
+    ]
 
 
 def read_collection_errors(path: Path) -> list[CollectionError]:

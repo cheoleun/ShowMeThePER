@@ -5,6 +5,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from html import escape
 import os
+from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urlencode
 
@@ -35,11 +36,17 @@ from .reports import (
     _format_percent,
     _render_growth_chart,
 )
+from .storage import (
+    read_dart_companies_from_database,
+    read_financial_statement_rows_from_database,
+    store_analysis_artifacts,
+)
 
 
 DEFAULT_RECENT_YEARS = 10
 DEFAULT_THRESHOLD_PERCENT = Decimal("20")
 MIN_OPENDART_YEAR = 2015
+DEFAULT_WEB_CACHE_DIR = Path("data/web-cache")
 DEFAULT_PERIOD_KEY = "quarterly"
 DEFAULT_METRIC_KEY = "revenue"
 METRIC_SEQUENCE = ("revenue", "operating_income", "net_income")
@@ -71,13 +78,13 @@ PERIOD_DEFS = (
 )
 
 QUARTER_COLORS = {
-    1: "#2563eb",
-    2: "#f97316",
-    3: "#16a34a",
-    4: "#eab308",
+    1: "#a5b4fc",
+    2: "#fdba74",
+    3: "#86efac",
+    4: "#fde68a",
 }
-AMOUNT_BAR_COLOR = "#60a5fa"
-AMOUNT_BAR_STROKE = "#2563eb"
+AMOUNT_BAR_COLOR = "#bfdbfe"
+AMOUNT_BAR_STROKE = "#60a5fa"
 GROWTH_LINE_COLORS = {
     "growth_rate": "#7c3aed",
     "qoq_growth_rate": "#e11d48",
@@ -360,9 +367,13 @@ def _collect_browser_payload(
     company_query: str,
     request: dict[str, object],
 ) -> dict[str, object]:
+    database_path = _web_cache_database_path(str(request["fs_div"]))
     try:
-        companies = client.fetch_companies()
-        company = resolve_company_query(companies, company_query)
+        company, company_source = _resolve_company_for_browser(
+            client,
+            database_path=database_path,
+            company_query=company_query,
+        )
     except ValueError:
         raise
     except Exception as error:  # pragma: no cover - exercised through route tests
@@ -373,25 +384,50 @@ def _collect_browser_payload(
             )
         ) from error
 
+    cached_rows = (
+        read_financial_statement_rows_from_database(
+            database_path,
+            corp_code=company.corp_code,
+        )
+        if database_path.exists()
+        else []
+    )
+    cached_years = sorted({row.business_year for row in cached_rows})
+    missing_years = [
+        business_year
+        for business_year in request["business_years"]
+        if business_year not in cached_years
+    ]
+
     try:
-        run = collect_financial_statement_run(
-            client,
-            corp_codes=[company.corp_code],
-            business_years=request["business_years"],
-            report_codes=DEFAULT_REPORT_CODES,
-            fs_div=request["fs_div"],
-            continue_on_error=True,
-        )
-        artifacts = build_analysis_artifacts(
-            run.rows,
-            collection_errors=run.errors,
-            expected_corp_codes=[company.corp_code],
-            expected_business_years=request["business_years"],
-            expected_report_codes=DEFAULT_REPORT_CODES,
-            threshold_percent=request["threshold_percent"],
-            recent_annual_periods=3,
-            recent_quarterly_periods=12,
-        )
+        if missing_years:
+            run = collect_financial_statement_run(
+                client,
+                corp_codes=[company.corp_code],
+                business_years=missing_years,
+                report_codes=DEFAULT_REPORT_CODES,
+                fs_div=request["fs_div"],
+                continue_on_error=True,
+            )
+            merged_rows = _merge_financial_statement_rows(cached_rows, run.rows)
+            artifacts = _build_browser_analysis_artifacts(
+                rows=merged_rows,
+                corp_code=company.corp_code,
+                request=request,
+                collection_errors=run.errors,
+            )
+            store_analysis_artifacts(database_path, artifacts)
+            source_label = "network" if not cached_rows else "cache+network"
+            available_years = sorted({row.business_year for row in merged_rows})
+        else:
+            artifacts = _build_browser_analysis_artifacts(
+                rows=cached_rows,
+                corp_code=company.corp_code,
+                request=request,
+                collection_errors=[],
+            )
+            source_label = "cache"
+            available_years = cached_years
     except Exception as error:  # pragma: no cover - exercised through route tests
         raise RuntimeError(
             _format_request_error(
@@ -400,7 +436,7 @@ def _collect_browser_payload(
             )
         ) from error
 
-    return build_browser_report_payload(
+    payload = build_browser_report_payload(
         artifacts,
         company=company,
         company_query=company_query,
@@ -410,6 +446,20 @@ def _collect_browser_payload(
         fs_div=request["fs_div"],
         threshold_percent=request["threshold_percent"],
     )
+    _dict(payload["summary"]).update(
+        {
+            "cache_database": str(database_path),
+            "data_source": source_label,
+            "company_source": company_source,
+            "cached_business_years": available_years,
+            "fetched_business_years": missing_years,
+            "cache_status": _describe_cache_status(
+                source_label=source_label,
+                fetched_business_years=missing_years,
+            ),
+        }
+    )
+    return payload
 
 
 def build_browser_report_payload(
@@ -486,6 +536,112 @@ def build_browser_report_payload(
     }
     payload["period_groups"] = _build_period_groups(payload)
     return payload
+
+
+def _build_browser_analysis_artifacts(
+    *,
+    rows: list[FinancialStatementRow],
+    corp_code: str,
+    request: dict[str, object],
+    collection_errors: list[object],
+) -> AnalysisArtifacts:
+    return build_analysis_artifacts(
+        rows,
+        collection_errors=list(collection_errors),
+        expected_corp_codes=[corp_code],
+        expected_business_years=[str(year) for year in request["business_years"]],
+        expected_report_codes=DEFAULT_REPORT_CODES,
+        threshold_percent=request["threshold_percent"],
+        recent_annual_periods=3,
+        recent_quarterly_periods=12,
+    )
+
+
+def _resolve_company_for_browser(
+    client: MajorAccountClient,
+    *,
+    database_path: Path,
+    company_query: str,
+) -> tuple[DartCompany, str]:
+    cached_company = _resolve_company_from_cache(database_path, company_query)
+    if cached_company is not None:
+        return cached_company, "cache"
+
+    companies = client.fetch_companies()
+    return resolve_company_query(companies, company_query), "opendart"
+
+
+def _resolve_company_from_cache(
+    database_path: Path,
+    company_query: str,
+) -> DartCompany | None:
+    if not database_path.exists():
+        return None
+    cached_companies = read_dart_companies_from_database(database_path)
+    if not cached_companies:
+        return None
+    try:
+        return resolve_company_query(cached_companies, company_query)
+    except ValueError:
+        return None
+
+
+def _merge_financial_statement_rows(
+    existing_rows: Iterable[FinancialStatementRow],
+    new_rows: Iterable[FinancialStatementRow],
+) -> list[FinancialStatementRow]:
+    merged: dict[tuple[str, ...], FinancialStatementRow] = {}
+    for row in [*existing_rows, *new_rows]:
+        key = (
+            row.corp_code,
+            row.business_year,
+            row.report_code,
+            row.fs_div,
+            row.statement_div,
+            row.statement_name,
+            row.account_id,
+            row.account_name,
+            row.current_term_name,
+        )
+        merged[key] = row
+    return sorted(
+        merged.values(),
+        key=lambda row: (
+            row.corp_code,
+            row.business_year,
+            row.report_code,
+            row.fs_div,
+            row.statement_div,
+            row.statement_name,
+            row.account_id,
+            row.account_name,
+            row.current_term_name,
+        ),
+    )
+
+
+def _web_cache_database_path(fs_div: str) -> Path:
+    base_dir = Path(
+        os.getenv(
+            "SHOW_ME_THE_PER_WEB_CACHE_DIR",
+            str(DEFAULT_WEB_CACHE_DIR),
+        )
+    )
+    return base_dir / f"show-me-the-per-{(fs_div or 'ALL').lower()}.sqlite3"
+
+
+def _describe_cache_status(
+    *,
+    source_label: str,
+    fetched_business_years: list[object],
+) -> str:
+    if source_label == "cache":
+        return "DB 캐시 사용"
+    if not fetched_business_years:
+        return "DB 캐시 사용"
+    if source_label == "network":
+        return f"OpenDART 신규 수집 ({len(fetched_business_years)}개 연도)"
+    return f"DB 캐시 + 최신 {len(fetched_business_years)}개 연도 갱신"
 
 
 def render_analysis_page(
@@ -752,6 +908,18 @@ def render_toolbar_meta(company: dict[str, object], form: AnalysisForm) -> str:
     return f'<div class="toolbar-meta">{"".join(pills)}</div>'
 
 
+def render_cache_status_pill(summary: dict[str, object]) -> str:
+    status = str(summary.get("cache_status", "") or "").strip()
+    if not status:
+        return ""
+    class_name = "inline-pill"
+    if status == "DB 캐시 사용":
+        class_name = "inline-pill inline-pill-accent"
+    elif "OpenDART 신규 수집" in status:
+        class_name = "inline-pill inline-pill-contrast"
+    return f'<span class="{class_name}">{escape(status)}</span>'
+
+
 def render_message(error: str | None = None, info: str | None = None) -> str:
     if error:
         return f'<section class="notice error">{escape(error)}</section>'
@@ -796,6 +964,7 @@ def render_browser_report(payload: dict[str, object]) -> str:
           <p>고유번호 {escape(str(company.get("corp_code", "")))} · 조회 기간 {escape(str(summary.get("start_year", "")))}-{escape(str(summary.get("end_year", "")))} · 재무제표 {escape(str(summary.get("fs_div", "")))}</p>
         </div>
         <div class="company-actions">
+          {render_cache_status_pill(summary)}
           <span class="inline-pill">원천 row {escape(str(summary.get("raw_rows", 0)))}개</span>
           <span class="inline-pill">성장률 {escape(str(summary.get("growth_points", 0)))}개</span>
           <a class="ghost-link" href="{escape(compare_href)}">이 기업으로 비교 시작</a>
