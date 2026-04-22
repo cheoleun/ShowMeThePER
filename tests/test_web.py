@@ -17,16 +17,17 @@ from show_me_the_per.web import (
 
 
 class WebTests(TestCase):
-    def test_home_renders_browser_form(self) -> None:
+    def test_home_renders_v2_analysis_toolbar(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
 
         response = client.get("/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("기업 이름", response.text)
-        self.assertIn("조회", response.text)
-        self.assertIn(str(default_end_year()), response.text)
+        self.assertIn("재무정보", response.text)
+        self.assertIn("VS 기업비교", response.text)
+        self.assertIn('id="analysis-form"', response.text)
         self.assertIn("loading-indicator", response.text)
+        self.assertIn(str(default_end_year()), response.text)
 
     def test_analysis_requires_api_key(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
@@ -36,7 +37,7 @@ class WebTests(TestCase):
                 "/analysis",
                 params={
                     "company_query": "Samsung Electronics",
-                    "recent_years": "2",
+                    "recent_years": "3",
                     "end_year": "2025",
                 },
             )
@@ -44,7 +45,7 @@ class WebTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("OPENDART_API_KEY", response.text)
 
-    def test_analysis_collects_and_renders_financials(self) -> None:
+    def test_analysis_collects_and_renders_v2_dashboard(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
 
         with patch.dict(os.environ, {"OPENDART_API_KEY": "test-key"}):
@@ -52,7 +53,7 @@ class WebTests(TestCase):
                 "/analysis",
                 params={
                     "company_query": "Samsung Electronics",
-                    "recent_years": "2",
+                    "recent_years": "5",
                     "end_year": "2025",
                     "fs_div": "CFS",
                     "threshold_percent": "20",
@@ -61,68 +62,68 @@ class WebTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Samsung Electronics", response.text)
-        self.assertIn("연간 금액", response.text)
-        self.assertIn("분기 금액", response.text)
-        self.assertIn("최근 4분기 누적 금액", response.text)
+        self.assertIn("최근 구간 요약", response.text)
+        self.assertIn("대표 차트", response.text)
+        self.assertIn("이 기업으로 비교 시작", response.text)
         self.assertIn("성장률 필터 결과", response.text)
-        self.assertIn("성장률 상세 보기", response.text)
-        self.assertIn("표 보기", response.text)
-        self.assertIn("<svg", response.text)
-        self.assertIn("150 (25.00%)", response.text)
-        self.assertIn("rgb(62, 230, 165)", response.text)
+        self.assertIn("분기", response.text)
+        self.assertIn("4분기 누적", response.text)
+        self.assertIn("연간", response.text)
         self.assertIn("YoY 성장률", response.text)
+        self.assertIn("QoQ 성장률", response.text)
+        self.assertIn("<svg", response.text)
 
-    def test_amount_chart_shows_x_axis_labels_and_change_colors(self) -> None:
-        chart = render_metric_amount_chart(
-            "revenue",
-            [
-                {
-                    "period": "2025",
-                    "values": {
-                        "revenue": {
-                            "amount": "1500000",
-                            "growth_rate": "25.00",
-                        }
-                    },
-                },
-                {
-                    "period": "2024",
-                    "values": {
-                        "revenue": {
-                            "amount": "1200000",
-                            "growth_rate": "-5.00",
-                        }
-                    },
-                },
-            ],
-            growth_label="YoY 성장률",
-            include_qoq=True,
+    def test_compare_empty_page_renders_form(self) -> None:
+        client = TestClient(create_app(FakeOpenDartClient))
+
+        response = client.get(
+            "/compare",
+            params={
+                "primary_company_query": "Samsung Electronics",
+                "recent_years": "5",
+                "end_year": "2025",
+            },
         )
 
-        self.assertIn("rgb(62, 230, 165)", chart)
-        self.assertIn("rgb(240, 81, 81)", chart)
-        self.assertIn(">2024</text>", chart)
-        self.assertIn(">2025</text>", chart)
-        self.assertIn("YoY 성장률", chart)
-        self.assertIn("QoQ 성장률", chart)
-        self.assertIn("<polyline", chart)
-        self.assertIn(">1.2M</text>", chart)
-        self.assertIn(">1.5M</text>", chart)
-        self.assertIn("<title>2024", chart)
-        self.assertIn("금액: 1,200,000", chart)
-        self.assertIn('data-axis="amount-left"', chart)
-        self.assertIn('data-axis="growth-right"', chart)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("VS 기업비교", response.text)
+        self.assertIn('id="compare-form"', response.text)
+        self.assertIn("비교할 두 기업을 모두 입력해 주세요.", response.text)
+
+    def test_compare_collects_and_renders_dashboard(self) -> None:
+        client = TestClient(create_app(FakeOpenDartClient))
+
+        with patch.dict(os.environ, {"OPENDART_API_KEY": "test-key"}):
+            response = client.get(
+                "/compare",
+                params={
+                    "primary_company_query": "Samsung Electronics",
+                    "secondary_company_query": "Vinatac",
+                    "recent_years": "5",
+                    "end_year": "2025",
+                    "fs_div": "CFS",
+                    "threshold_percent": "20",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Samsung Electronics", response.text)
+        self.assertIn("Vinatac", response.text)
+        self.assertIn("대표 비교 차트", response.text)
+        self.assertIn("최근 값 비교", response.text)
+        self.assertIn("같은 구간, 같은 지표를 한 축에서 비교합니다.", response.text)
+        self.assertIn("<svg", response.text)
 
     def test_analysis_validation_errors_stay_in_browser(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
 
         response = client.get(
-                "/analysis",
-                params={
-                    "company_query": "",
-                    "recent_years": "abc",
-                    "end_year": "2025",
-                },
+            "/analysis",
+            params={
+                "company_query": "",
+                "recent_years": "abc",
+                "end_year": "2025",
+            },
         )
 
         self.assertEqual(response.status_code, 200)
@@ -173,6 +174,43 @@ class WebTests(TestCase):
         self.assertEqual(by_stock_code.corp_code, "00126380")
         self.assertEqual(by_corp_code.stock_code, "005930")
 
+    def test_amount_chart_has_axes_tooltip_and_compact_amount_labels(self) -> None:
+        chart = render_metric_amount_chart(
+            "revenue",
+            [
+                {
+                    "period": "2025Q2",
+                    "values": {
+                        "revenue": {
+                            "amount": "1500000",
+                            "growth_rate": "25.00",
+                        }
+                    },
+                },
+                {
+                    "period": "2025Q1",
+                    "values": {
+                        "revenue": {
+                            "amount": "1200000",
+                            "growth_rate": "-5.00",
+                        }
+                    },
+                },
+            ],
+            growth_label="YoY 성장률",
+            include_qoq=True,
+        )
+
+        self.assertIn("rgb(62, 230, 165)", chart)
+        self.assertIn("rgb(240, 81, 81)", chart)
+        self.assertIn('data-axis="amount-left"', chart)
+        self.assertIn('data-axis="growth-right"', chart)
+        self.assertIn("<title>2025Q1", chart)
+        self.assertIn("금액: 1,200,000", chart)
+        self.assertIn(">1.2M</text>", chart)
+        self.assertIn(">1.5M</text>", chart)
+        self.assertIn("<polyline", chart)
+
 
 class FakeOpenDartClient:
     def __init__(self, api_key: str) -> None:
@@ -185,7 +223,13 @@ class FakeOpenDartClient:
                 corp_name="Samsung Electronics",
                 stock_code="005930",
                 modify_date="20260419",
-            )
+            ),
+            DartCompany(
+                corp_code="00888888",
+                corp_name="Vinatac",
+                stock_code="126340",
+                modify_date="20260419",
+            ),
         ]
 
     def fetch_major_accounts(
@@ -196,8 +240,12 @@ class FakeOpenDartClient:
         fs_div: str | None = None,
         batch_size: int = 100,
     ) -> list[FinancialStatementRow]:
+        corp_code = corp_codes[0]
         year = int(business_year)
+        multiplier = Decimal("1") if corp_code == "00126380" else Decimal("0.35")
         annual_amounts = {
+            2021: Decimal("70"),
+            2022: Decimal("85"),
             2023: Decimal("100"),
             2024: Decimal("120"),
             2025: Decimal("150"),
@@ -219,12 +267,14 @@ class FakeOpenDartClient:
         current_amount = quarter_amounts.get(year, {}).get(
             report_code,
             annual_amounts.get(year, Decimal("0")),
-        )
+        ) * multiplier
         return [
             FinancialStatementRow(
-                corp_code=corp_codes[0],
-                corp_name="Samsung Electronics",
-                stock_code="005930",
+                corp_code=corp_code,
+                corp_name="Samsung Electronics"
+                if corp_code == "00126380"
+                else "Vinatac",
+                stock_code="005930" if corp_code == "00126380" else "126340",
                 business_year=business_year,
                 report_code=report_code,
                 fs_div=fs_div or "CFS",
