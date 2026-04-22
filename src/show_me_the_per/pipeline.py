@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable, Protocol
 
 from .financials import (
+    CORE_METRICS,
     METRIC_ORDER,
     REPORT_CODE_ANNUAL,
     REPORT_CODE_HALF,
@@ -187,7 +188,7 @@ def build_coverage_report(
     expected_corp_codes: Iterable[str] | None = None,
     expected_business_years: Iterable[str | int] | None = None,
     expected_report_codes: Iterable[str] | None = DEFAULT_REPORT_CODES,
-    expected_metrics: Iterable[str] = tuple(METRIC_ORDER),
+    expected_metrics: Iterable[str] = CORE_METRICS,
 ) -> dict[str, object]:
     copied_rows = list(rows)
     copied_values = list(period_values)

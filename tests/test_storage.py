@@ -5,6 +5,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
+from show_me_the_per.krx import KrxStockPriceSnapshot
 from show_me_the_per.models import FinancialStatementRow
 from show_me_the_per.pipeline import (
     CollectionError,
@@ -15,11 +16,13 @@ from show_me_the_per.storage import (
     build_database_growth_ranking_payload,
     read_dart_companies_from_database,
     read_financial_statement_rows_from_database,
+    read_latest_equity_price_snapshot,
     read_financial_period_values_from_database,
     read_growth_filter_results_from_database,
     read_growth_points_from_database,
     store_analysis_artifacts,
     store_analysis_directory,
+    store_equity_price_snapshot,
     summarize_database,
 )
 
@@ -131,6 +134,40 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(companies), 2)
         self.assertEqual(companies[0].corp_name, "Samsung Electronics")
         self.assertEqual({company.stock_code for company in companies}, {"005930", "000660"})
+
+    def test_store_and_read_latest_equity_price_snapshot(self) -> None:
+        snapshot_old = KrxStockPriceSnapshot(
+            base_date="20260418",
+            stock_code="126340",
+            item_name="Vinatac",
+            market="KOSDAQ",
+            close_price=Decimal("36000"),
+            market_cap=Decimal("544444416000"),
+            listed_stock_count=Decimal("15123456"),
+        )
+        snapshot_new = KrxStockPriceSnapshot(
+            base_date="20260421",
+            stock_code="126340",
+            item_name="Vinatac",
+            market="KOSDAQ",
+            close_price=Decimal("37100"),
+            market_cap=Decimal("561080217600"),
+            listed_stock_count=Decimal("15123456"),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            store_equity_price_snapshot(database_path, snapshot_old)
+            store_equity_price_snapshot(database_path, snapshot_new)
+            latest = read_latest_equity_price_snapshot(
+                database_path,
+                stock_code="126340",
+            )
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.base_date, "20260421")
+        self.assertEqual(latest.market, "KOSDAQ")
+        self.assertEqual(latest.close_price, Decimal("37100"))
 
     def test_store_analysis_directory_loads_written_json_outputs(self) -> None:
         artifacts = build_analysis_artifacts(

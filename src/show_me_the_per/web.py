@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from html import escape
 import os
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Protocol
 from urllib.parse import urlencode
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from .growth import ANNUAL_YOY, QUARTERLY_YOY, TRAILING_FOUR_QUARTER_YOY
+from .krx import KrxStockPriceClient, KrxStockPriceSnapshot
 from .models import (
     DartCompany,
     FinancialPeriodValue,
@@ -38,7 +39,9 @@ from .reports import (
 )
 from .storage import (
     read_dart_companies_from_database,
+    read_latest_equity_price_snapshot,
     read_financial_statement_rows_from_database,
+    store_equity_price_snapshot,
     store_analysis_artifacts,
 )
 
@@ -95,6 +98,16 @@ COMPARE_LINE_COLORS = {
 }
 
 
+class StockPriceClient(Protocol):
+    def fetch_stock_price(
+        self,
+        stock_code: str,
+        *,
+        base_date: str,
+    ) -> KrxStockPriceSnapshot:
+        ...
+
+
 @dataclass(frozen=True)
 class AnalysisForm:
     company_query: str = ""
@@ -116,6 +129,7 @@ class CompareForm:
 
 def create_app(
     client_factory: Callable[[str], MajorAccountClient] = OpenDartClient,
+    stock_client_factory: Callable[[str], StockPriceClient] = KrxStockPriceClient,
 ) -> FastAPI:
     app = FastAPI(title="ShowMeThePER")
 
@@ -156,9 +170,11 @@ def create_app(
             )
 
         client = client_factory(api_key)
+        stock_client = _build_stock_price_client(stock_client_factory)
         try:
             payload = _collect_browser_payload(
                 client,
+                stock_client=stock_client,
                 company_query=request["company_query"],
                 request=request,
             )
@@ -210,14 +226,17 @@ def create_app(
             )
 
         client = client_factory(api_key)
+        stock_client = _build_stock_price_client(stock_client_factory)
         try:
             primary_payload = _collect_browser_payload(
                 client,
+                stock_client=stock_client,
                 company_query=request["primary_company_query"],
                 request=request,
             )
             secondary_payload = _collect_browser_payload(
                 client,
+                stock_client=stock_client,
                 company_query=request["secondary_company_query"],
                 request=request,
             )
@@ -250,6 +269,15 @@ app = create_app()
 def default_end_year(today: date | None = None) -> int:
     current = today or date.today()
     return current.year - 1
+
+
+def _build_stock_price_client(
+    stock_client_factory: Callable[[str], StockPriceClient],
+) -> StockPriceClient | None:
+    service_key = os.getenv("KRX_SERVICE_KEY", "").strip()
+    if not service_key:
+        return None
+    return stock_client_factory(service_key)
 
 
 def parse_analysis_request(form: AnalysisForm) -> dict[str, object]:
@@ -364,6 +392,7 @@ def resolve_company_query(
 def _collect_browser_payload(
     client: MajorAccountClient,
     *,
+    stock_client: StockPriceClient | None,
     company_query: str,
     request: dict[str, object],
 ) -> dict[str, object]:
@@ -459,6 +488,13 @@ def _collect_browser_payload(
             ),
         }
     )
+    market_profile = _load_market_profile(
+        database_path=database_path,
+        company=company,
+        stock_client=stock_client,
+    )
+    if market_profile:
+        payload["market_profile"] = market_profile
     return payload
 
 
@@ -642,6 +678,82 @@ def _describe_cache_status(
     if source_label == "network":
         return f"OpenDART 신규 수집 ({len(fetched_business_years)}개 연도)"
     return f"DB 캐시 + 최신 {len(fetched_business_years)}개 연도 갱신"
+
+
+def _load_market_profile(
+    *,
+    database_path: Path,
+    company: DartCompany,
+    stock_client: StockPriceClient | None,
+    today: date | None = None,
+) -> dict[str, object]:
+    stock_code = normalize_stock_code(company.stock_code)
+    if not stock_code:
+        return {}
+
+    cached = read_latest_equity_price_snapshot(
+        database_path,
+        stock_code=stock_code,
+    )
+    candidate_dates = _candidate_market_dates(today or date.today())
+
+    if cached is not None and cached.base_date in candidate_dates:
+        return _market_profile_json(cached, source="cache")
+
+    if stock_client is not None:
+        for base_date in candidate_dates:
+            try:
+                snapshot = stock_client.fetch_stock_price(
+                    stock_code,
+                    base_date=base_date,
+                )
+            except LookupError:
+                continue
+            except Exception:
+                break
+            store_equity_price_snapshot(database_path, snapshot)
+            return _market_profile_json(
+                snapshot,
+                source="cache" if cached is not None else "network",
+            )
+
+    if cached is not None:
+        return _market_profile_json(cached, source="cache")
+
+    return {}
+
+
+def _candidate_market_dates(today: date, attempts: int = 7) -> list[str]:
+    dates: list[str] = []
+    cursor = today
+    while len(dates) < attempts:
+        cursor -= timedelta(days=1)
+        if cursor.weekday() < 5:
+            dates.append(cursor.strftime("%Y%m%d"))
+    return dates
+
+
+def _market_profile_json(
+    snapshot: KrxStockPriceSnapshot,
+    *,
+    source: str,
+) -> dict[str, object]:
+    return {
+        "stock_code": snapshot.stock_code,
+        "base_date": snapshot.base_date,
+        "market": snapshot.market,
+        "item_name": snapshot.item_name,
+        "close_price": (
+            None if snapshot.close_price is None else str(snapshot.close_price)
+        ),
+        "listed_stock_count": (
+            None
+            if snapshot.listed_stock_count is None
+            else str(snapshot.listed_stock_count)
+        ),
+        "market_cap": None if snapshot.market_cap is None else str(snapshot.market_cap),
+        "source": source,
+    }
 
 
 def render_analysis_page(
@@ -920,6 +1032,30 @@ def render_cache_status_pill(summary: dict[str, object]) -> str:
     return f'<span class="{class_name}">{escape(status)}</span>'
 
 
+def render_market_profile_pills(profile: dict[str, object]) -> str:
+    if not profile:
+        return ""
+
+    pills: list[str] = []
+    market = str(profile.get("market", "") or "").strip()
+    if market:
+        pills.append(f'<span class="inline-pill">{escape(market)}</span>')
+
+    close_price = _format_won(profile.get("close_price"))
+    if close_price != "-":
+        pills.append(f'<span class="inline-pill">전일 종가 {escape(close_price)}</span>')
+
+    market_cap = _format_market_cap(profile.get("market_cap"))
+    if market_cap != "-":
+        pills.append(f'<span class="inline-pill">시가총액 {escape(market_cap)}</span>')
+
+    base_date = _format_base_date(profile.get("base_date"))
+    if base_date:
+        pills.append(f'<span class="inline-pill">기준 {escape(base_date)}</span>')
+
+    return "".join(pills)
+
+
 def render_message(error: str | None = None, info: str | None = None) -> str:
     if error:
         return f'<section class="notice error">{escape(error)}</section>'
@@ -945,6 +1081,7 @@ def render_analysis_empty_state() -> str:
 def render_browser_report(payload: dict[str, object]) -> str:
     company = _dict(payload.get("company"))
     summary = _dict(payload.get("summary"))
+    market_profile = _dict(payload.get("market_profile"))
     period_groups = _list(payload.get("period_groups"))
     compare_href = _build_compare_href(
         primary_company_query=str(summary.get("company_query", "")),
@@ -964,6 +1101,7 @@ def render_browser_report(payload: dict[str, object]) -> str:
           <p>고유번호 {escape(str(company.get("corp_code", "")))} · 조회 기간 {escape(str(summary.get("start_year", "")))}-{escape(str(summary.get("end_year", "")))} · 재무제표 {escape(str(summary.get("fs_div", "")))}</p>
         </div>
         <div class="company-actions">
+          {render_market_profile_pills(market_profile)}
           {render_cache_status_pill(summary)}
           <span class="inline-pill">원천 row {escape(str(summary.get("raw_rows", 0)))}개</span>
           <span class="inline-pill">성장률 {escape(str(summary.get("growth_points", 0)))}개</span>
@@ -1047,14 +1185,25 @@ def render_metric_switches() -> str:
     return f'<div class="metric-switches">{"".join(buttons)}</div>'
 
 
+def _available_metrics_for_rows(rows: list[object]) -> tuple[str, ...]:
+    metrics = {
+        metric
+        for row in rows
+        for metric, cell in _dict(_dict(row).get("values")).items()
+        if _to_decimal(_dict(cell).get("amount")) is not None
+    }
+    return tuple(sorted(metrics, key=lambda metric: METRIC_ORDER.get(metric, 999)))
+
+
 def render_snapshot_matrix(group: dict[str, object]) -> str:
     rows = [_dict(row) for row in _list(group.get("rows"))[:5]]
+    metrics = _available_metrics_for_rows(rows)
     headers = "".join(
         f"<th>{escape(str(row.get('period', '')))}</th>"
         for row in rows
     )
     body = []
-    for metric in METRIC_SEQUENCE:
+    for metric in metrics:
         cells = []
         for row in rows:
             cell = _dict(_dict(row.get("values")).get(metric))
@@ -1100,7 +1249,7 @@ def render_focus_panel(group: dict[str, object]) -> str:
 def render_period_grid(group: dict[str, object], compare_href: str) -> str:
     rows = _list(group.get("rows"))
     cards = []
-    for metric in METRIC_SEQUENCE:
+    for metric in _available_metrics_for_rows(rows):
         cards.append(
             f'<article class="panel grid-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
             f'<div class="panel-heading"><h3>{escape(str(group.get("label", "")))} · {escape(METRIC_LABELS.get(metric, metric))}</h3></div>'
@@ -2626,6 +2775,35 @@ def _format_chart_amount(value: object) -> str:
             ).rstrip("0").rstrip(".")
             return f"{text}{suffix}"
     return _format_amount(parsed)
+
+
+def _format_won(value: object) -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+    normalized = parsed.quantize(Decimal("1")) if parsed == parsed.to_integral() else parsed
+    return f"{format(normalized, ',f').rstrip('0').rstrip('.')}원"
+
+
+def _format_market_cap(value: object) -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+    absolute = abs(parsed)
+    if absolute >= Decimal("1000000000000"):
+        scaled = (parsed / Decimal("1000000000000")).quantize(Decimal("0.01"))
+        return f"{format(scaled, 'f').rstrip('0').rstrip('.')}조원"
+    if absolute >= Decimal("100000000"):
+        scaled = (parsed / Decimal("100000000")).quantize(Decimal("0.01"))
+        return f"{format(scaled, 'f').rstrip('0').rstrip('.')}억원"
+    return _format_won(parsed)
+
+
+def _format_base_date(value: object) -> str:
+    text = str(value or "").strip()
+    if len(text) != 8 or not text.isdigit():
+        return text
+    return f"{text[:4]}-{text[4:6]}-{text[6:]}"
 
 
 def _build_amount_chart_tooltip(

@@ -8,6 +8,7 @@ from typing import Iterable
 
 from .financials import read_financial_statement_rows
 from .growth import read_financial_period_values
+from .krx import KrxStockPriceSnapshot
 from .models import DartCompany, FinancialPeriodValue, FinancialStatementRow, GrowthPoint
 from .pipeline import AnalysisArtifacts, CollectionError
 from .rankings import rank_growth_filter_results
@@ -120,6 +121,18 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS equity_price_snapshots (
+        stock_code TEXT NOT NULL,
+        base_date TEXT NOT NULL,
+        market TEXT NOT NULL,
+        item_name TEXT NOT NULL,
+        close_price TEXT,
+        listed_stock_count TEXT,
+        market_cap TEXT,
+        PRIMARY KEY (stock_code, base_date)
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_financial_rows_corp_year
     ON financial_statement_rows (corp_code, business_year)
     """,
@@ -130,6 +143,10 @@ SCHEMA_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS idx_growth_points_corp_metric
     ON growth_points (corp_code, metric, series_type)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_equity_price_snapshots_stock_code
+    ON equity_price_snapshots (stock_code, base_date DESC)
     """,
 )
 
@@ -362,6 +379,36 @@ def store_collection_errors(
     )
 
 
+def store_equity_price_snapshot(
+    database_path: Path,
+    snapshot: KrxStockPriceSnapshot,
+) -> None:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO equity_price_snapshots (
+                stock_code,
+                base_date,
+                market,
+                item_name,
+                close_price,
+                listed_stock_count,
+                market_cap
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot.stock_code,
+                snapshot.base_date,
+                snapshot.market,
+                snapshot.item_name,
+                _decimal_to_text(snapshot.close_price),
+                _decimal_to_text(snapshot.listed_stock_count),
+                _decimal_to_text(snapshot.market_cap),
+            ),
+        )
+
+
 def read_financial_statement_rows_from_database(
     database_path: Path,
     *,
@@ -433,6 +480,45 @@ def read_financial_statement_rows_from_database(
         )
         for row in rows
     ]
+
+
+def read_latest_equity_price_snapshot(
+    database_path: Path,
+    *,
+    stock_code: str,
+) -> KrxStockPriceSnapshot | None:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                stock_code,
+                base_date,
+                market,
+                item_name,
+                close_price,
+                listed_stock_count,
+                market_cap
+            FROM equity_price_snapshots
+            WHERE stock_code = ?
+            ORDER BY base_date DESC
+            LIMIT 1
+            """,
+            (stock_code,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return KrxStockPriceSnapshot(
+        stock_code=row[0],
+        base_date=row[1],
+        market=row[2],
+        item_name=row[3],
+        close_price=_parse_decimal(row[4]),
+        listed_stock_count=_parse_decimal(row[5]),
+        market_cap=_parse_decimal(row[6]),
+    )
 
 
 def read_financial_period_values_from_database(

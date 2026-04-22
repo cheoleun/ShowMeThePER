@@ -26,6 +26,8 @@ METRIC_LABELS = {
     "net_income": "순이익",
 }
 
+METRIC_LABELS["eps"] = "EPS"
+
 SERIES_LABELS = {
     ANNUAL_YOY: "연간 YoY",
     QUARTERLY_YOY: "분기 YoY",
@@ -44,6 +46,8 @@ METRIC_ORDER = {
     "net_income": 2,
 }
 
+
+METRIC_ORDER["eps"] = 3
 
 def build_company_growth_report_payload(
     database_path: Path,

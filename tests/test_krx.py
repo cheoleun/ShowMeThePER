@@ -1,4 +1,4 @@
-from show_me_the_per.krx import parse_krx_listings
+from show_me_the_per.krx import parse_krx_listings, parse_stock_price_payload
 import unittest
 
 
@@ -62,6 +62,37 @@ class KrxParserTests(unittest.TestCase):
 
         self.assertEqual(len(listings), 1)
         self.assertEqual(listings[0].normalized_short_code, "035720")
+
+    def test_parse_stock_price_payload_extracts_close_and_market_cap(self) -> None:
+        payload = {
+            "response": {
+                "header": {
+                    "resultCode": "00",
+                    "resultMsg": "NORMAL SERVICE.",
+                },
+                "body": {
+                    "items": {
+                        "item": {
+                            "basDt": "20260421",
+                            "srtnCd": "126340",
+                            "itmsNm": "Vinatac",
+                            "mrktCtg": "KOSDAQ",
+                            "clpr": "37100",
+                            "lstgStCnt": "15123456",
+                            "mrktTotAmt": "561080217600",
+                        }
+                    }
+                },
+            }
+        }
+
+        snapshots = parse_stock_price_payload(payload)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].stock_code, "126340")
+        self.assertEqual(str(snapshots[0].close_price), "37100")
+        self.assertEqual(str(snapshots[0].market_cap), "561080217600")
+        self.assertEqual(snapshots[0].market, "KOSDAQ")
 
 
 if __name__ == "__main__":

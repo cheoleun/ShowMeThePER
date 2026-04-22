@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from show_me_the_per.krx import KrxStockPriceSnapshot
 from show_me_the_per.models import DartCompany, FinancialStatementRow
 from show_me_the_per.web import (
     create_app,
@@ -72,6 +73,35 @@ class WebTests(TestCase):
         self.assertIn("<svg", response.text)
         self.assertIn("/compare?primary_company_query=Samsung+Electronics", response.text)
         self.assertIn("OpenDART 신규 수집", response.text)
+
+    def test_analysis_renders_eps_and_market_summary(self) -> None:
+        client = TestClient(create_app(FakeOpenDartClient, FakeKrxStockPriceClient))
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Vinatac",
+                        "recent_years": "5",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("EPS", response.text)
+        self.assertIn("KOSDAQ", response.text)
+        self.assertIn("시가총액", response.text)
+        self.assertIn("전일 종가", response.text)
 
     def test_compare_empty_page_renders_form(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
@@ -394,7 +424,7 @@ class FakeOpenDartClient:
             report_code,
             annual_amounts.get(year, Decimal("0")),
         ) * multiplier
-        return [
+        rows = [
             FinancialStatementRow(
                 corp_code=corp_code,
                 corp_name="Samsung Electronics"
@@ -417,6 +447,75 @@ class FakeOpenDartClient:
                 before_previous_amount=annual_amounts.get(year - 2),
             )
         ]
+        if report_code == "11011":
+            eps_amounts = {
+                2015: Decimal("120"),
+                2016: Decimal("135"),
+                2017: Decimal("148"),
+                2018: Decimal("166"),
+                2019: Decimal("182"),
+                2020: Decimal("194"),
+                2021: Decimal("143"),
+                2022: Decimal("168"),
+                2023: Decimal("205"),
+                2024: Decimal("248"),
+                2025: Decimal("310"),
+            }
+            rows.append(
+                FinancialStatementRow(
+                    corp_code=corp_code,
+                    corp_name="Samsung Electronics"
+                    if corp_code == "00126380"
+                    else "Vinatac",
+                    stock_code="005930" if corp_code == "00126380" else "126340",
+                    business_year=business_year,
+                    report_code=report_code,
+                    fs_div=fs_div or "CFS",
+                    fs_name="Consolidated financial statements",
+                    statement_div="IS",
+                    statement_name="Income statement",
+                    account_id="ifrs-full_BasicEarningsLossPerShare",
+                    account_name="Basic earnings per share",
+                    current_term_name="Current",
+                    current_amount=eps_amounts.get(year) * multiplier,
+                    previous_term_name="Previous",
+                    previous_amount=eps_amounts.get(year - 1),
+                    before_previous_term_name="Before previous",
+                    before_previous_amount=eps_amounts.get(year - 2),
+                )
+            )
+        return rows
+
+
+class FakeKrxStockPriceClient:
+    def __init__(self, service_key: str) -> None:
+        self.service_key = service_key
+
+    def fetch_stock_price(
+        self,
+        stock_code: str,
+        *,
+        base_date: str,
+    ) -> KrxStockPriceSnapshot:
+        if stock_code == "126340":
+            return KrxStockPriceSnapshot(
+                base_date=base_date,
+                stock_code="126340",
+                item_name="Vinatac",
+                market="KOSDAQ",
+                close_price=Decimal("37100"),
+                market_cap=Decimal("561080217600"),
+                listed_stock_count=Decimal("15123456"),
+            )
+        return KrxStockPriceSnapshot(
+            base_date=base_date,
+            stock_code="005930",
+            item_name="Samsung Electronics",
+            market="KOSPI",
+            close_price=Decimal("84500"),
+            market_cap=Decimal("504448025000000"),
+            listed_stock_count=Decimal("5969782550"),
+        )
 
 
 class CountingOpenDartClient(FakeOpenDartClient):

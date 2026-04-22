@@ -15,10 +15,17 @@ from .models import (
 METRIC_REVENUE = "revenue"
 METRIC_OPERATING_INCOME = "operating_income"
 METRIC_NET_INCOME = "net_income"
+METRIC_EPS = "eps"
+CORE_METRICS = (
+    METRIC_REVENUE,
+    METRIC_OPERATING_INCOME,
+    METRIC_NET_INCOME,
+)
 METRIC_ORDER = {
     METRIC_REVENUE: 0,
     METRIC_OPERATING_INCOME: 1,
     METRIC_NET_INCOME: 2,
+    METRIC_EPS: 3,
 }
 
 REPORT_CODE_ANNUAL = "11011"
@@ -42,6 +49,10 @@ ACCOUNT_ID_METRICS = {
     "ifrs-full_RevenueFromContractsWithCustomers": METRIC_REVENUE,
     "dart_OperatingIncomeLoss": METRIC_OPERATING_INCOME,
     "ifrs-full_ProfitLoss": METRIC_NET_INCOME,
+    "ifrs-full_BasicEarningsLossPerShare": METRIC_EPS,
+    "dart_BasicEarningsPerShare": METRIC_EPS,
+    "dart_DilutedEarningsPerShare": METRIC_EPS,
+    "ifrs-full_DilutedEarningsLossPerShare": METRIC_EPS,
 }
 
 ACCOUNT_NAME_METRICS = (
@@ -153,6 +164,8 @@ def build_quarterly_period_values_from_rows(
 
         metric = map_financial_account_to_metric(row.account_id, row.account_name)
         if metric is None:
+            continue
+        if metric == METRIC_EPS:
             continue
 
         try:

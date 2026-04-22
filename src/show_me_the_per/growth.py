@@ -13,6 +13,7 @@ from .models import FinancialPeriodValue, GrowthPoint
 ANNUAL_YOY = "annual_yoy"
 QUARTERLY_YOY = "quarterly_yoy"
 TRAILING_FOUR_QUARTER_YOY = "trailing_four_quarter_yoy"
+FILTERABLE_METRICS = frozenset({"revenue", "operating_income", "net_income"})
 
 
 def calculate_annual_yoy_growth(
@@ -263,6 +264,8 @@ def _build_filter_results(
         sorted_points,
         key=lambda point: (point.corp_code, point.metric, point.series_type),
     ):
+        if metric not in FILTERABLE_METRICS:
+            continue
         grouped = list(grouped_points)
         recent_periods = (
             recent_annual_periods
