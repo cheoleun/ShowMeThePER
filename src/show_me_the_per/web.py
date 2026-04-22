@@ -629,7 +629,7 @@ def render_amount_charts(rows: list[object]) -> str:
 
 def render_metric_amount_chart(metric: str, rows: list[object]) -> str:
     chart_rows = []
-    for item in rows[:12]:
+    for item in reversed(rows[:12]):
         row = _dict(item)
         values = _dict(row.get("values"))
         cell = _dict(values.get(metric))
@@ -648,12 +648,13 @@ def render_metric_amount_chart(metric: str, rows: list[object]) -> str:
         return ""
 
     width = 920
-    row_height = 30
-    top = 30
-    left = 160
-    right = 90
-    bottom = 20
-    height = top + bottom + row_height * len(chart_rows)
+    height = 320
+    top = 28
+    left = 48
+    right = 24
+    bottom = 74
+    chart_width = Decimal(width - left - right)
+    chart_height = Decimal(height - top - bottom)
     values = [row["amount"] for row in chart_rows]
     min_value = min(values + [Decimal("0")])
     max_value = max(values + [Decimal("0")])
@@ -664,34 +665,48 @@ def render_metric_amount_chart(metric: str, rows: list[object]) -> str:
     min_value -= padding
     max_value += padding
 
-    def x_for(value: Decimal) -> Decimal:
-        return Decimal(left) + (
+    def y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + chart_height - (
             (value - min_value)
             / (max_value - min_value)
-            * Decimal(width - left - right)
+            * chart_height
         )
 
-    zero_x = x_for(Decimal("0"))
+    zero_y = y_for(Decimal("0"))
+    slot_width = chart_width / Decimal(len(chart_rows))
+    bar_width = min(Decimal("52"), slot_width * Decimal("0.62"))
     bars = []
     for index, row in enumerate(chart_rows):
         amount = row["amount"]
-        value_x = x_for(amount)
-        bar_x = min(zero_x, value_x)
-        bar_width = abs(value_x - zero_x)
-        y = Decimal(top + index * row_height + 6)
+        value_y = y_for(amount)
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        bar_x = center_x - (bar_width / Decimal("2"))
+        bar_y = min(value_y, zero_y)
+        bar_height = max(abs(zero_y - value_y), Decimal("1"))
+        label_y = (
+            max(Decimal("16"), bar_y - Decimal("8"))
+            if amount >= 0
+            else min(Decimal(height - 18), bar_y + bar_height + Decimal("16"))
+        )
+        tick_bottom = Decimal(height - bottom)
         bars.append(
-            f'<text x="12" y="{_svg_number(y + Decimal("14"))}" font-size="13" fill="#172026">{escape(_truncate_label(row["period"], 18))}</text>'
-            f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(y)}" width="{_svg_number(bar_width)}" height="18" fill="#0b6b5c" rx="4" />'
-            f'<text x="{_svg_number(value_x + Decimal("6") if amount >= 0 else value_x - Decimal("6"))}" '
-            f'y="{_svg_number(y + Decimal("14"))}" font-size="12" fill="#5d6972" '
-            f'text-anchor="{"start" if amount >= 0 else "end"}">{escape(_format_amount_with_growth(amount, row.get("growth_rate")))}</text>'
+            f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(bar_y)}" '
+            f'width="{_svg_number(bar_width)}" height="{_svg_number(bar_height)}" '
+            f'fill="{_amount_chart_fill(row.get("growth_rate"))}" rx="4" />'
+            f'<text x="{_svg_number(center_x)}" y="{_svg_number(label_y)}" font-size="12" fill="#5d6972" '
+            f'text-anchor="middle">{escape(_format_amount_with_growth(amount, row.get("growth_rate")))}</text>'
+            f'<line x1="{_svg_number(center_x)}" y1="{_svg_number(tick_bottom)}" '
+            f'x2="{_svg_number(center_x)}" y2="{_svg_number(tick_bottom + Decimal("6"))}" stroke="#b7c0c8" />'
+            f'<text x="{_svg_number(center_x)}" y="{_svg_number(tick_bottom + Decimal("22"))}" '
+            f'font-size="12" fill="#5d6972" text-anchor="middle">{escape(row["period"])}</text>'
         )
 
     return f"""
     <section class="series">
       <h3>{escape(METRIC_LABELS.get(metric, metric))}</h3>
       <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(METRIC_LABELS.get(metric, metric))} 금액 차트">
-        <line x1="{_svg_number(zero_x)}" y1="{top}" x2="{_svg_number(zero_x)}" y2="{height - bottom}" stroke="#b7c0c8" stroke-dasharray="4 4" />
+        <line x1="{left}" y1="{_svg_number(zero_y)}" x2="{width - right}" y2="{_svg_number(zero_y)}" stroke="#b7c0c8" stroke-dasharray="4 4" />
+        <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#d7dde2" />
         {''.join(bars)}
       </svg>
     </section>
@@ -976,6 +991,17 @@ def _format_amount_cell(cell: dict[str, object]) -> str:
 
 def _format_amount_with_growth(amount: object, growth_rate: object) -> str:
     return f"{_format_amount(amount)} ({_format_percent(growth_rate)})"
+
+
+def _amount_chart_fill(growth_rate: object) -> str:
+    growth = _to_decimal(growth_rate)
+    if growth is None:
+        return "#b7c0c8"
+    if growth > 0:
+        return "rgb(62, 230, 165)"
+    if growth < 0:
+        return "rgb(240, 81, 81)"
+    return "#b7c0c8"
 
 
 def _to_decimal(value: object) -> Decimal | None:

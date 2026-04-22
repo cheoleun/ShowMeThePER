@@ -8,7 +8,12 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from show_me_the_per.models import DartCompany, FinancialStatementRow
-from show_me_the_per.web import create_app, default_end_year, resolve_company_query
+from show_me_the_per.web import (
+    create_app,
+    default_end_year,
+    render_metric_amount_chart,
+    resolve_company_query,
+)
 
 
 class WebTests(TestCase):
@@ -63,6 +68,37 @@ class WebTests(TestCase):
         self.assertIn("표 보기", response.text)
         self.assertIn("<svg", response.text)
         self.assertIn("150 (25.00%)", response.text)
+        self.assertIn("rgb(62, 230, 165)", response.text)
+
+    def test_amount_chart_shows_x_axis_labels_and_change_colors(self) -> None:
+        chart = render_metric_amount_chart(
+            "revenue",
+            [
+                {
+                    "period": "2025",
+                    "values": {
+                        "revenue": {
+                            "amount": "150",
+                            "growth_rate": "25.00",
+                        }
+                    },
+                },
+                {
+                    "period": "2024",
+                    "values": {
+                        "revenue": {
+                            "amount": "120",
+                            "growth_rate": "-5.00",
+                        }
+                    },
+                },
+            ],
+        )
+
+        self.assertIn("rgb(62, 230, 165)", chart)
+        self.assertIn("rgb(240, 81, 81)", chart)
+        self.assertIn(">2024</text>", chart)
+        self.assertIn(">2025</text>", chart)
 
     def test_analysis_validation_errors_stay_in_browser(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
