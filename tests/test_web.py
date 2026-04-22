@@ -11,6 +11,7 @@ from show_me_the_per.models import DartCompany, FinancialStatementRow
 from show_me_the_per.web import (
     create_app,
     default_end_year,
+    render_compare_metric_chart,
     render_metric_amount_chart,
     resolve_company_query,
 )
@@ -174,42 +175,60 @@ class WebTests(TestCase):
         self.assertEqual(by_stock_code.corp_code, "00126380")
         self.assertEqual(by_corp_code.stock_code, "005930")
 
-    def test_amount_chart_has_axes_tooltip_and_compact_amount_labels(self) -> None:
+    def test_quarterly_amount_chart_uses_full_ten_year_window_and_year_labels(self) -> None:
         chart = render_metric_amount_chart(
             "revenue",
-            [
-                {
-                    "period": "2025Q2",
-                    "values": {
-                        "revenue": {
-                            "amount": "1500000",
-                            "growth_rate": "25.00",
-                        }
-                    },
-                },
-                {
-                    "period": "2025Q1",
-                    "values": {
-                        "revenue": {
-                            "amount": "1200000",
-                            "growth_rate": "-5.00",
-                        }
-                    },
-                },
-            ],
+            _build_quarterly_rows(2016, 2025),
+            period_key="quarterly",
             growth_label="YoY 성장률",
             include_qoq=True,
         )
 
-        self.assertIn("rgb(62, 230, 165)", chart)
-        self.assertIn("rgb(240, 81, 81)", chart)
+        self.assertIn("#2563eb", chart)
+        self.assertIn("#f97316", chart)
+        self.assertIn("#16a34a", chart)
+        self.assertIn("#eab308", chart)
+        self.assertIn("#7c3aed", chart)
+        self.assertIn("#e11d48", chart)
         self.assertIn('data-axis="amount-left"', chart)
         self.assertIn('data-axis="growth-right"', chart)
-        self.assertIn("<title>2025Q1", chart)
-        self.assertIn("금액: 1,200,000", chart)
-        self.assertIn(">1.2M</text>", chart)
-        self.assertIn(">1.5M</text>", chart)
+        self.assertIn("<title>2025Q4", chart)
+        self.assertIn("금액: 212,000", chart)
+        self.assertIn(">2016</text>", chart)
+        self.assertIn(">2025</text>", chart)
+        self.assertNotIn('font-size="12" fill="#475569" text-anchor="middle">220K</text>', chart)
         self.assertIn("<polyline", chart)
+
+    def test_annual_amount_chart_uses_full_recent_years_window(self) -> None:
+        chart = render_metric_amount_chart(
+            "revenue",
+            _build_annual_rows(2016, 2025),
+            period_key="annual",
+            growth_label="YoY 성장률",
+            include_qoq=False,
+        )
+
+        self.assertIn(">2016</text>", chart)
+        self.assertIn(">2025</text>", chart)
+        self.assertIn("#60a5fa", chart)
+        self.assertIn("#7c3aed", chart)
+
+    def test_compare_quarterly_chart_renders_vertical_two_panel_layout(self) -> None:
+        chart = render_compare_metric_chart(
+            "revenue",
+            _build_quarterly_rows(2016, 2025),
+            _build_quarterly_rows(2016, 2025, multiplier=Decimal("0.7")),
+            period_key="quarterly",
+            primary_name="Samsung Electronics",
+            secondary_name="Vinatac",
+            title="분기 비교",
+        )
+
+        self.assertIn("compare-chart-stack", chart)
+        self.assertIn("compare-panel-title", chart)
+        self.assertIn("Samsung Electronics", chart)
+        self.assertIn("Vinatac", chart)
+        self.assertGreaterEqual(chart.count("<svg"), 2)
 
 
 class FakeOpenDartClient:
@@ -308,6 +327,58 @@ class FailingFinancialClient(FakeOpenDartClient):
         batch_size: int = 100,
     ) -> list[FinancialStatementRow]:
         raise RuntimeError("temporary financial fetch failure")
+
+
+def _build_quarterly_rows(
+    start_year: int,
+    end_year: int,
+    *,
+    multiplier: Decimal = Decimal("1"),
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    base = Decimal("100000")
+    for year in range(end_year, start_year - 1, -1):
+        for quarter in range(4, 0, -1):
+            amount = (
+                base
+                + Decimal(year - start_year) * Decimal("8000")
+                + Decimal(quarter) * Decimal("10000")
+            ) * multiplier
+            growth = Decimal(year - start_year + quarter)
+            rows.append(
+                {
+                    "period": f"{year}Q{quarter}",
+                    "fiscal_year": year,
+                    "fiscal_quarter": quarter,
+                    "values": {
+                        "revenue": {
+                            "amount": str(amount),
+                            "growth_rate": str(growth),
+                        }
+                    },
+                }
+            )
+    return rows
+
+
+def _build_annual_rows(start_year: int, end_year: int) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for year in range(end_year, start_year - 1, -1):
+        amount = Decimal("1000000") + Decimal(year - start_year) * Decimal("150000")
+        rows.append(
+            {
+                "period": str(year),
+                "fiscal_year": year,
+                "fiscal_quarter": None,
+                "values": {
+                    "revenue": {
+                        "amount": str(amount),
+                        "growth_rate": str(Decimal(year - start_year + 3)),
+                    }
+                },
+            }
+        )
+    return rows
 
 
 if __name__ == "__main__":

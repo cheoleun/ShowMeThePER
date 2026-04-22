@@ -70,6 +70,23 @@ PERIOD_DEFS = (
     },
 )
 
+QUARTER_COLORS = {
+    1: "#2563eb",
+    2: "#f97316",
+    3: "#16a34a",
+    4: "#eab308",
+}
+AMOUNT_BAR_COLOR = "#60a5fa"
+AMOUNT_BAR_STROKE = "#2563eb"
+GROWTH_LINE_COLORS = {
+    "growth_rate": "#7c3aed",
+    "qoq_growth_rate": "#e11d48",
+}
+COMPARE_LINE_COLORS = {
+    "primary": "#2563eb",
+    "secondary": "#f97316",
+}
+
 
 @dataclass(frozen=True)
 class AnalysisForm:
@@ -905,7 +922,7 @@ def render_focus_panel(group: dict[str, object]) -> str:
         panels.append(
             f'<div class="chart-focus-panel" data-panel data-period="{escape(str(group.get("key", "")))}" '
             f'data-metric="{escape(metric)}" {"hidden" if not (group.get("key") == DEFAULT_PERIOD_KEY and metric == DEFAULT_METRIC_KEY) else ""}>'
-            f'{render_metric_amount_chart(metric, rows, growth_label=str(group.get("growth_label", "")), include_qoq=bool(group.get("include_qoq")), width=820, height=350)}'
+            f'{render_metric_amount_chart(metric, rows, period_key=str(group.get("key", "")), growth_label=str(group.get("growth_label", "")), include_qoq=bool(group.get("include_qoq")), width=820, height=350)}'
             "</div>"
         )
     return "".join(panels)
@@ -918,7 +935,7 @@ def render_period_grid(group: dict[str, object], compare_href: str) -> str:
         cards.append(
             f'<article class="panel grid-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
             f'<div class="panel-heading"><h3>{escape(str(group.get("label", "")))} · {escape(METRIC_LABELS.get(metric, metric))}</h3></div>'
-            f'{render_metric_amount_chart(metric, rows, growth_label=str(group.get("growth_label", "")), include_qoq=bool(group.get("include_qoq")), width=540, height=320)}'
+            f'{render_metric_amount_chart(metric, rows, period_key=str(group.get("key", "")), growth_label=str(group.get("growth_label", "")), include_qoq=bool(group.get("include_qoq")), width=540, height=320)}'
             "</article>"
         )
 
@@ -1037,7 +1054,7 @@ def render_compare_focus_panel(
         panels.append(
             f'<div class="chart-focus-panel" data-panel data-period="{escape(str(group.get("key", "")))}" data-metric="{escape(metric)}" '
             f'{"hidden" if not (group.get("key") == DEFAULT_PERIOD_KEY and metric == DEFAULT_METRIC_KEY) else ""}>'
-            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), primary_name=_company_title(primary_company), secondary_name=_company_title(secondary_company), title=chart_title)}'
+            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), period_key=str(group.get("key", "")), primary_name=_company_title(primary_company), secondary_name=_company_title(secondary_company), title=chart_title)}'
             "</div>"
         )
     return "".join(panels)
@@ -1053,7 +1070,7 @@ def render_compare_grid(
         chart_title = f"{group.get('label')} · {METRIC_LABELS.get(metric, metric)}"
         cards.append(
             f'<article class="panel grid-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
-            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), primary_name=_company_title(primary_company), secondary_name=_company_title(secondary_company), title=chart_title)}'
+            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), period_key=str(group.get("key", "")), primary_name=_company_title(primary_company), secondary_name=_company_title(secondary_company), title=chart_title)}'
             "</article>"
         )
     cards.append(
@@ -1152,11 +1169,35 @@ def render_metric_amount_chart(
     metric: str,
     rows: list[object],
     *,
+    period_key: str,
     growth_label: str,
     include_qoq: bool,
     width: int = 920,
     height: int = 360,
 ) -> str:
+    chart_rows = _build_metric_chart_rows(rows, metric, include_qoq=include_qoq)
+    if not chart_rows:
+        return '<p class="empty">차트로 표시할 금액 데이터가 없습니다.</p>'
+
+    if period_key == "quarterly":
+        return _render_quarterly_metric_amount_chart(
+            metric,
+            chart_rows,
+            growth_label=growth_label,
+            include_qoq=include_qoq,
+            width=width,
+            height=height,
+        )
+
+    return _render_series_metric_amount_chart(
+        metric,
+        chart_rows,
+        growth_label=growth_label,
+        include_qoq=include_qoq,
+        width=width,
+        height=height,
+    )
+
     chart_rows: list[dict[str, object]] = []
     for item in reversed(rows[:12]):
         row = _dict(item)
@@ -1353,12 +1394,36 @@ def render_compare_metric_chart(
     primary_rows: list[object],
     secondary_rows: list[object],
     *,
+    period_key: str,
     primary_name: str,
     secondary_name: str,
     title: str,
     width: int = 540,
     height: int = 320,
 ) -> str:
+    if period_key == "quarterly":
+        return _render_compare_quarterly_metric_chart(
+            metric,
+            primary_rows,
+            secondary_rows,
+            primary_name=primary_name,
+            secondary_name=secondary_name,
+            title=title,
+            width=width,
+            height=height,
+        )
+
+    return _render_compare_series_metric_chart(
+        metric,
+        primary_rows,
+        secondary_rows,
+        primary_name=primary_name,
+        secondary_name=secondary_name,
+        title=title,
+        width=width,
+        height=height,
+    )
+
     primary_points = _compare_chart_points(primary_rows, metric)
     secondary_points = _compare_chart_points(secondary_rows, metric)
     labels = [point["period"] for point in primary_points or secondary_points]
@@ -1572,6 +1637,728 @@ def _render_compare_line(
     )
 
 
+def _build_metric_chart_rows(
+    rows: list[object],
+    metric: str,
+    *,
+    include_qoq: bool,
+) -> list[dict[str, object]]:
+    chart_rows: list[dict[str, object]] = []
+    for item in reversed(rows):
+        row = _dict(item)
+        cell = _dict(_dict(row.get("values")).get(metric))
+        amount = _to_decimal(cell.get("amount"))
+        if amount is None:
+            continue
+        chart_rows.append(
+            {
+                "period": str(row.get("period", "")),
+                "amount": amount,
+                "growth_rate": cell.get("growth_rate"),
+                "qoq_growth_rate": None,
+                "fiscal_year": _row_fiscal_year(row),
+                "fiscal_quarter": _row_fiscal_quarter(row),
+            }
+        )
+
+    if include_qoq:
+        previous_amount: Decimal | None = None
+        for row in chart_rows:
+            row["qoq_growth_rate"] = _calculate_growth_rate(
+                row["amount"],
+                previous_amount,
+            )
+            previous_amount = row["amount"]
+
+    return chart_rows
+
+
+def _render_series_metric_amount_chart(
+    metric: str,
+    chart_rows: list[dict[str, object]],
+    *,
+    growth_label: str,
+    include_qoq: bool,
+    width: int,
+    height: int,
+) -> str:
+    top = 36
+    left = 86
+    right = 96
+    bottom = 84
+    chart_width = Decimal(width - left - right)
+    chart_height = Decimal(height - top - bottom)
+    amount_range = _build_numeric_range(
+        [row["amount"] for row in chart_rows],
+        padding_ratio=Decimal("0.08"),
+    )
+    if amount_range is None:
+        return '<p class="empty">차트로 표시할 금액 데이터가 없습니다.</p>'
+    min_value, max_value = amount_range
+
+    def y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + chart_height - (
+            (value - min_value)
+            / (max_value - min_value)
+            * chart_height
+        )
+
+    zero_y = y_for(Decimal("0"))
+    slot_width = chart_width / Decimal(max(len(chart_rows), 1))
+    bar_width = min(Decimal("54"), slot_width * Decimal("0.62"))
+    show_value_labels = len(chart_rows) <= 16
+    x_label_stride = _x_label_stride(len(chart_rows))
+
+    growth_series = [
+        {
+            "key": "growth_rate",
+            "label": growth_label,
+            "color": GROWTH_LINE_COLORS["growth_rate"],
+        }
+    ]
+    if include_qoq:
+        growth_series.append(
+            {
+                "key": "qoq_growth_rate",
+                "label": "QoQ 성장률",
+                "color": GROWTH_LINE_COLORS["qoq_growth_rate"],
+            }
+        )
+
+    growth_values = [
+        rate
+        for row in chart_rows
+        for series in growth_series
+        for rate in [_to_decimal(row.get(series["key"]))]
+        if rate is not None
+    ]
+    growth_range = _build_numeric_range(
+        growth_values,
+        padding_ratio=Decimal("0.12"),
+    )
+    growth_zero_y: Decimal | None = None
+    growth_y_for = None
+    if growth_range is not None:
+        growth_min, growth_max = growth_range
+
+        def growth_y_for(value: Decimal) -> Decimal:
+            return Decimal(top) + chart_height - (
+                (value - growth_min)
+                / (growth_max - growth_min)
+                * chart_height
+            )
+
+        growth_zero_y = growth_y_for(Decimal("0"))
+
+    amount_ticks = _build_amount_axis_ticks(min_value, max_value)
+    amount_grid = []
+    amount_labels = []
+    for tick in amount_ticks:
+        y = y_for(tick)
+        amount_grid.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#e6edf5" />'
+        )
+        amount_labels.append(
+            f'<line x1="{left - 6}" y1="{_svg_number(y)}" x2="{left}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569" text-anchor="end">{escape(_format_chart_amount(tick))}</text>'
+        )
+
+    bars = []
+    for index, row in enumerate(chart_rows):
+        amount = row["amount"]
+        value_y = y_for(amount)
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        bar_x = center_x - (bar_width / Decimal("2"))
+        bar_y = min(value_y, zero_y)
+        bar_height = max(abs(zero_y - value_y), Decimal("1"))
+        tick_bottom = Decimal(height - bottom)
+        label_y = (
+            max(Decimal("16"), bar_y - Decimal("8"))
+            if amount >= 0
+            else min(Decimal(height - 18), bar_y + bar_height + Decimal("16"))
+        )
+        label_markup = ""
+        if show_value_labels:
+            label_markup = (
+                f'<text x="{_svg_number(center_x)}" y="{_svg_number(label_y)}" font-size="12" fill="#475569" text-anchor="middle">{escape(_format_chart_amount(amount))}</text>'
+            )
+        tick_markup = ""
+        if _should_render_x_label(index, len(chart_rows), x_label_stride):
+            tick_markup = (
+                f'<line x1="{_svg_number(center_x)}" y1="{_svg_number(tick_bottom)}" x2="{_svg_number(center_x)}" y2="{_svg_number(tick_bottom + Decimal("6"))}" stroke="#94a3b8" />'
+                f'<text x="{_svg_number(center_x)}" y="{_svg_number(tick_bottom + Decimal("22"))}" font-size="12" fill="#475569" text-anchor="middle">{escape(_truncate_label(str(row["period"]), 12))}</text>'
+            )
+        bars.append(
+            "<g>"
+            f"<title>{escape(_build_amount_chart_tooltip(row, growth_label=growth_label, include_qoq=include_qoq))}</title>"
+            f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(bar_y)}" width="{_svg_number(bar_width)}" height="{_svg_number(bar_height)}" fill="{AMOUNT_BAR_COLOR}" stroke="{AMOUNT_BAR_STROKE}" stroke-width="1" rx="4" />'
+            f"{label_markup}"
+            f"{tick_markup}"
+            "</g>"
+        )
+
+    growth_ticks = []
+    growth_lines = []
+    if growth_range is not None and growth_y_for is not None and growth_zero_y is not None:
+        growth_min, growth_max = growth_range
+        for tick in _build_growth_axis_ticks(growth_min, growth_max):
+            y = growth_y_for(tick)
+            growth_ticks.append(
+                f'<line x1="{width - right}" y1="{_svg_number(y)}" x2="{width - right + 6}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+                f'<text x="{width - right + 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569">{escape(_format_percent(tick))}</text>'
+            )
+        for series in growth_series:
+            growth_lines.append(
+                _render_amount_growth_series(
+                    chart_rows,
+                    value_key=str(series["key"]),
+                    color=str(series["color"]),
+                    left=left,
+                    slot_width=slot_width,
+                    growth_y_for=growth_y_for,
+                )
+            )
+
+    legend_items = [
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{AMOUNT_BAR_COLOR};"></span><span>금액</span></span>'
+    ]
+    for series in growth_series:
+        legend_items.append(
+            f'<span class="legend-item"><span class="legend-line" style="border-top-color: {escape(str(series["color"]))};"></span><span>{escape(str(series["label"]))}</span></span>'
+        )
+
+    return f"""
+    <div class="chart-shell">
+      <div class="legend">{"".join(legend_items)}</div>
+      <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(METRIC_LABELS.get(metric, metric))} 금액 차트">
+        {''.join(amount_grid)}
+        {(
+            f'<line x1="{left}" y1="{_svg_number(growth_zero_y)}" x2="{width - right}" y2="{_svg_number(growth_zero_y)}" stroke="#e9d5ff" stroke-dasharray="3 4" />'
+            if growth_zero_y is not None
+            else ""
+        )}
+        <line x1="{left}" y1="{_svg_number(zero_y)}" x2="{width - right}" y2="{_svg_number(zero_y)}" stroke="#94a3b8" stroke-dasharray="4 4" />
+        <line data-axis="amount-left" x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#94a3b8" />
+        <line data-axis="growth-right" x1="{width - right}" y1="{top}" x2="{width - right}" y2="{height - bottom}" stroke="#94a3b8" />
+        <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#cbd5e1" />
+        {''.join(amount_labels)}
+        {''.join(bars)}
+        {''.join(growth_ticks)}
+        {''.join(growth_lines)}
+      </svg>
+    </div>
+    """
+
+
+def _render_quarterly_metric_amount_chart(
+    metric: str,
+    chart_rows: list[dict[str, object]],
+    *,
+    growth_label: str,
+    include_qoq: bool,
+    width: int,
+    height: int,
+    amount_range: tuple[Decimal, Decimal] | None = None,
+    growth_range: tuple[Decimal, Decimal] | None = None,
+    show_legend: bool = True,
+    show_x_axis_labels: bool = True,
+    title_prefix: str | None = None,
+) -> str:
+    top = 36
+    left = 72
+    right = 96
+    bottom = 74 if show_x_axis_labels else 30
+    chart_width = Decimal(width - left - right)
+    chart_height = Decimal(height - top - bottom)
+    amount_range = amount_range or _build_numeric_range(
+        [row["amount"] for row in chart_rows],
+        padding_ratio=Decimal("0.08"),
+    )
+    if amount_range is None:
+        return '<p class="empty">차트로 표시할 금액 데이터가 없습니다.</p>'
+    amount_min, amount_max = amount_range
+
+    def amount_y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + chart_height - (
+            (value - amount_min)
+            / (amount_max - amount_min)
+            * chart_height
+        )
+
+    amount_zero_y = amount_y_for(Decimal("0"))
+    growth_values = [
+        rate
+        for row in chart_rows
+        for key in ("growth_rate", "qoq_growth_rate")
+        for rate in [_to_decimal(row.get(key))]
+        if rate is not None and (key != "qoq_growth_rate" or include_qoq)
+    ]
+    growth_range = growth_range or _build_numeric_range(
+        growth_values,
+        padding_ratio=Decimal("0.12"),
+    )
+    growth_zero_y: Decimal | None = None
+    growth_y_for = None
+    if growth_range is not None:
+        growth_min, growth_max = growth_range
+
+        def growth_y_for(value: Decimal) -> Decimal:
+            return Decimal(top) + chart_height - (
+                (value - growth_min)
+                / (growth_max - growth_min)
+                * chart_height
+            )
+
+        growth_zero_y = growth_y_for(Decimal("0"))
+
+    years = []
+    for row in chart_rows:
+        year = int(row.get("fiscal_year") or 0)
+        if year and year not in years:
+            years.append(year)
+    if not years:
+        return '<p class="empty">차트로 표시할 분기 데이터가 없습니다.</p>'
+
+    group_width = chart_width / Decimal(len(years))
+    quarter_gap = min(Decimal("6"), max(Decimal("2"), group_width * Decimal("0.05")))
+    bar_width = (group_width * Decimal("0.76") - (quarter_gap * Decimal("3"))) / Decimal("4")
+    bar_width = min(Decimal("16"), max(Decimal("6"), bar_width))
+    group_inner_width = bar_width * Decimal("4") + quarter_gap * Decimal("3")
+    group_offset = (group_width - group_inner_width) / Decimal("2")
+    year_index = {year: index for index, year in enumerate(years)}
+
+    positioned_rows: list[dict[str, object]] = []
+    for row in chart_rows:
+        year = int(row.get("fiscal_year") or 0)
+        quarter = int(row.get("fiscal_quarter") or 0)
+        if year not in year_index or quarter not in QUARTER_COLORS:
+            continue
+        center_x = (
+            Decimal(left)
+            + group_width * Decimal(year_index[year])
+            + group_offset
+            + Decimal(quarter - 1) * (bar_width + quarter_gap)
+            + (bar_width / Decimal("2"))
+        )
+        positioned_rows.append({**row, "center_x": center_x})
+
+    amount_ticks = _build_amount_axis_ticks(amount_min, amount_max)
+    amount_grid = []
+    amount_labels = []
+    for tick in amount_ticks:
+        y = amount_y_for(tick)
+        amount_grid.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#e5e7eb" />'
+        )
+        amount_labels.append(
+            f'<line x1="{left - 6}" y1="{_svg_number(y)}" x2="{left}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569" text-anchor="end">{escape(_format_chart_amount(tick))}</text>'
+        )
+
+    year_guides = []
+    year_labels = []
+    axis_bottom = Decimal(height - bottom)
+    for index, year in enumerate(years):
+        boundary_x = Decimal(left) + group_width * Decimal(index)
+        year_guides.append(
+            f'<line x1="{_svg_number(boundary_x)}" y1="{top}" x2="{_svg_number(boundary_x)}" y2="{_svg_number(axis_bottom)}" stroke="#eef2f7" />'
+        )
+        if show_x_axis_labels:
+            center_x = Decimal(left) + group_width * Decimal(index) + (group_width / Decimal("2"))
+            year_labels.append(
+                f'<text x="{_svg_number(center_x)}" y="{_svg_number(axis_bottom + Decimal("20"))}" font-size="11" fill="#475569" text-anchor="middle">{year}</text>'
+            )
+    year_guides.append(
+        f'<line x1="{_svg_number(Decimal(left) + group_width * Decimal(len(years)))}" y1="{top}" x2="{_svg_number(Decimal(left) + group_width * Decimal(len(years)))}" y2="{_svg_number(axis_bottom)}" stroke="#eef2f7" />'
+    )
+
+    bars = []
+    for row in positioned_rows:
+        amount = row["amount"]
+        value_y = amount_y_for(amount)
+        center_x = row["center_x"]
+        bar_x = center_x - (bar_width / Decimal("2"))
+        bar_y = min(value_y, amount_zero_y)
+        bar_height = max(abs(amount_zero_y - value_y), Decimal("1"))
+        quarter = int(row.get("fiscal_quarter") or 4)
+        bars.append(
+            "<g>"
+            f"<title>{escape(_build_amount_chart_tooltip(row, growth_label=growth_label, include_qoq=include_qoq, title_prefix=title_prefix))}</title>"
+            f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(bar_y)}" width="{_svg_number(bar_width)}" height="{_svg_number(bar_height)}" fill="{QUARTER_COLORS.get(quarter, AMOUNT_BAR_COLOR)}" stroke="#1f2937" stroke-opacity="0.18" stroke-width="1" rx="2" />'
+            "</g>"
+        )
+
+    growth_ticks = []
+    growth_lines = []
+    if growth_range is not None and growth_y_for is not None and growth_zero_y is not None:
+        growth_min, growth_max = growth_range
+        for tick in _build_growth_axis_ticks(growth_min, growth_max):
+            y = growth_y_for(tick)
+            growth_ticks.append(
+                f'<line x1="{width - right}" y1="{_svg_number(y)}" x2="{width - right + 6}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+                f'<text x="{width - right + 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569">{escape(_format_percent(tick))}</text>'
+            )
+        growth_lines.append(
+            _render_centered_growth_series(
+                positioned_rows,
+                value_key="growth_rate",
+                color=GROWTH_LINE_COLORS["growth_rate"],
+                growth_y_for=growth_y_for,
+            )
+        )
+        if include_qoq:
+            growth_lines.append(
+                _render_centered_growth_series(
+                    positioned_rows,
+                    value_key="qoq_growth_rate",
+                    color=GROWTH_LINE_COLORS["qoq_growth_rate"],
+                    growth_y_for=growth_y_for,
+                )
+            )
+
+    legend_html = ""
+    if show_legend:
+        legend_html = f'<div class="legend">{"".join(_quarterly_legend_items(include_qoq=include_qoq, growth_label=growth_label))}</div>'
+
+    return f"""
+    <div class="chart-shell">
+      {legend_html}
+      <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(METRIC_LABELS.get(metric, metric))} 분기 차트">
+        {''.join(amount_grid)}
+        {''.join(year_guides)}
+        {(
+            f'<line x1="{left}" y1="{_svg_number(growth_zero_y)}" x2="{width - right}" y2="{_svg_number(growth_zero_y)}" stroke="#f3e8ff" stroke-dasharray="3 4" />'
+            if growth_zero_y is not None
+            else ""
+        )}
+        <line x1="{left}" y1="{_svg_number(amount_zero_y)}" x2="{width - right}" y2="{_svg_number(amount_zero_y)}" stroke="#94a3b8" stroke-dasharray="4 4" />
+        <line data-axis="amount-left" x1="{left}" y1="{top}" x2="{left}" y2="{_svg_number(axis_bottom)}" stroke="#94a3b8" />
+        <line data-axis="growth-right" x1="{width - right}" y1="{top}" x2="{width - right}" y2="{_svg_number(axis_bottom)}" stroke="#94a3b8" />
+        <line x1="{left}" y1="{_svg_number(axis_bottom)}" x2="{width - right}" y2="{_svg_number(axis_bottom)}" stroke="#cbd5e1" />
+        {''.join(amount_labels)}
+        {''.join(bars)}
+        {''.join(growth_ticks)}
+        {''.join(growth_lines)}
+        {''.join(year_labels)}
+      </svg>
+    </div>
+    """
+
+
+def _render_compare_series_metric_chart(
+    metric: str,
+    primary_rows: list[object],
+    secondary_rows: list[object],
+    *,
+    primary_name: str,
+    secondary_name: str,
+    title: str,
+    width: int,
+    height: int,
+) -> str:
+    primary_points = _build_metric_chart_rows(primary_rows, metric, include_qoq=False)
+    secondary_points = _build_metric_chart_rows(secondary_rows, metric, include_qoq=False)
+    labels = _merge_period_labels(primary_points, secondary_points)
+    if not labels:
+        return '<p class="empty">비교 차트로 표시할 데이터가 없습니다.</p>'
+
+    values = [point["amount"] for point in primary_points + secondary_points]
+    amount_range = _build_numeric_range(values, padding_ratio=Decimal("0.08"))
+    if amount_range is None:
+        return '<p class="empty">비교 차트로 표시할 데이터가 없습니다.</p>'
+    min_value, max_value = amount_range
+
+    top = 28
+    left = 70
+    right = 24
+    bottom = 68
+    chart_width = Decimal(width - left - right)
+    chart_height = Decimal(height - top - bottom)
+
+    def y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + chart_height - (
+            (value - min_value)
+            / (max_value - min_value)
+            * chart_height
+        )
+
+    period_index = {label: index for index, label in enumerate(labels)}
+    slot_width = chart_width / Decimal(max(len(labels), 1))
+    x_label_stride = _x_label_stride(len(labels))
+
+    ticks = _build_amount_axis_ticks(min_value, max_value)
+    grid = []
+    labels_left = []
+    for tick in ticks:
+        y = y_for(tick)
+        grid.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#e6edf5" />'
+        )
+        labels_left.append(
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569" text-anchor="end">{escape(_format_chart_amount(tick))}</text>'
+        )
+
+    primary_line = _render_compare_metric_line(
+        primary_points,
+        period_index=period_index,
+        color=COMPARE_LINE_COLORS["primary"],
+        left=left,
+        slot_width=slot_width,
+        y_for=y_for,
+        title_prefix=primary_name,
+    )
+    secondary_line = _render_compare_metric_line(
+        secondary_points,
+        period_index=period_index,
+        color=COMPARE_LINE_COLORS["secondary"],
+        left=left,
+        slot_width=slot_width,
+        y_for=y_for,
+        title_prefix=secondary_name,
+    )
+
+    x_labels = []
+    axis_bottom = Decimal(height - bottom)
+    for index, label in enumerate(labels):
+        if not _should_render_x_label(index, len(labels), x_label_stride):
+            continue
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        x_labels.append(
+            f'<line x1="{_svg_number(center_x)}" y1="{_svg_number(axis_bottom)}" x2="{_svg_number(center_x)}" y2="{_svg_number(axis_bottom + Decimal("6"))}" stroke="#94a3b8" />'
+            f'<text x="{_svg_number(center_x)}" y="{_svg_number(axis_bottom + Decimal("20"))}" font-size="11" fill="#475569" text-anchor="middle">{escape(_truncate_label(label, 12))}</text>'
+        )
+
+    return f"""
+    <div class="panel-heading">
+      <h3>{escape(title)}</h3>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-line" style="border-top-color:{COMPARE_LINE_COLORS["primary"]};"></span><span>{escape(primary_name)}</span></span>
+      <span class="legend-item"><span class="legend-line" style="border-top-color:{COMPARE_LINE_COLORS["secondary"]};"></span><span>{escape(secondary_name)}</span></span>
+    </div>
+    <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(title)}">
+      {''.join(grid)}
+      <line x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#94a3b8" />
+      <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#cbd5e1" />
+      {''.join(labels_left)}
+      {primary_line}
+      {secondary_line}
+      {''.join(x_labels)}
+    </svg>
+    """
+
+
+def _render_compare_quarterly_metric_chart(
+    metric: str,
+    primary_rows: list[object],
+    secondary_rows: list[object],
+    *,
+    primary_name: str,
+    secondary_name: str,
+    title: str,
+    width: int,
+    height: int,
+) -> str:
+    primary_points = _build_metric_chart_rows(primary_rows, metric, include_qoq=True)
+    secondary_points = _build_metric_chart_rows(secondary_rows, metric, include_qoq=True)
+    if not primary_points and not secondary_points:
+        return '<p class="empty">비교 차트로 표시할 데이터가 없습니다.</p>'
+
+    amount_range = _build_numeric_range(
+        [point["amount"] for point in primary_points + secondary_points],
+        padding_ratio=Decimal("0.08"),
+    )
+    growth_range = _build_numeric_range(
+        [
+            rate
+            for point in primary_points + secondary_points
+            for key in ("growth_rate", "qoq_growth_rate")
+            for rate in [_to_decimal(point.get(key))]
+            if rate is not None
+        ],
+        padding_ratio=Decimal("0.12"),
+    )
+    panel_height = max(220, (height - 36) // 2)
+
+    return f"""
+    <div class="panel-heading">
+      <h3>{escape(title)}</h3>
+    </div>
+    <div class="legend">{"".join(_quarterly_legend_items(include_qoq=True, growth_label="YoY 성장률"))}</div>
+    <div class="compare-chart-stack">
+      <section class="compare-chart-panel">
+        <div class="compare-panel-title">{escape(primary_name)}</div>
+        {_render_quarterly_metric_amount_chart(metric, primary_points, growth_label="YoY 성장률", include_qoq=True, width=width, height=panel_height, amount_range=amount_range, growth_range=growth_range, show_legend=False, show_x_axis_labels=False, title_prefix=primary_name)}
+      </section>
+      <section class="compare-chart-panel">
+        <div class="compare-panel-title">{escape(secondary_name)}</div>
+        {_render_quarterly_metric_amount_chart(metric, secondary_points, growth_label="YoY 성장률", include_qoq=True, width=width, height=panel_height, amount_range=amount_range, growth_range=growth_range, show_legend=False, show_x_axis_labels=True, title_prefix=secondary_name)}
+      </section>
+    </div>
+    """
+
+
+def _render_centered_growth_series(
+    chart_rows: list[dict[str, object]],
+    *,
+    value_key: str,
+    color: str,
+    growth_y_for: Callable[[Decimal], Decimal],
+) -> str:
+    segments: list[str] = []
+    markers: list[str] = []
+    points: list[str] = []
+
+    def flush_points() -> None:
+        nonlocal points
+        if len(points) >= 2:
+            segments.append(
+                f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />'
+            )
+        points = []
+
+    for row in chart_rows:
+        rate = _to_decimal(row.get(value_key))
+        center_x = row.get("center_x")
+        if rate is None or not isinstance(center_x, Decimal):
+            flush_points()
+            continue
+        y = growth_y_for(rate)
+        points.append(f"{_svg_number(center_x)},{_svg_number(y)}")
+        markers.append(
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="3.5" fill="{color}" stroke="#ffffff" stroke-width="1.2" />'
+        )
+
+    flush_points()
+    return "".join(segments + markers)
+
+
+def _render_compare_metric_line(
+    points: list[dict[str, object]],
+    *,
+    period_index: dict[str, int],
+    color: str,
+    left: int,
+    slot_width: Decimal,
+    y_for: Callable[[Decimal], Decimal],
+    title_prefix: str,
+) -> str:
+    if not points:
+        return ""
+
+    coordinates = []
+    markers = []
+    for point in points:
+        index = period_index.get(str(point.get("period", "")))
+        if index is None:
+            continue
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        y = y_for(point["amount"])
+        coordinates.append(f"{_svg_number(center_x)},{_svg_number(y)}")
+        markers.append(
+            "<g>"
+            f"<title>{escape(title_prefix)} · {point['period']} · 금액 {_format_amount(point['amount'])} · YoY {_format_percent(point.get('growth_rate'))}</title>"
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="4" fill="{color}" stroke="#ffffff" stroke-width="1.5" />'
+            "</g>"
+        )
+
+    return (
+        f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />'
+        f'{"".join(markers)}'
+    )
+
+
+def _quarterly_legend_items(
+    *,
+    include_qoq: bool,
+    growth_label: str,
+) -> list[str]:
+    items = [
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{QUARTER_COLORS[1]};"></span><span>Q1</span></span>',
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{QUARTER_COLORS[2]};"></span><span>Q2</span></span>',
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{QUARTER_COLORS[3]};"></span><span>Q3</span></span>',
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{QUARTER_COLORS[4]};"></span><span>Q4</span></span>',
+        f'<span class="legend-item"><span class="legend-line" style="border-top-color:{GROWTH_LINE_COLORS["growth_rate"]};"></span><span>{escape(growth_label)}</span></span>',
+    ]
+    if include_qoq:
+        items.append(
+            f'<span class="legend-item"><span class="legend-line" style="border-top-color:{GROWTH_LINE_COLORS["qoq_growth_rate"]};"></span><span>QoQ 성장률</span></span>'
+        )
+    return items
+
+
+def _build_numeric_range(
+    values: list[Decimal],
+    *,
+    padding_ratio: Decimal,
+) -> tuple[Decimal, Decimal] | None:
+    if not values:
+        return None
+    min_value = min(values + [Decimal("0")])
+    max_value = max(values + [Decimal("0")])
+    if min_value == max_value:
+        min_value -= Decimal("1")
+        max_value += Decimal("1")
+    padding = (max_value - min_value) * padding_ratio
+    return (min_value - padding, max_value + padding)
+
+
+def _merge_period_labels(
+    primary_points: list[dict[str, object]],
+    secondary_points: list[dict[str, object]],
+) -> list[str]:
+    labels: list[str] = []
+    for point in primary_points + secondary_points:
+        period = str(point.get("period", ""))
+        if period and period not in labels:
+            labels.append(period)
+    return labels
+
+
+def _x_label_stride(total_points: int) -> int:
+    if total_points <= 12:
+        return 1
+    if total_points <= 24:
+        return 2
+    return 4
+
+
+def _should_render_x_label(index: int, total_points: int, stride: int) -> bool:
+    return index == 0 or index == total_points - 1 or index % max(stride, 1) == 0
+
+
+def _row_fiscal_year(row: dict[str, object]) -> int | None:
+    value = row.get("fiscal_year")
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    period = str(row.get("period", ""))
+    if "Q" in period:
+        period = period.split("Q", maxsplit=1)[0]
+    try:
+        return int(period)
+    except ValueError:
+        return None
+
+
+def _row_fiscal_quarter(row: dict[str, object]) -> int | None:
+    value = row.get("fiscal_quarter")
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    period = str(row.get("period", ""))
+    if "Q" not in period:
+        return None
+    try:
+        return int(period.split("Q", maxsplit=1)[1])
+    except ValueError:
+        return None
+
+
 def _build_growth_axis_ticks(growth_min: Decimal, growth_max: Decimal) -> list[Decimal]:
     ticks: list[Decimal] = []
     seen: set[str] = set()
@@ -1677,12 +2464,18 @@ def _build_amount_chart_tooltip(
     *,
     growth_label: str,
     include_qoq: bool,
+    title_prefix: str | None = None,
 ) -> str:
-    lines = [
-        str(row.get("period", "")),
-        f"금액: {_format_amount(row.get('amount'))}",
-        f"{growth_label}: {_format_percent(row.get('growth_rate'))}",
-    ]
+    lines = []
+    if title_prefix:
+        lines.append(title_prefix)
+    lines.extend(
+        [
+            str(row.get("period", "")),
+            f"금액: {_format_amount(row.get('amount'))}",
+            f"{growth_label}: {_format_percent(row.get('growth_rate'))}",
+        ]
+    )
     if include_qoq:
         lines.append(f"QoQ 성장률: {_format_percent(row.get('qoq_growth_rate'))}")
     return "\n".join(lines)
@@ -1703,6 +2496,8 @@ def _pivot_period_values(
             {
                 "period": period,
                 "sort": _period_sort_key(value),
+                "fiscal_year": value.fiscal_year,
+                "fiscal_quarter": value.fiscal_quarter,
                 "values": {},
             },
         )
@@ -1734,6 +2529,8 @@ def _pivot_growth_amount_rows(
             {
                 "period": period,
                 "sort": fiscal_year * 4 + fiscal_quarter,
+                "fiscal_year": fiscal_year,
+                "fiscal_quarter": fiscal_quarter,
                 "values": {},
             },
         )
@@ -2545,6 +3342,19 @@ def _page_styles() -> str:
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
+    }
+    .compare-chart-stack {
+      display: grid;
+      gap: 12px;
+    }
+    .compare-chart-panel {
+      display: grid;
+      gap: 8px;
+    }
+    .compare-panel-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #334155;
     }
     .compare-stat-card {
       border: 1px solid #e5ebf2;
