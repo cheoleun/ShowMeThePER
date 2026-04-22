@@ -3208,6 +3208,21 @@ def _format_market_cap(value: object) -> str:
     return _format_won(parsed)
 
 
+def _format_display_won(value: object) -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+    if parsed == parsed.to_integral():
+        normalized = parsed.quantize(Decimal("1"))
+        return f"{format(normalized, ',f')}\uc6d0"
+
+    text = format(parsed, ",f").rstrip("0").rstrip(".")
+    return f"{text}\uc6d0"
+
+
+_format_won = _format_display_won
+
+
 def _format_base_date(value: object) -> str:
     text = str(value or "").strip()
     if len(text) != 8 or not text.isdigit():

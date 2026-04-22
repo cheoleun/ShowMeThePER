@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from show_me_the_per.krx import KrxStockPriceSnapshot
 from show_me_the_per.models import DartCompany, FinancialStatementRow
 from show_me_the_per.web import (
+    _format_won,
     create_app,
     default_end_year,
     render_compare_metric_chart,
@@ -20,6 +21,13 @@ from show_me_the_per.web import (
 
 
 class WebTests(TestCase):
+    def test_format_won_keeps_integer_prices(self) -> None:
+        self.assertEqual(_format_won("1342000"), "1,342,000원")
+        self.assertEqual(_format_won("37100"), "37,100원")
+        self.assertEqual(_format_won("1000"), "1,000원")
+        self.assertEqual(_format_won("0"), "0원")
+        self.assertEqual(_format_won(None), "-")
+
     def test_home_renders_v2_analysis_toolbar(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
 
@@ -176,6 +184,7 @@ class WebTests(TestCase):
         self.assertIn('data-metric-periods="annual"', response.text)
         self.assertIn("시가총액", response.text)
         self.assertIn("전일 종가", response.text)
+        self.assertIn("전일 종가 37,100원", response.text)
 
     def test_analysis_shows_market_status_when_krx_key_is_missing(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
