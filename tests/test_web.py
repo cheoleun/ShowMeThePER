@@ -80,7 +80,7 @@ class WebTests(TestCase):
                     "period": "2025",
                     "values": {
                         "revenue": {
-                            "amount": "150",
+                            "amount": "1500000",
                             "growth_rate": "25.00",
                         }
                     },
@@ -89,7 +89,7 @@ class WebTests(TestCase):
                     "period": "2024",
                     "values": {
                         "revenue": {
-                            "amount": "120",
+                            "amount": "1200000",
                             "growth_rate": "-5.00",
                         }
                     },
@@ -106,6 +106,12 @@ class WebTests(TestCase):
         self.assertIn("YoY 성장률", chart)
         self.assertIn("QoQ 성장률", chart)
         self.assertIn("<polyline", chart)
+        self.assertIn(">1.2M</text>", chart)
+        self.assertIn(">1.5M</text>", chart)
+        self.assertIn("<title>2024", chart)
+        self.assertIn("금액: 1,200,000", chart)
+        self.assertIn('data-axis="amount-left"', chart)
+        self.assertIn('data-axis="growth-right"', chart)
 
     def test_analysis_validation_errors_stay_in_browser(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))

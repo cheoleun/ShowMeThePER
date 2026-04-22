@@ -818,9 +818,9 @@ def render_metric_amount_chart(
 
     width = 920
     height = 360
-    top = 48
-    left = 48
-    right = 86
+    top = 36
+    left = 86
+    right = 96
     bottom = 84
     chart_width = Decimal(width - left - right)
     chart_height = Decimal(height - top - bottom)
@@ -890,6 +890,18 @@ def render_metric_amount_chart(
 
         growth_zero_y = growth_y_for(Decimal("0"))
 
+    amount_axis_labels = []
+    amount_grid_lines = []
+    for tick in _build_amount_axis_ticks(min_value, max_value):
+        y = y_for(tick)
+        amount_grid_lines.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#f2f4f7" />'
+        )
+        amount_axis_labels.append(
+            f'<line x1="{left - 6}" y1="{_svg_number(y)}" x2="{left}" y2="{_svg_number(y)}" stroke="#b7c0c8" />'
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#5d6972" text-anchor="end">{escape(_format_chart_amount(tick))}</text>'
+        )
+
     bars = []
     for index, row in enumerate(chart_rows):
         amount = row["amount"]
@@ -905,15 +917,18 @@ def render_metric_amount_chart(
         )
         tick_bottom = Decimal(height - bottom)
         bars.append(
+            "<g>"
+            f"<title>{escape(_build_amount_chart_tooltip(row, growth_label=growth_label, include_qoq=include_qoq))}</title>"
             f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(bar_y)}" '
             f'width="{_svg_number(bar_width)}" height="{_svg_number(bar_height)}" '
             f'fill="{_amount_chart_fill(row.get("growth_rate"))}" rx="4" />'
             f'<text x="{_svg_number(center_x)}" y="{_svg_number(label_y)}" font-size="12" fill="#5d6972" '
-            f'text-anchor="middle">{escape(_format_amount_with_growth(amount, row.get("growth_rate")))}</text>'
+            f'text-anchor="middle">{escape(_format_chart_amount(amount))}</text>'
             f'<line x1="{_svg_number(center_x)}" y1="{_svg_number(tick_bottom)}" '
             f'x2="{_svg_number(center_x)}" y2="{_svg_number(tick_bottom + Decimal("6"))}" stroke="#b7c0c8" />'
             f'<text x="{_svg_number(center_x)}" y="{_svg_number(tick_bottom + Decimal("22"))}" '
             f'font-size="12" fill="#5d6972" text-anchor="middle">{escape(row["period"])}</text>'
+            "</g>"
         )
 
     growth_ticks: list[str] = []
@@ -922,8 +937,8 @@ def render_metric_amount_chart(
         for tick in _build_growth_axis_ticks(growth_min, growth_max):
             y = growth_y_for(tick)
             growth_ticks.append(
-                f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#eef2f5" />'
-                f'<text x="{width - right + 8}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#5d6972">{escape(_format_percent(tick))}</text>'
+                f'<line x1="{width - right}" y1="{_svg_number(y)}" x2="{width - right + 6}" y2="{_svg_number(y)}" stroke="#b7c0c8" />'
+                f'<text x="{width - right + 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#5d6972">{escape(_format_percent(tick))}</text>'
             )
 
         for series in growth_series:
@@ -951,16 +966,20 @@ def render_metric_amount_chart(
       <h3>{escape(METRIC_LABELS.get(metric, metric))}</h3>
       <div class="legend">{"".join(legend_items)}</div>
       <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(METRIC_LABELS.get(metric, metric))} 금액 차트">
-        {''.join(growth_ticks)}
-        {''.join(growth_lines)}
+        {''.join(amount_grid_lines)}
         {(
             f'<line x1="{left}" y1="{_svg_number(growth_zero_y)}" x2="{width - right}" y2="{_svg_number(growth_zero_y)}" stroke="#d9e4ff" stroke-dasharray="3 4" />'
             if growth_zero_y is not None
             else ""
         )}
         <line x1="{left}" y1="{_svg_number(zero_y)}" x2="{width - right}" y2="{_svg_number(zero_y)}" stroke="#b7c0c8" stroke-dasharray="4 4" />
+        <line data-axis="amount-left" x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#b7c0c8" />
+        <line data-axis="growth-right" x1="{width - right}" y1="{top}" x2="{width - right}" y2="{height - bottom}" stroke="#b7c0c8" />
         <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#d7dde2" />
+        {''.join(amount_axis_labels)}
         {''.join(bars)}
+        {''.join(growth_ticks)}
+        {''.join(growth_lines)}
       </svg>
     </section>
     """
@@ -970,6 +989,25 @@ def _build_growth_axis_ticks(growth_min: Decimal, growth_max: Decimal) -> list[D
     ticks: list[Decimal] = []
     seen: set[str] = set()
     for value in (growth_max, Decimal("0"), growth_min):
+        key = str(value.quantize(Decimal("0.1")))
+        if key in seen:
+            continue
+        seen.add(key)
+        ticks.append(value)
+    return ticks
+
+
+def _build_amount_axis_ticks(min_value: Decimal, max_value: Decimal) -> list[Decimal]:
+    candidates = [max_value]
+    if min_value < 0 < max_value:
+        candidates.append(Decimal("0"))
+    else:
+        candidates.append((max_value + min_value) / Decimal("2"))
+    candidates.append(min_value)
+
+    ticks: list[Decimal] = []
+    seen: set[str] = set()
+    for value in candidates:
         key = str(value.quantize(Decimal("0.1")))
         if key in seen:
             continue
@@ -1022,6 +1060,42 @@ def _calculate_growth_rate(
     if previous_amount is None or previous_amount <= 0:
         return None
     return (current_amount - previous_amount) / previous_amount * Decimal("100")
+
+
+def _format_chart_amount(value: object) -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+
+    absolute = abs(parsed)
+    units = [
+        (Decimal("1000000000000"), "T"),
+        (Decimal("1000000000"), "B"),
+        (Decimal("1000000"), "M"),
+        (Decimal("1000"), "K"),
+    ]
+    for factor, suffix in units:
+        if absolute >= factor:
+            scaled = parsed / factor
+            text = format(scaled.quantize(Decimal("0.1")), "f").rstrip("0").rstrip(".")
+            return f"{text}{suffix}"
+    return _format_amount(parsed)
+
+
+def _build_amount_chart_tooltip(
+    row: dict[str, object],
+    *,
+    growth_label: str,
+    include_qoq: bool,
+) -> str:
+    lines = [
+        str(row.get("period", "")),
+        f"금액: {_format_amount(row.get('amount'))}",
+        f"{growth_label}: {_format_percent(row.get('growth_rate'))}",
+    ]
+    if include_qoq:
+        lines.append(f"QoQ 성장률: {_format_percent(row.get('qoq_growth_rate'))}")
+    return "\n".join(lines)
 
 
 def render_filter_results(results: list[object]) -> str:
