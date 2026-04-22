@@ -89,9 +89,13 @@ QUARTER_COLORS = {
 AMOUNT_BAR_COLOR = "#bfdbfe"
 AMOUNT_BAR_STROKE = "#60a5fa"
 GROWTH_LINE_COLORS = {
-    "growth_rate": "#7c3aed",
-    "qoq_growth_rate": "#e11d48",
+    "growth_rate": "#c4b5fd",
+    "qoq_growth_rate": "#f9a8d4",
 }
+GROWTH_LINE_STROKE_WIDTH = "1.6"
+GROWTH_LINE_MARKER_RADIUS = "2.5"
+GROWTH_LINE_COMPACT_MARKER_RADIUS = "2.25"
+GROWTH_LINE_MARKER_STROKE_WIDTH = "1.0"
 COMPARE_LINE_COLORS = {
     "primary": "#2563eb",
     "secondary": "#f97316",
@@ -1945,12 +1949,12 @@ def _render_compare_line(
         markers.append(
             "<g>"
             f"<title>{escape(title_prefix)} · {point['period']} · 금액 {_format_amount(point['amount'])} · YoY {_format_percent(point.get('growth_rate'))}</title>"
-            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="4" fill="{color}" stroke="#ffffff" stroke-width="1.5" />'
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="{GROWTH_LINE_MARKER_RADIUS}" fill="{color}" stroke="#ffffff" stroke-width="{GROWTH_LINE_MARKER_STROKE_WIDTH}" />'
             "</g>"
         )
 
     return (
-        f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />'
+        f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="{color}" stroke-width="{GROWTH_LINE_STROKE_WIDTH}" stroke-linejoin="round" stroke-linecap="round" />'
         f'{"".join(markers)}'
     )
 
@@ -2531,7 +2535,7 @@ def _render_centered_growth_series(
         nonlocal points
         if len(points) >= 2:
             segments.append(
-                f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />'
+                f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="{GROWTH_LINE_STROKE_WIDTH}" stroke-linejoin="round" stroke-linecap="round" />'
             )
         points = []
 
@@ -2544,7 +2548,7 @@ def _render_centered_growth_series(
         y = growth_y_for(rate)
         points.append(f"{_svg_number(center_x)},{_svg_number(y)}")
         markers.append(
-            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="3.5" fill="{color}" stroke="#ffffff" stroke-width="1.2" />'
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="{GROWTH_LINE_COMPACT_MARKER_RADIUS}" fill="{color}" stroke="#ffffff" stroke-width="{GROWTH_LINE_MARKER_STROKE_WIDTH}" />'
         )
 
     flush_points()
@@ -2576,12 +2580,12 @@ def _render_compare_metric_line(
         markers.append(
             "<g>"
             f"<title>{escape(title_prefix)} · {point['period']} · 금액 {_format_amount(point['amount'])} · YoY {_format_percent(point.get('growth_rate'))}</title>"
-            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="4" fill="{color}" stroke="#ffffff" stroke-width="1.5" />'
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="{GROWTH_LINE_MARKER_RADIUS}" fill="{color}" stroke="#ffffff" stroke-width="{GROWTH_LINE_MARKER_STROKE_WIDTH}" />'
             "</g>"
         )
 
     return (
-        f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />'
+        f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="{color}" stroke-width="{GROWTH_LINE_STROKE_WIDTH}" stroke-linejoin="round" stroke-linecap="round" />'
         f'{"".join(markers)}'
     )
 
@@ -2725,7 +2729,7 @@ def _render_amount_growth_series(
         nonlocal points
         if len(points) >= 2:
             segments.append(
-                f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />'
+                f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="{GROWTH_LINE_STROKE_WIDTH}" stroke-linejoin="round" stroke-linecap="round" />'
             )
         points = []
 
@@ -2738,7 +2742,7 @@ def _render_amount_growth_series(
         y = growth_y_for(rate)
         points.append(f"{_svg_number(center_x)},{_svg_number(y)}")
         markers.append(
-            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="4" fill="{color}" stroke="#ffffff" stroke-width="1.5" />'
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="{GROWTH_LINE_MARKER_RADIUS}" fill="{color}" stroke="#ffffff" stroke-width="{GROWTH_LINE_MARKER_STROKE_WIDTH}" />'
         )
 
     flush_points()

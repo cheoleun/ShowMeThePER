@@ -235,8 +235,10 @@ class WebTests(TestCase):
         self.assertIn("#fdba74", chart)
         self.assertIn("#86efac", chart)
         self.assertIn("#fde68a", chart)
-        self.assertIn("#7c3aed", chart)
-        self.assertIn("#e11d48", chart)
+        self.assertIn("#c4b5fd", chart)
+        self.assertIn("#f9a8d4", chart)
+        self.assertIn('stroke-width="1.6"', chart)
+        self.assertIn('r="2.25"', chart)
         self.assertIn('data-axis="amount-left"', chart)
         self.assertIn('data-axis="growth-right"', chart)
         self.assertIn("<title>2025Q4", chart)
@@ -258,7 +260,7 @@ class WebTests(TestCase):
         self.assertIn(">2016</text>", chart)
         self.assertIn(">2025</text>", chart)
         self.assertIn("#bfdbfe", chart)
-        self.assertIn("#7c3aed", chart)
+        self.assertIn("#c4b5fd", chart)
 
     def test_compare_quarterly_chart_renders_vertical_two_panel_layout(self) -> None:
         chart = render_compare_metric_chart(
