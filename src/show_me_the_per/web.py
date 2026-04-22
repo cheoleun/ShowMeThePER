@@ -10,6 +10,7 @@ from typing import Callable, Iterable
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
+from .growth import ANNUAL_YOY, QUARTERLY_YOY, TRAILING_FOUR_QUARTER_YOY
 from .models import (
     DartCompany,
     FinancialPeriodValue,
@@ -267,6 +268,20 @@ def build_browser_report_payload(
         if start_year <= int(point.get("fiscal_year", 0) or 0) <= end_year
     ]
     filter_results = _filter_results_from_payload(artifacts.growth_metrics)
+    annual_rows = _pivot_period_values(
+        (value for value in values if value.period_type == "annual"),
+        growth_points=growth_points,
+        series_type=ANNUAL_YOY,
+    )
+    quarterly_rows = _pivot_period_values(
+        (value for value in values if value.period_type == "quarter"),
+        growth_points=growth_points,
+        series_type=QUARTERLY_YOY,
+    )
+    trailing_rows = _pivot_growth_amount_rows(
+        growth_points,
+        series_type=TRAILING_FOUR_QUARTER_YOY,
+    )
 
     return {
         "company": _company_from_rows(company, artifacts.financial_statement_rows),
@@ -283,12 +298,9 @@ def build_browser_report_payload(
             "growth_points": len(growth_points),
             "collection_errors": len(artifacts.collection_errors),
         },
-        "annual_rows": _pivot_period_values(
-            value for value in values if value.period_type == "annual"
-        ),
-        "quarterly_rows": _pivot_period_values(
-            value for value in values if value.period_type == "quarter"
-        ),
+        "annual_rows": annual_rows,
+        "quarterly_rows": quarterly_rows,
+        "trailing_rows": trailing_rows,
         "filter_results": sorted(
             filter_results,
             key=lambda item: (
@@ -458,6 +470,34 @@ def render_page(
       border-radius: 8px;
       background: #ffffff;
     }}
+    .amount-chart {{
+      width: 100%;
+      min-height: 220px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      margin-bottom: 12px;
+    }}
+    .chart-group {{
+      display: grid;
+      gap: 14px;
+      margin: 12px 0 16px;
+    }}
+    details {{
+      margin: 12px 0 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: #ffffff;
+    }}
+    summary {{
+      cursor: pointer;
+      font-weight: 700;
+      color: #25313a;
+    }}
+    details[open] summary {{
+      margin-bottom: 10px;
+    }}
     .empty {{ color: var(--muted); }}
     @media (max-width: 840px) {{
       main {{ padding: 16px; }}
@@ -528,14 +568,25 @@ def render_browser_report(payload: dict[str, object]) -> str:
         <span class="pill">성장률 {escape(str(summary.get("growth_points", 0)))}개</span>
       </div>
       {render_collection_errors(_list(payload.get("collection_errors")))}
-      <h2>연간 금액</h2>
-      {render_amount_table(_list(payload.get("annual_rows")))}
-      <h2>분기 금액</h2>
-      {render_amount_table(_list(payload.get("quarterly_rows")))}
+      {render_amount_section("연간 금액", _list(payload.get("annual_rows")))}
+      {render_amount_section("분기 금액", _list(payload.get("quarterly_rows")))}
+      {render_amount_section("최근 4분기 누적 금액", _list(payload.get("trailing_rows")))}
       <h2>성장률 필터 결과</h2>
       {render_filter_results(_list(payload.get("filter_results")))}
-      <h2>성장률 차트</h2>
-      {render_growth_sections(_list(payload.get("growth_sections")))}
+      {render_optional_growth_details(_list(payload.get("growth_sections")))}
+    </section>
+    """
+
+
+def render_amount_section(title: str, rows: list[object]) -> str:
+    return f"""
+    <section>
+      <h2>{escape(title)}</h2>
+      {render_amount_charts(rows)}
+      <details>
+        <summary>표 보기</summary>
+        {render_amount_table(rows)}
+      </details>
     </section>
     """
 
@@ -551,9 +602,9 @@ def render_amount_table(rows: list[object]) -> str:
         body.append(
             "<tr>"
             f"<td>{escape(str(row.get('period', '')))}</td>"
-            f"<td>{_format_amount(values.get('revenue'))}</td>"
-            f"<td>{_format_amount(values.get('operating_income'))}</td>"
-            f"<td>{_format_amount(values.get('net_income'))}</td>"
+            f"<td>{_format_amount_cell(_dict(values.get('revenue')))}</td>"
+            f"<td>{_format_amount_cell(_dict(values.get('operating_income')))}</td>"
+            f"<td>{_format_amount_cell(_dict(values.get('net_income')))}</td>"
             "</tr>"
         )
 
@@ -563,6 +614,88 @@ def render_amount_table(rows: list[object]) -> str:
         f"<tbody>{''.join(body)}</tbody>"
         "</table>"
     )
+
+
+def render_amount_charts(rows: list[object]) -> str:
+    charts = [
+        render_metric_amount_chart(metric, rows)
+        for metric in ("revenue", "operating_income", "net_income")
+    ]
+    rendered = [chart for chart in charts if chart]
+    if not rendered:
+        return '<p class="empty">표시할 금액 그래프가 없습니다.</p>'
+    return f'<div class="chart-group">{"".join(rendered)}</div>'
+
+
+def render_metric_amount_chart(metric: str, rows: list[object]) -> str:
+    chart_rows = []
+    for item in rows[:12]:
+        row = _dict(item)
+        values = _dict(row.get("values"))
+        cell = _dict(values.get(metric))
+        amount = _to_decimal(cell.get("amount"))
+        if amount is None:
+            continue
+        chart_rows.append(
+            {
+                "period": str(row.get("period", "")),
+                "amount": amount,
+                "growth_rate": cell.get("growth_rate"),
+            }
+        )
+
+    if not chart_rows:
+        return ""
+
+    width = 920
+    row_height = 30
+    top = 30
+    left = 160
+    right = 90
+    bottom = 20
+    height = top + bottom + row_height * len(chart_rows)
+    values = [row["amount"] for row in chart_rows]
+    min_value = min(values + [Decimal("0")])
+    max_value = max(values + [Decimal("0")])
+    if min_value == max_value:
+        min_value -= Decimal("1")
+        max_value += Decimal("1")
+    padding = (max_value - min_value) * Decimal("0.08")
+    min_value -= padding
+    max_value += padding
+
+    def x_for(value: Decimal) -> Decimal:
+        return Decimal(left) + (
+            (value - min_value)
+            / (max_value - min_value)
+            * Decimal(width - left - right)
+        )
+
+    zero_x = x_for(Decimal("0"))
+    bars = []
+    for index, row in enumerate(chart_rows):
+        amount = row["amount"]
+        value_x = x_for(amount)
+        bar_x = min(zero_x, value_x)
+        bar_width = abs(value_x - zero_x)
+        y = Decimal(top + index * row_height + 6)
+        bars.append(
+            f'<text x="12" y="{_svg_number(y + Decimal("14"))}" font-size="13" fill="#172026">{escape(_truncate_label(row["period"], 18))}</text>'
+            f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(y)}" width="{_svg_number(bar_width)}" height="18" fill="#0b6b5c" rx="4" />'
+            f'<text x="{_svg_number(value_x + Decimal("6") if amount >= 0 else value_x - Decimal("6"))}" '
+            f'y="{_svg_number(y + Decimal("14"))}" font-size="12" fill="#5d6972" '
+            f'text-anchor="{"start" if amount >= 0 else "end"}">{escape(_format_amount_with_growth(amount, row.get("growth_rate")))}</text>'
+        )
+
+    return f"""
+    <section class="series">
+      <h3>{escape(METRIC_LABELS.get(metric, metric))}</h3>
+      <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(METRIC_LABELS.get(metric, metric))} 금액 차트">
+        <line x1="{_svg_number(zero_x)}" y1="{top}" x2="{_svg_number(zero_x)}" y2="{height - bottom}" stroke="#b7c0c8" stroke-dasharray="4 4" />
+        {''.join(bars)}
+      </svg>
+    </section>
+    """
 
 
 def render_filter_results(results: list[object]) -> str:
@@ -588,6 +721,15 @@ def render_filter_results(results: list[object]) -> str:
         f"<tbody>{''.join(rows)}</tbody>"
         "</table>"
     )
+
+
+def render_optional_growth_details(sections: list[object]) -> str:
+    return f"""
+    <details>
+      <summary>성장률 상세 보기</summary>
+      {render_growth_sections(sections)}
+    </details>
+    """
 
 
 def render_growth_sections(sections: list[object]) -> str:
@@ -654,7 +796,13 @@ def render_collection_errors(errors: list[object]) -> str:
     )
 
 
-def _pivot_period_values(values: Iterable[FinancialPeriodValue]) -> list[dict[str, object]]:
+def _pivot_period_values(
+    values: Iterable[FinancialPeriodValue],
+    *,
+    growth_points: list[dict[str, object]],
+    series_type: str,
+) -> list[dict[str, object]]:
+    growth_index = _index_growth_rates(growth_points, series_type=series_type)
     rows: dict[str, dict[str, object]] = {}
     for value in values:
         period = value.period_label
@@ -666,7 +814,41 @@ def _pivot_period_values(values: Iterable[FinancialPeriodValue]) -> list[dict[st
                 "values": {},
             },
         )
-        _dict(row["values"])[value.metric] = str(value.amount)
+        _dict(row["values"])[value.metric] = {
+            "amount": str(value.amount),
+            "growth_rate": growth_index.get((value.metric, period)),
+        }
+
+    return [
+        {key: value for key, value in row.items() if key != "sort"}
+        for row in sorted(rows.values(), key=lambda item: int(item["sort"]), reverse=True)
+    ]
+
+
+def _pivot_growth_amount_rows(
+    growth_points: list[dict[str, object]],
+    *,
+    series_type: str,
+) -> list[dict[str, object]]:
+    rows: dict[str, dict[str, object]] = {}
+    for point in growth_points:
+        if str(point.get("series_type", "")) != series_type:
+            continue
+        period = str(point.get("period_label", ""))
+        fiscal_year = int(point.get("fiscal_year", 0) or 0)
+        fiscal_quarter = int(point.get("fiscal_quarter", 0) or 0)
+        row = rows.setdefault(
+            period,
+            {
+                "period": period,
+                "sort": fiscal_year * 4 + fiscal_quarter,
+                "values": {},
+            },
+        )
+        _dict(row["values"])[str(point.get("metric", ""))] = {
+            "amount": point.get("amount"),
+            "growth_rate": point.get("growth_rate"),
+        }
 
     return [
         {key: value for key, value in row.items() if key != "sort"}
@@ -769,6 +951,50 @@ def _company_title(company: dict[str, object]) -> str:
 def _period_sort_key(value: FinancialPeriodValue) -> int:
     quarter = value.fiscal_quarter if value.fiscal_quarter is not None else 4
     return value.fiscal_year * 4 + quarter
+
+
+def _index_growth_rates(
+    growth_points: list[dict[str, object]],
+    *,
+    series_type: str,
+) -> dict[tuple[str, str], object]:
+    index: dict[tuple[str, str], object] = {}
+    for point in growth_points:
+        if str(point.get("series_type", "")) != series_type:
+            continue
+        key = (str(point.get("metric", "")), str(point.get("period_label", "")))
+        index[key] = point.get("growth_rate")
+    return index
+
+
+def _format_amount_cell(cell: dict[str, object]) -> str:
+    amount = cell.get("amount")
+    if amount is None:
+        return "-"
+    return _format_amount_with_growth(amount, cell.get("growth_rate"))
+
+
+def _format_amount_with_growth(amount: object, growth_rate: object) -> str:
+    return f"{_format_amount(amount)} ({_format_percent(growth_rate)})"
+
+
+def _to_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except InvalidOperation:
+        return None
+
+
+def _svg_number(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.01")))
+
+
+def _truncate_label(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 1] + "…"
 
 
 def _parse_int(value: str, *, field_name: str) -> int:

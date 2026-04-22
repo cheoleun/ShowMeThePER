@@ -57,10 +57,12 @@ class WebTests(TestCase):
         self.assertIn("Samsung Electronics", response.text)
         self.assertIn("연간 금액", response.text)
         self.assertIn("분기 금액", response.text)
+        self.assertIn("최근 4분기 누적 금액", response.text)
         self.assertIn("성장률 필터 결과", response.text)
-        self.assertIn("성장률 차트", response.text)
+        self.assertIn("성장률 상세 보기", response.text)
+        self.assertIn("표 보기", response.text)
         self.assertIn("<svg", response.text)
-        self.assertIn("25.00%", response.text)
+        self.assertIn("150 (25.00%)", response.text)
 
     def test_analysis_validation_errors_stay_in_browser(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
