@@ -141,6 +141,10 @@ class WebTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Samsung Electronics", response.text)
         self.assertIn('<details class="panel" open>', response.text)
+        self.assertIn('class="growth-detail-chart amount-chart"', response.text)
+        self.assertIn('class="growth-table"', response.text)
+        self.assertIn('stroke="#c4b5fd"', response.text)
+        self.assertIn('stroke="#ddd6fe"', response.text)
 
     def test_analysis_renders_eps_and_market_summary(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient, FakeKrxStockPriceClient))

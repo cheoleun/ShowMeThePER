@@ -35,7 +35,6 @@ from .reports import (
     SERIES_ORDER,
     _format_amount,
     _format_percent,
-    _render_growth_chart,
 )
 from .storage import (
     read_dart_companies_from_database,
@@ -1584,12 +1583,19 @@ def render_growth_sections(sections: list[object]) -> str:
     for item in sections:
         section = _dict(item)
         points = [_dict(point) for point in _list(section.get("points"))]
+        metric_label = str(section.get("metric_label", ""))
+        series_label = str(section.get("series_label", ""))
         rendered.append(
             f"""
             <section class="growth-series">
-              <h3>{escape(str(section.get("metric_label", "")))} · {escape(str(section.get("series_label", "")))}</h3>
-              {_render_growth_chart(points)}
-              {render_growth_table(points)}
+              <div class="panel-heading">
+                <h3>{escape(metric_label)} · {escape(series_label)}</h3>
+                <p>성장률 흐름과 기간별 원본 값을 함께 확인할 수 있습니다.</p>
+              </div>
+              {render_growth_detail_chart(points, metric_label=metric_label, series_label=series_label)}
+              <div class="growth-table-wrap">
+                {render_growth_table(points)}
+              </div>
             </section>
             """
         )
@@ -1599,20 +1605,142 @@ def render_growth_sections(sections: list[object]) -> str:
 def render_growth_table(points: list[dict[str, object]]) -> str:
     rows = []
     for point in reversed(points):
+        growth_rate = point.get("growth_rate")
         rows.append(
             "<tr>"
             f"<td>{escape(str(point.get('period_label', '')))}</td>"
             f"<td>{_format_amount(point.get('amount'))}</td>"
             f"<td>{_format_amount(point.get('base_amount'))}</td>"
-            f"<td>{_format_percent(point.get('growth_rate'))}</td>"
+            f'<td><span class="growth-value {_growth_class(growth_rate)}">{escape(_format_percent(growth_rate))}</span></td>'
             "</tr>"
         )
     return (
-        "<table>"
+        '<table class="growth-table">'
         "<thead><tr><th>기간</th><th>금액</th><th>비교 기준 금액</th><th>성장률</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody>"
         "</table>"
     )
+
+
+def render_growth_detail_chart(
+    points: list[dict[str, object]],
+    *,
+    metric_label: str,
+    series_label: str,
+    width: int = 920,
+    height: int = 340,
+) -> str:
+    chart_points = [
+        (index, _to_decimal(point.get("growth_rate")))
+        for index, point in enumerate(points)
+    ]
+    numeric_points = [(index, value) for index, value in chart_points if value is not None]
+    if not numeric_points:
+        return '<p class="empty">표시할 성장률 차트 데이터가 없습니다.</p>'
+
+    left = 64
+    right = 28
+    top = 24
+    bottom = 52
+    values = [value for _, value in numeric_points]
+    min_value = min(values + [Decimal("0")])
+    max_value = max(values + [Decimal("0")])
+    if min_value == max_value:
+        min_value -= Decimal("1")
+        max_value += Decimal("1")
+
+    padding = (max_value - min_value) * Decimal("0.10")
+    if padding == 0:
+        padding = Decimal("1")
+    min_value -= padding
+    max_value += padding
+
+    def x_for(index: int) -> Decimal:
+        if len(points) == 1:
+            return Decimal(left + (width - left - right) / 2)
+        return Decimal(left) + (
+            Decimal(index)
+            / Decimal(len(points) - 1)
+            * Decimal(width - left - right)
+        )
+
+    def y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + (
+            (max_value - value)
+            / (max_value - min_value)
+            * Decimal(height - top - bottom)
+        )
+
+    tick_count = 5
+    tick_values = [
+        min_value + (max_value - min_value) * Decimal(step) / Decimal(tick_count - 1)
+        for step in range(tick_count)
+    ]
+    tick_values = list(reversed(tick_values))
+
+    grid_lines = []
+    axis_labels = []
+    for tick in tick_values:
+        y = y_for(tick)
+        grid_lines.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#eceff8" />'
+        )
+        axis_labels.append(
+            f'<line x1="{left - 6}" y1="{_svg_number(y)}" x2="{left}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#64748b" text-anchor="end">{escape(_format_percent(tick))}</text>'
+        )
+
+    coordinates: list[str] = []
+    markers: list[str] = []
+    for index, value in numeric_points:
+        x = x_for(index)
+        y = y_for(value)
+        coordinates.append(f"{_svg_number(x)},{_svg_number(y)}")
+        tooltip = (
+            f"{metric_label} · {series_label} · {points[index].get('period_label', '')} · "
+            f"금액 {_format_amount(points[index].get('amount'))} · "
+            f"비교 기준 금액 {_format_amount(points[index].get('base_amount'))} · "
+            f"성장률 {_format_percent(value)}"
+        )
+        markers.append(
+            "<g>"
+            f"<title>{escape(tooltip)}</title>"
+            f'<circle cx="{_svg_number(x)}" cy="{_svg_number(y)}" r="2.75" fill="#c4b5fd" stroke="#ffffff" stroke-width="1.0" />'
+            "</g>"
+        )
+
+    line_markup = ""
+    if len(coordinates) >= 2:
+        line_markup = (
+            f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="#c4b5fd" '
+            'stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" />'
+        )
+
+    zero_y = y_for(Decimal("0"))
+    axis_bottom = height - bottom
+    x_label_stride = max(1, len(points) // 8)
+    x_labels = []
+    for index, point in enumerate(points):
+        if not _should_render_x_label(index, len(points), x_label_stride):
+            continue
+        x = x_for(index)
+        x_labels.append(
+            f'<line x1="{_svg_number(x)}" y1="{axis_bottom}" x2="{_svg_number(x)}" y2="{axis_bottom + 6}" stroke="#94a3b8" />'
+            f'<text x="{_svg_number(x)}" y="{axis_bottom + 22}" font-size="12" fill="#64748b" text-anchor="middle">{escape(_truncate_label(str(point.get("period_label", "")), 12))}</text>'
+        )
+
+    return f"""
+    <svg class="growth-detail-chart amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(metric_label)} {escape(series_label)} 성장률 차트">
+      {''.join(grid_lines)}
+      <line x1="{left}" y1="{_svg_number(zero_y)}" x2="{width - right}" y2="{_svg_number(zero_y)}" stroke="#ddd6fe" stroke-dasharray="4 4" />
+      <line x1="{left}" y1="{top}" x2="{left}" y2="{axis_bottom}" stroke="#94a3b8" />
+      <line x1="{left}" y1="{axis_bottom}" x2="{width - right}" y2="{axis_bottom}" stroke="#cbd5e1" />
+      {''.join(axis_labels)}
+      {line_markup}
+      {''.join(markers)}
+      {''.join(x_labels)}
+    </svg>
+    """
 
 
 def render_collection_errors(errors: list[object]) -> str:
@@ -3859,7 +3987,7 @@ def _page_styles() -> str:
     }
     .growth-series {
       display: grid;
-      gap: 10px;
+      gap: 12px;
       padding-top: 12px;
       margin-top: 12px;
       border-top: 1px solid #ebeff4;
@@ -3867,6 +3995,29 @@ def _page_styles() -> str:
     .growth-series h3 {
       margin: 0;
       font-size: 16px;
+    }
+    .growth-detail-chart {
+      min-height: 300px;
+      background: linear-gradient(180deg, #fcfbff 0%, #ffffff 100%);
+    }
+    .growth-table-wrap {
+      overflow-x: auto;
+      border: 1px solid #e8eaf6;
+      border-radius: 8px;
+      background: #fcfcff;
+    }
+    .growth-table {
+      margin: 0;
+    }
+    .growth-table thead th {
+      background: #f6f3ff;
+      color: #5b5f88;
+    }
+    .growth-table tbody tr:nth-child(even) {
+      background: #fafaff;
+    }
+    .growth-value {
+      font-weight: 700;
     }
     table {
       width: 100%;
