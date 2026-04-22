@@ -77,6 +77,40 @@ class WebTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("기업 이름을 입력해 주세요.", response.text)
 
+    def test_analysis_company_lookup_failure_stays_in_browser(self) -> None:
+        client = TestClient(create_app(FailingCompanyListClient))
+
+        with patch.dict(os.environ, {"OPENDART_API_KEY": "test-key"}):
+            response = client.get(
+                "/analysis",
+                params={
+                    "company_query": "Samsung Electronics",
+                    "recent_years": "2",
+                    "end_year": "2025",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("기업 목록을 가져오는 중 오류가 발생했습니다.", response.text)
+        self.assertIn("temporary company lookup failure", response.text)
+
+    def test_analysis_financial_collection_failure_stays_in_browser(self) -> None:
+        client = TestClient(create_app(FailingFinancialClient))
+
+        with patch.dict(os.environ, {"OPENDART_API_KEY": "test-key"}):
+            response = client.get(
+                "/analysis",
+                params={
+                    "company_query": "Samsung Electronics",
+                    "recent_years": "2",
+                    "end_year": "2025",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("수집 오류", response.text)
+        self.assertIn("temporary financial fetch failure", response.text)
+
     def test_resolve_company_query_accepts_name_stock_code_and_corp_code(self) -> None:
         companies = FakeOpenDartClient("test-key").fetch_companies()
 
@@ -156,6 +190,23 @@ class FakeOpenDartClient:
                 before_previous_amount=annual_amounts.get(year - 2),
             )
         ]
+
+
+class FailingCompanyListClient(FakeOpenDartClient):
+    def fetch_companies(self) -> list[DartCompany]:
+        raise RuntimeError("temporary company lookup failure")
+
+
+class FailingFinancialClient(FakeOpenDartClient):
+    def fetch_major_accounts(
+        self,
+        corp_codes: list[str],
+        business_year: str,
+        report_code: str,
+        fs_div: str | None = None,
+        batch_size: int = 100,
+    ) -> list[FinancialStatementRow]:
+        raise RuntimeError("temporary financial fetch failure")
 
 
 if __name__ == "__main__":

@@ -92,28 +92,50 @@ def create_app(
 
         client = client_factory(api_key)
         try:
-            company = resolve_company_query(client.fetch_companies(), request["company_query"])
+            companies = client.fetch_companies()
+            company = resolve_company_query(companies, request["company_query"])
         except ValueError as error:
             return HTMLResponse(render_page(form=form, error=str(error)))
+        except Exception as error:
+            return HTMLResponse(
+                render_page(
+                    form=form,
+                    error=_format_request_error(
+                        "기업 목록을 가져오는 중 오류가 발생했습니다.",
+                        error,
+                    ),
+                )
+            )
 
-        run = collect_financial_statement_run(
-            client,
-            corp_codes=[company.corp_code],
-            business_years=request["business_years"],
-            report_codes=DEFAULT_REPORT_CODES,
-            fs_div=request["fs_div"],
-            continue_on_error=True,
-        )
-        artifacts = build_analysis_artifacts(
-            run.rows,
-            collection_errors=run.errors,
-            expected_corp_codes=[company.corp_code],
-            expected_business_years=request["business_years"],
-            expected_report_codes=DEFAULT_REPORT_CODES,
-            threshold_percent=request["threshold_percent"],
-            recent_annual_periods=3,
-            recent_quarterly_periods=12,
-        )
+        try:
+            run = collect_financial_statement_run(
+                client,
+                corp_codes=[company.corp_code],
+                business_years=request["business_years"],
+                report_codes=DEFAULT_REPORT_CODES,
+                fs_div=request["fs_div"],
+                continue_on_error=True,
+            )
+            artifacts = build_analysis_artifacts(
+                run.rows,
+                collection_errors=run.errors,
+                expected_corp_codes=[company.corp_code],
+                expected_business_years=request["business_years"],
+                expected_report_codes=DEFAULT_REPORT_CODES,
+                threshold_percent=request["threshold_percent"],
+                recent_annual_periods=3,
+                recent_quarterly_periods=12,
+            )
+        except Exception as error:
+            return HTMLResponse(
+                render_page(
+                    form=form,
+                    error=_format_request_error(
+                        "재무제표를 수집하는 중 오류가 발생했습니다.",
+                        error,
+                    ),
+                )
+            )
         payload = build_browser_report_payload(
             artifacts,
             company=company,
@@ -785,6 +807,13 @@ def _ambiguous_company_message(
         for company in companies[:5]
     )
     return f"'{query}'에 해당하는 기업이 여러 개입니다: {candidates}"
+
+
+def _format_request_error(prefix: str, error: Exception) -> str:
+    message = str(error).strip()
+    if not message:
+        return prefix
+    return f"{prefix} {message}"
 
 
 def _option(value: str, label: str, selected: str) -> str:
