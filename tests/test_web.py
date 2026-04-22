@@ -187,13 +187,14 @@ class WebTests(TestCase):
         self.assertIn('id="compare-form"', response.text)
 
     def test_compare_collects_and_renders_dashboard(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(create_app(FakeOpenDartClient, FakeKrxStockPriceClient))
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
                 os.environ,
                 {
                     "OPENDART_API_KEY": "test-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
                     "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
                 },
             ):
@@ -213,6 +214,12 @@ class WebTests(TestCase):
         self.assertIn("Samsung Electronics", response.text)
         self.assertIn("Vinatac", response.text)
         self.assertIn("<svg", response.text)
+        self.assertIn("KOSPI", response.text)
+        self.assertIn("KOSDAQ", response.text)
+        self.assertIn("시가총액", response.text)
+        self.assertIn("전일 종가", response.text)
+        self.assertNotIn("Samsung Electronics (005930)", response.text)
+        self.assertNotIn("Vinatac (126340)", response.text)
 
     def test_compare_top_tabs_keep_both_companies(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))

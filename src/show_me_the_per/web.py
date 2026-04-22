@@ -800,7 +800,7 @@ def render_compare_page(
     company_title = ""
     if primary and secondary:
         company_title = (
-            f"{_company_title(_dict(primary))} VS {_company_title(_dict(secondary))}"
+            f"{_company_name(_dict(primary))} VS {_company_name(_dict(secondary))}"
         )
 
     return render_shell(
@@ -1196,6 +1196,19 @@ def render_market_profile_pills(profile: dict[str, object]) -> str:
     return "".join(pills)
 
 
+def render_compare_company_meta(
+    company: dict[str, object],
+    profile: dict[str, object],
+    *,
+    accent_class: str,
+) -> str:
+    pills = [f'<span class="inline-pill {accent_class}">{escape(_company_name(company))}</span>']
+    pills_html = render_market_profile_pills(profile)
+    if pills_html:
+        pills.append(pills_html)
+    return f'<div class="compare-company-meta">{"".join(pills)}</div>'
+
+
 def render_message(error: str | None = None, info: str | None = None) -> str:
     if error:
         return f'<section class="notice error">{escape(error)}</section>'
@@ -1434,6 +1447,8 @@ def render_compare_dashboard(payload: dict[str, object]) -> str:
     secondary = _dict(payload.get("secondary"))
     primary_company = _dict(primary.get("company"))
     secondary_company = _dict(secondary.get("company"))
+    primary_market_profile = _dict(primary.get("market_profile"))
+    secondary_market_profile = _dict(secondary.get("market_profile"))
     summary = _dict(payload.get("summary"))
     period_groups = _build_compare_period_groups(primary, secondary)
 
@@ -1441,12 +1456,12 @@ def render_compare_dashboard(payload: dict[str, object]) -> str:
     <section class="report-shell" data-dashboard data-initial-period="{DEFAULT_PERIOD_KEY}" data-initial-metric="{DEFAULT_METRIC_KEY}">
       <section class="company-header panel">
         <div>
-          <h2>{escape(_company_title(primary_company))} VS {escape(_company_title(secondary_company))}</h2>
+          <h2>{escape(_company_name(primary_company))} VS {escape(_company_name(secondary_company))}</h2>
           <p>조회 기간 {escape(str(summary.get("recent_years", DEFAULT_RECENT_YEARS)))}년 · 기준 연도 {escape(str(summary.get("end_year", default_end_year())))} · 재무제표 {escape(str(summary.get("fs_div", "")))}</p>
         </div>
-        <div class="company-actions">
-          <span class="inline-pill inline-pill-accent">{escape(_company_title(primary_company))}</span>
-          <span class="inline-pill inline-pill-contrast">{escape(_company_title(secondary_company))}</span>
+        <div class="company-actions company-actions-compare">
+          {render_compare_company_meta(primary_company, primary_market_profile, accent_class="inline-pill-accent")}
+          {render_compare_company_meta(secondary_company, secondary_market_profile, accent_class="inline-pill-contrast")}
         </div>
       </section>
       {render_dashboard_toolbar()}
@@ -1492,8 +1507,8 @@ def render_compare_latest_cards(
             '<article class="compare-stat-card">'
             f'<div class="compare-stat-title">{escape(METRIC_LABELS.get(metric, metric))}</div>'
             f'<div class="compare-stat-period">{escape(str(latest_left.get("period") or latest_right.get("period") or "-"))}</div>'
-            f'<div class="compare-stat-row"><span>{escape(_company_title(primary_company))}</span><strong>{escape(_format_chart_amount(left_cell.get("amount")))}</strong><em>{escape(_format_percent(left_cell.get("growth_rate")))}</em></div>'
-            f'<div class="compare-stat-row"><span>{escape(_company_title(secondary_company))}</span><strong>{escape(_format_chart_amount(right_cell.get("amount")))}</strong><em>{escape(_format_percent(right_cell.get("growth_rate")))}</em></div>'
+            f'<div class="compare-stat-row"><span>{escape(_company_name(primary_company))}</span><strong>{escape(_format_chart_amount(left_cell.get("amount")))}</strong><em>{escape(_format_percent(left_cell.get("growth_rate")))}</em></div>'
+            f'<div class="compare-stat-row"><span>{escape(_company_name(secondary_company))}</span><strong>{escape(_format_chart_amount(right_cell.get("amount")))}</strong><em>{escape(_format_percent(right_cell.get("growth_rate")))}</em></div>'
             f'<div class="compare-stat-delta">차이 {escape(_format_chart_amount(delta))}</div>'
             "</article>"
         )
@@ -1516,7 +1531,7 @@ def render_compare_focus_panel(
         panels.append(
             f'<div class="chart-focus-panel" data-panel data-period="{escape(str(group.get("key", "")))}" data-metric="{escape(metric)}" '
             f'{"hidden" if not (group.get("key") == DEFAULT_PERIOD_KEY and metric == DEFAULT_METRIC_KEY) else ""}>'
-            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), period_key=str(group.get("key", "")), primary_name=_company_title(primary_company), secondary_name=_company_title(secondary_company), title=chart_title)}'
+            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), period_key=str(group.get("key", "")), primary_name=_company_name(primary_company), secondary_name=_company_name(secondary_company), title=chart_title)}'
             "</div>"
         )
     return "".join(panels)
@@ -1532,13 +1547,13 @@ def render_compare_grid(
         chart_title = f"{group.get('label')} · {METRIC_LABELS.get(metric, metric)}"
         cards.append(
             f'<article class="panel grid-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
-            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), period_key=str(group.get("key", "")), primary_name=_company_title(primary_company), secondary_name=_company_title(secondary_company), title=chart_title)}'
+            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), period_key=str(group.get("key", "")), primary_name=_company_name(primary_company), secondary_name=_company_name(secondary_company), title=chart_title)}'
             "</article>"
         )
     cards.append(
         f'<article class="panel info-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
         f'<div class="panel-heading"><h3>{escape(str(group.get("label", "")))} 최근 비교 표</h3></div>'
-        f'{render_compare_table(_list(group.get("primary_rows")), _list(group.get("secondary_rows")), _company_title(primary_company), _company_title(secondary_company))}'
+        f'{render_compare_table(_list(group.get("primary_rows")), _list(group.get("secondary_rows")), _company_name(primary_company), _company_name(secondary_company))}'
         "</article>"
     )
     return "".join(cards)
@@ -3128,6 +3143,13 @@ def _company_title(company: dict[str, object]) -> str:
     return name or stock_code or corp_code
 
 
+def _company_name(company: dict[str, object]) -> str:
+    name = str(company.get("corp_name") or "").strip()
+    stock_code = str(company.get("stock_code") or "").strip()
+    corp_code = str(company.get("corp_code") or "").strip()
+    return name or stock_code or corp_code
+
+
 def _period_sort_key(value: FinancialPeriodValue) -> int:
     quarter = value.fiscal_quarter if value.fiscal_quarter is not None else 4
     return value.fiscal_year * 4 + quarter
@@ -3644,6 +3666,17 @@ def _page_styles() -> str:
       align-items: center;
       gap: 8px;
       justify-content: flex-end;
+    }
+    .company-actions-compare {
+      align-items: stretch;
+      gap: 12px;
+    }
+    .compare-company-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+      align-items: center;
     }
     .overview-layout {
       display: grid;
