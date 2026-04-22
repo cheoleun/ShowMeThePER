@@ -7,14 +7,18 @@ from pathlib import Path
 from typing import Iterable
 
 from .financials import read_financial_statement_rows
-from .growth import read_financial_period_values
+from .growth import build_growth_metrics_payload, read_financial_period_values
 from .krx import KrxStockPriceSnapshot
 from .models import DartCompany, FinancialPeriodValue, FinancialStatementRow, GrowthPoint
 from .pipeline import AnalysisArtifacts, CollectionError
-from .rankings import rank_growth_filter_results
+from .rankings import (
+    ValuationSnapshot,
+    build_screening_rows,
+    rank_growth_filter_results,
+)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 SCHEMA_STATEMENTS = (
@@ -133,6 +137,24 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS valuation_snapshots (
+        stock_code TEXT NOT NULL,
+        corp_code TEXT NOT NULL,
+        corp_name TEXT NOT NULL,
+        base_date TEXT NOT NULL,
+        market TEXT,
+        close_price TEXT,
+        market_cap TEXT,
+        per TEXT,
+        pbr TEXT,
+        roe TEXT,
+        eps TEXT,
+        source TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        PRIMARY KEY (stock_code, base_date)
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_financial_rows_corp_year
     ON financial_statement_rows (corp_code, business_year)
     """,
@@ -148,6 +170,10 @@ SCHEMA_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_equity_price_snapshots_stock_code
     ON equity_price_snapshots (stock_code, base_date DESC)
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_valuation_snapshots_stock_code
+    ON valuation_snapshots (stock_code, base_date DESC, fetched_at DESC)
+    """,
 )
 
 
@@ -156,8 +182,9 @@ def initialize_database(database_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
+        connection.execute("DELETE FROM schema_version")
         connection.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+            "INSERT INTO schema_version (version) VALUES (?)",
             (SCHEMA_VERSION,),
         )
 
@@ -409,6 +436,48 @@ def store_equity_price_snapshot(
         )
 
 
+def store_valuation_snapshot(
+    database_path: Path,
+    snapshot: ValuationSnapshot,
+) -> None:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO valuation_snapshots (
+                stock_code,
+                corp_code,
+                corp_name,
+                base_date,
+                market,
+                close_price,
+                market_cap,
+                per,
+                pbr,
+                roe,
+                eps,
+                source,
+                fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot.stock_code,
+                snapshot.corp_code,
+                snapshot.corp_name,
+                snapshot.base_date,
+                snapshot.market or "",
+                _decimal_to_text(snapshot.close_price),
+                _decimal_to_text(snapshot.market_cap),
+                _decimal_to_text(snapshot.per),
+                _decimal_to_text(snapshot.pbr),
+                _decimal_to_text(snapshot.roe),
+                _decimal_to_text(snapshot.eps),
+                snapshot.source or "",
+                snapshot.fetched_at or "",
+            ),
+        )
+
+
 def read_financial_statement_rows_from_database(
     database_path: Path,
     *,
@@ -519,6 +588,114 @@ def read_latest_equity_price_snapshot(
         listed_stock_count=_parse_decimal(row[5]),
         market_cap=_parse_decimal(row[6]),
     )
+
+
+def read_latest_equity_price_snapshots(
+    database_path: Path,
+) -> dict[str, KrxStockPriceSnapshot]:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                stock_code,
+                base_date,
+                market,
+                item_name,
+                close_price,
+                listed_stock_count,
+                market_cap
+            FROM equity_price_snapshots
+            ORDER BY stock_code ASC, base_date DESC
+            """
+        ).fetchall()
+
+    latest: dict[str, KrxStockPriceSnapshot] = {}
+    for row in rows:
+        stock_code = row[0]
+        if stock_code in latest:
+            continue
+        latest[stock_code] = KrxStockPriceSnapshot(
+            stock_code=stock_code,
+            base_date=row[1],
+            market=row[2],
+            item_name=row[3],
+            close_price=_parse_decimal(row[4]),
+            listed_stock_count=_parse_decimal(row[5]),
+            market_cap=_parse_decimal(row[6]),
+        )
+    return latest
+
+
+def read_latest_valuation_snapshot(
+    database_path: Path,
+    *,
+    stock_code: str,
+) -> ValuationSnapshot | None:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                stock_code,
+                corp_code,
+                corp_name,
+                base_date,
+                market,
+                close_price,
+                market_cap,
+                per,
+                pbr,
+                roe,
+                eps,
+                source,
+                fetched_at
+            FROM valuation_snapshots
+            WHERE stock_code = ?
+            ORDER BY base_date DESC, fetched_at DESC
+            LIMIT 1
+            """,
+            (stock_code,),
+        ).fetchone()
+
+    if row is None:
+        return None
+    return _row_to_valuation_snapshot(row)
+
+
+def read_latest_valuation_snapshots(
+    database_path: Path,
+) -> list[ValuationSnapshot]:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                stock_code,
+                corp_code,
+                corp_name,
+                base_date,
+                market,
+                close_price,
+                market_cap,
+                per,
+                pbr,
+                roe,
+                eps,
+                source,
+                fetched_at
+            FROM valuation_snapshots
+            ORDER BY stock_code ASC, base_date DESC, fetched_at DESC
+            """
+        ).fetchall()
+
+    latest: dict[str, ValuationSnapshot] = {}
+    for row in rows:
+        stock_code = row[0]
+        if stock_code in latest:
+            continue
+        latest[stock_code] = _row_to_valuation_snapshot(row)
+    return list(latest.values())
 
 
 def read_financial_period_values_from_database(
@@ -724,6 +901,94 @@ def build_database_growth_ranking_payload(
     }
 
 
+def build_database_company_screening_payload(
+    database_path: Path,
+    *,
+    start_year: int,
+    end_year: int,
+    fs_div: str | None = None,
+    growth_metric: str | None = None,
+    growth_series_type: str | None = None,
+    include_failed_growth: bool = False,
+    threshold_percent: Decimal = Decimal("20"),
+    recent_annual_periods: int = 3,
+    recent_quarterly_periods: int = 12,
+    max_per: Decimal | None = None,
+    max_pbr: Decimal | None = None,
+    min_roe: Decimal | None = None,
+    market: str | None = None,
+    sort_by: str = "market_cap",
+) -> dict[str, object]:
+    calculation_start_year = max(0, start_year - 1)
+    values = [
+        value
+        for value in read_financial_period_values_from_database(database_path)
+        if calculation_start_year <= value.fiscal_year <= end_year
+    ]
+    growth_payload = build_growth_metrics_payload(
+        values,
+        threshold_percent=threshold_percent,
+        recent_annual_periods=recent_annual_periods,
+        recent_quarterly_periods=recent_quarterly_periods,
+    )
+    valuation_snapshots = read_latest_valuation_snapshots(database_path)
+    company_index = _read_company_index(database_path)
+    latest_equity_price_snapshots = read_latest_equity_price_snapshots(database_path)
+    price_index = {
+        profile.get("corp_code", corp_code): {
+            "market": snapshot.market,
+            "close_price": _decimal_to_text(snapshot.close_price),
+            "market_cap": _decimal_to_text(snapshot.market_cap),
+            "base_date": snapshot.base_date,
+            "source": "krx_cache",
+        }
+        for corp_code, profile in company_index.items()
+        for snapshot in [latest_equity_price_snapshots.get(profile.get("stock_code", ""))]
+        if snapshot is not None
+    }
+
+    rows = build_screening_rows(
+        growth_payload.get("filter", {}).get("results", []),  # type: ignore[arg-type]
+        valuation_snapshots,
+        company_index=company_index,
+        price_index=price_index,
+        growth_metric=growth_metric,
+        growth_series_type=growth_series_type,
+        include_failed_growth=include_failed_growth,
+        max_per=max_per,
+        max_pbr=max_pbr,
+        min_roe=min_roe,
+        market=market,
+        sort_by=sort_by,
+    )
+
+    return {
+        "summary": {
+            "database": str(database_path),
+            "values": len(values),
+            "valuation_snapshots": len(valuation_snapshots),
+            "screening_rows": len(rows),
+            "start_year": start_year,
+            "end_year": end_year,
+        },
+        "filters": {
+            "fs_div": fs_div,
+            "growth_metric": growth_metric,
+            "growth_series_type": growth_series_type,
+            "include_failed_growth": include_failed_growth,
+            "threshold_percent": str(threshold_percent),
+            "recent_annual_periods": recent_annual_periods,
+            "recent_quarterly_periods": recent_quarterly_periods,
+            "max_per": _decimal_to_text(max_per),
+            "max_pbr": _decimal_to_text(max_pbr),
+            "min_roe": _decimal_to_text(min_roe),
+            "market": (market or "").strip().upper(),
+            "sort_by": sort_by,
+        },
+        "screening_rows": rows,
+    }
+
+
 def read_company_profile_from_database(
     database_path: Path,
     corp_code: str,
@@ -775,6 +1040,14 @@ def summarize_database(database_path: Path) -> dict[str, int]:
                 "growth_filter_results",
             ),
             "collection_errors": _table_count(connection, "collection_errors"),
+            "equity_price_snapshots": _table_count(
+                connection,
+                "equity_price_snapshots",
+            ),
+            "valuation_snapshots": _table_count(
+                connection,
+                "valuation_snapshots",
+            ),
         }
 
 
@@ -798,6 +1071,24 @@ def _read_company_index(database_path: Path) -> dict[str, dict[str, str]]:
             },
         )
     return companies
+
+
+def _row_to_valuation_snapshot(row: tuple[object, ...]) -> ValuationSnapshot:
+    return ValuationSnapshot(
+        stock_code=str(row[0]),
+        corp_code=str(row[1]),
+        corp_name=str(row[2]),
+        base_date=str(row[3]),
+        market=_optional_text(row[4]),
+        close_price=_parse_decimal(row[5]),
+        market_cap=_parse_decimal(row[6]),
+        per=_parse_decimal(row[7]),
+        pbr=_parse_decimal(row[8]),
+        roe=_parse_decimal(row[9]),
+        eps=_parse_decimal(row[10]),
+        source=str(row[11]),
+        fetched_at=str(row[12]),
+    )
 
 
 def _parse_growth_points_payload(payload: dict[str, object]) -> list[GrowthPoint]:

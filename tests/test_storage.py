@@ -13,18 +13,22 @@ from show_me_the_per.pipeline import (
     write_analysis_outputs,
 )
 from show_me_the_per.storage import (
+    build_database_company_screening_payload,
     build_database_growth_ranking_payload,
     read_dart_companies_from_database,
     read_financial_statement_rows_from_database,
     read_latest_equity_price_snapshot,
+    read_latest_valuation_snapshot,
     read_financial_period_values_from_database,
     read_growth_filter_results_from_database,
     read_growth_points_from_database,
     store_analysis_artifacts,
     store_analysis_directory,
     store_equity_price_snapshot,
+    store_valuation_snapshot,
     summarize_database,
 )
+from show_me_the_per.rankings import ValuationSnapshot
 
 
 class StorageTests(unittest.TestCase):
@@ -238,6 +242,8 @@ class StorageTests(unittest.TestCase):
                 "growth_points": 0,
                 "growth_filter_results": 0,
                 "collection_errors": 0,
+                "equity_price_snapshots": 0,
+                "valuation_snapshots": 0,
             },
         )
 
@@ -358,6 +364,145 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["growth_rankings"], 1)
         self.assertEqual(payload["growth_rankings"][0]["corp_code"], "00434003")
         self.assertEqual(payload["growth_rankings"][0]["stock_code"], "000660")
+
+    def test_store_and_read_latest_valuation_snapshot(self) -> None:
+        snapshot_old = ValuationSnapshot(
+            corp_code="00888888",
+            corp_name="Vinatac",
+            stock_code="126340",
+            per=Decimal("12.1"),
+            pbr=Decimal("1.8"),
+            roe=Decimal("14.2"),
+            eps=Decimal("2345"),
+            close_price=Decimal("36000"),
+            market_cap=Decimal("544444416000"),
+            market="KOSDAQ",
+            base_date="20260421",
+            source="naver_finance",
+            fetched_at="2026-04-21T07:30:00Z",
+        )
+        snapshot_new = ValuationSnapshot(
+            corp_code="00888888",
+            corp_name="Vinatac",
+            stock_code="126340",
+            per=Decimal("11.4"),
+            pbr=Decimal("1.7"),
+            roe=Decimal("15.0"),
+            eps=Decimal("2450"),
+            close_price=Decimal("37100"),
+            market_cap=Decimal("561080217600"),
+            market="KOSDAQ",
+            base_date="20260422",
+            source="naver_finance",
+            fetched_at="2026-04-22T07:30:00Z",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            store_valuation_snapshot(database_path, snapshot_old)
+            store_valuation_snapshot(database_path, snapshot_new)
+            latest = read_latest_valuation_snapshot(
+                database_path,
+                stock_code="126340",
+            )
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.base_date, "20260422")
+        self.assertEqual(latest.per, Decimal("11.4"))
+        self.assertEqual(latest.market_cap, Decimal("561080217600"))
+
+    def test_build_database_company_screening_payload_combines_growth_and_valuation(
+        self,
+    ) -> None:
+        artifacts = build_analysis_artifacts(
+            [
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "150",
+                    business_year="2025",
+                    previous_amount=Decimal("120"),
+                    before_previous_amount=Decimal("100"),
+                    stock_code="005930",
+                ),
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "120",
+                    business_year="2024",
+                    previous_amount=Decimal("100"),
+                    before_previous_amount=Decimal("80"),
+                    stock_code="005930",
+                ),
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "80",
+                    business_year="2022",
+                    previous_amount=Decimal("60"),
+                    before_previous_amount=Decimal("50"),
+                    stock_code="005930",
+                ),
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "100",
+                    business_year="2023",
+                    previous_amount=Decimal("80"),
+                    before_previous_amount=Decimal("70"),
+                    stock_code="005930",
+                ),
+            ],
+            expected_corp_codes=["00126380"],
+            expected_business_years=["2022", "2023", "2024", "2025"],
+            expected_report_codes=["11011"],
+            recent_annual_periods=3,
+            recent_quarterly_periods=12,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            store_analysis_artifacts(database_path, artifacts)
+            store_valuation_snapshot(
+                database_path,
+                ValuationSnapshot(
+                    corp_code="00126380",
+                    corp_name="Samsung Electronics",
+                    stock_code="005930",
+                    per=Decimal("8"),
+                    pbr=Decimal("0.9"),
+                    roe=Decimal("22"),
+                    eps=Decimal("6564"),
+                    close_price=Decimal("84500"),
+                    market_cap=Decimal("504448025000000"),
+                    market="KOSPI",
+                    base_date="20260422",
+                    source="naver_finance",
+                    fetched_at="2026-04-22T07:30:00Z",
+                ),
+            )
+            payload = build_database_company_screening_payload(
+                database_path,
+                start_year=2023,
+                end_year=2025,
+                fs_div="CFS",
+                growth_metric="revenue",
+                growth_series_type="annual_yoy",
+                threshold_percent=Decimal("20"),
+                recent_annual_periods=3,
+                recent_quarterly_periods=12,
+                max_per=Decimal("10"),
+                min_roe=Decimal("20"),
+                sort_by="market_cap",
+            )
+
+        self.assertEqual(payload["summary"]["screening_rows"], 1)
+        self.assertEqual(payload["screening_rows"][0]["corp_code"], "00126380")
+        self.assertEqual(payload["screening_rows"][0]["per"], "8")
 
 
 def financial_row(

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from show_me_the_per import cli
 from show_me_the_per.cli import main, parse_corp_code_args
-from show_me_the_per.models import FinancialStatementRow
+from show_me_the_per.models import DartCompany, FinancialStatementRow
 from show_me_the_per.storage import summarize_database
 
 
@@ -223,10 +223,11 @@ class CliTests(unittest.TestCase):
             cli.OpenDartClient = original_client
 
         self.assertEqual(coverage["summary"]["corp_codes"], 1)
-        self.assertEqual(growth["summary"]["growth_points"], 2)
+        self.assertEqual(growth["summary"]["growth_points"], 3)
         self.assertEqual(errors["summary"]["errors"], 0)
         self.assertEqual(database_summary["financial_statement_rows"], 1)
-        self.assertEqual(database_summary["financial_period_values"], 2)
+        self.assertEqual(database_summary["financial_period_values"], 3)
+        self.assertEqual(database_summary["valuation_snapshots"], 0)
 
     def test_analysis_to_db_command_stores_existing_outputs(self) -> None:
         original_client = cli.OpenDartClient
@@ -464,6 +465,78 @@ class CliTests(unittest.TestCase):
         self.assertEqual(coverage["summary"]["collection_errors"], 1)
         self.assertEqual(errors["errors"][0]["report_code"], "11013")
 
+    def test_refresh_valuations_and_rank_companies_from_database(self) -> None:
+        original_open_dart_client = cli.OpenDartClient
+        original_naver_client = cli.NaverFinanceClient
+        cli.OpenDartClient = FakeOpenDartClient
+        cli.NaverFinanceClient = FakeNaverFinanceClient
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                output_dir = Path(directory) / "analysis"
+                database_path = Path(directory) / "analysis.sqlite3"
+                summary_path = Path(directory) / "valuations.json"
+                ranking_path = Path(directory) / "screening.json"
+
+                main(
+                    [
+                        "collect-analysis",
+                        "--opendart-api-key",
+                        "test-key",
+                        "--corp-code",
+                        "00126380",
+                        "--year-from",
+                        "2023",
+                        "--year-to",
+                        "2025",
+                        "--report-code",
+                        "11011",
+                        "--output-dir",
+                        str(output_dir),
+                        "--database",
+                        str(database_path),
+                        "--recent-annual-periods",
+                        "3",
+                        "--recent-quarterly-periods",
+                        "12",
+                    ]
+                )
+                main(
+                    [
+                        "refresh-valuations",
+                        "--database",
+                        str(database_path),
+                        "--output",
+                        str(summary_path),
+                    ]
+                )
+                main(
+                    [
+                        "rank-companies",
+                        "--database",
+                        str(database_path),
+                        "--output",
+                        str(ranking_path),
+                        "--recent-years",
+                        "2",
+                        "--end-year",
+                        "2025",
+                        "--max-per",
+                        "10",
+                        "--min-roe",
+                        "20",
+                    ]
+                )
+
+                refresh_summary = json.loads(summary_path.read_text("utf-8"))
+                ranking_payload = json.loads(ranking_path.read_text("utf-8"))
+        finally:
+            cli.OpenDartClient = original_open_dart_client
+            cli.NaverFinanceClient = original_naver_client
+
+        self.assertEqual(refresh_summary["summary"]["companies"], 1)
+        self.assertEqual(ranking_payload["summary"]["screening_rows"], 1)
+        self.assertEqual(ranking_payload["screening_rows"][0]["corp_code"], "00126380")
+
 
 class FakeOpenDartClient:
     def __init__(self, api_key: str) -> None:
@@ -477,6 +550,12 @@ class FakeOpenDartClient:
         fs_div: str | None = None,
         batch_size: int = 100,
     ) -> list[FinancialStatementRow]:
+        year = int(business_year)
+        annual_amounts = {
+            2023: Decimal("100"),
+            2024: Decimal("130"),
+            2025: Decimal("170"),
+        }
         return [
             FinancialStatementRow(
                 corp_code=corp_codes[0],
@@ -491,11 +570,11 @@ class FakeOpenDartClient:
                 account_id="ifrs-full_Revenue",
                 account_name="Revenue",
                 current_term_name="Current",
-                current_amount=Decimal("130"),
+                current_amount=annual_amounts.get(year, Decimal("170")),
                 previous_term_name="Previous",
-                previous_amount=Decimal("100"),
+                previous_amount=annual_amounts.get(year - 1),
                 before_previous_term_name="Before previous",
-                before_previous_amount=None,
+                before_previous_amount=annual_amounts.get(year - 2),
             )
         ]
 
@@ -518,6 +597,27 @@ class PartiallyFailingOpenDartClient(FakeOpenDartClient):
             fs_div,
             batch_size,
         )
+
+
+class FakeNaverFinanceClient:
+    def fetch_snapshot(self, stock_code: str) -> object:
+        return type(
+            "Snapshot",
+            (),
+            {
+                "corp_name": "Samsung Electronics",
+                "market": "KOSPI",
+                "close_price": Decimal("84500"),
+                "market_cap": Decimal("504448025000000"),
+                "per": Decimal("8"),
+                "pbr": Decimal("0.9"),
+                "roe": Decimal("22"),
+                "eps": Decimal("6564"),
+                "base_date": "20260422",
+                "source": "naver_finance",
+                "fetched_at": "2026-04-22T07:30:00Z",
+            },
+        )()
 
 
 if __name__ == "__main__":

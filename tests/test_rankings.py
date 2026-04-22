@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import tempfile
 import unittest
@@ -6,6 +8,7 @@ from pathlib import Path
 
 from show_me_the_per.rankings import (
     ValuationSnapshot,
+    build_screening_rows,
     build_ranking_payload,
     filter_valuation_snapshots,
     rank_growth_filter_results,
@@ -76,6 +79,39 @@ class RankingTests(unittest.TestCase):
 
         self.assertEqual(payload["summary"]["growth_rankings"], 1)
         self.assertEqual(payload["summary"]["valuation_rankings"], 1)
+        self.assertEqual(payload["summary"]["screening_rows"], 1)
+
+    def test_build_screening_rows_applies_market_and_sorting(self) -> None:
+        rows = build_screening_rows(
+            [
+                growth_result("00126380", "revenue", "annual_yoy", "25", True),
+                growth_result("00434003", "revenue", "annual_yoy", "30", True),
+            ],
+            [
+                valuation(
+                    "00126380",
+                    per="8",
+                    pbr="0.9",
+                    roe="22",
+                    market_cap="504448025000000",
+                    market="KOSPI",
+                ),
+                valuation(
+                    "00434003",
+                    per="6",
+                    pbr="0.8",
+                    roe="18",
+                    market_cap="160000000000000",
+                    market="KOSPI",
+                ),
+            ],
+            market="KOSPI",
+            min_roe=Decimal("20"),
+            sort_by="market_cap",
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["corp_code"], "00126380")
 
     def test_read_and_write_ranking_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -140,6 +176,8 @@ def valuation(
     per: str,
     pbr: str,
     roe: str,
+    market_cap: str | None = None,
+    market: str | None = None,
 ) -> ValuationSnapshot:
     return ValuationSnapshot(
         corp_code=corp_code,
@@ -148,6 +186,8 @@ def valuation(
         per=Decimal(per),
         pbr=Decimal(pbr),
         roe=Decimal(roe),
+        market_cap=None if market_cap is None else Decimal(market_cap),
+        market=market,
     )
 
 

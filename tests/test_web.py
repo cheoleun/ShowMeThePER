@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import tempfile
@@ -29,7 +29,13 @@ class WebTests(TestCase):
         self.assertEqual(_format_won(None), "-")
 
     def test_home_renders_v2_analysis_toolbar(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         response = client.get("/")
 
@@ -39,7 +45,13 @@ class WebTests(TestCase):
         self.assertIn(str(default_end_year()), response.text)
 
     def test_analysis_requires_api_key(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with patch.dict(os.environ, {}, clear=True):
             response = client.get(
@@ -55,7 +67,13 @@ class WebTests(TestCase):
         self.assertIn("OPENDART_API_KEY", response.text)
 
     def test_analysis_collects_and_renders_v2_dashboard(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -83,7 +101,13 @@ class WebTests(TestCase):
         self.assertIn("OpenDART 신규 수집", response.text)
 
     def test_analysis_top_tabs_keep_company_context(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -124,7 +148,13 @@ class WebTests(TestCase):
         )
 
     def test_growth_tab_opens_growth_details_without_losing_data(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -155,7 +185,13 @@ class WebTests(TestCase):
         self.assertIn('stroke="#ddd6fe"', response.text)
 
     def test_analysis_renders_eps_and_market_summary(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient, FakeKrxStockPriceClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -186,8 +222,14 @@ class WebTests(TestCase):
         self.assertIn("전일 종가", response.text)
         self.assertIn("전일 종가 37,100원", response.text)
 
-    def test_analysis_shows_market_status_when_krx_key_is_missing(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+    def test_analysis_uses_valuation_snapshot_when_krx_key_is_missing(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -209,10 +251,19 @@ class WebTests(TestCase):
                 )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("전일 시세 정보 비활성화", response.text)
+        self.assertIn("KOSDAQ", response.text)
+        self.assertIn("PER", response.text)
+        self.assertIn("PBR", response.text)
+        self.assertIn("ROE", response.text)
 
-    def test_analysis_shows_market_status_when_krx_lookup_fails(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient, MissingKrxStockPriceClient))
+    def test_analysis_falls_back_to_valuation_snapshot_when_krx_lookup_fails(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                MissingKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -235,10 +286,19 @@ class WebTests(TestCase):
                 )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("전일 시가총액 정보 없음", response.text)
+        self.assertIn("KOSDAQ", response.text)
+        self.assertIn("PER", response.text)
+        self.assertIn("PBR", response.text)
+        self.assertIn("ROE", response.text)
 
     def test_compare_empty_page_renders_form(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         response = client.get(
             "/compare",
@@ -253,7 +313,13 @@ class WebTests(TestCase):
         self.assertIn('id="compare-form"', response.text)
 
     def test_compare_collects_and_renders_dashboard(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient, FakeKrxStockPriceClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -291,7 +357,13 @@ class WebTests(TestCase):
         self.assertNotIn("Vinatac (126340)", response.text)
 
     def test_dashboard_metric_script_resets_eps_outside_annual_period(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -318,7 +390,13 @@ class WebTests(TestCase):
         self.assertIn("allowedMetricButtons[0]", response.text)
 
     def test_compare_top_tabs_keep_both_companies(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -351,7 +429,13 @@ class WebTests(TestCase):
         )
 
     def test_analysis_validation_errors_stay_in_browser(self) -> None:
-        client = TestClient(create_app(FakeOpenDartClient))
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         response = client.get(
             "/analysis",
@@ -368,7 +452,13 @@ class WebTests(TestCase):
         self.assertNotIn("<svg", response.text)
 
     def test_analysis_company_lookup_failure_stays_in_browser(self) -> None:
-        client = TestClient(create_app(FailingCompanyListClient))
+        client = TestClient(
+            create_app(
+                FailingCompanyListClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -391,7 +481,13 @@ class WebTests(TestCase):
         self.assertIn("temporary company lookup failure", response.text)
 
     def test_analysis_financial_collection_failure_stays_in_browser(self) -> None:
-        client = TestClient(create_app(FailingFinancialClient))
+        client = TestClient(
+            create_app(
+                FailingFinancialClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(
@@ -487,7 +583,13 @@ class WebTests(TestCase):
         self,
     ) -> None:
         CountingOpenDartClient.reset()
-        client = TestClient(create_app(CountingOpenDartClient))
+        client = TestClient(
+            create_app(
+                CountingOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             env = {
@@ -527,7 +629,13 @@ class WebTests(TestCase):
 
     def test_analysis_fetches_only_missing_latest_year_from_db_cache(self) -> None:
         CountingOpenDartClient.reset()
-        client = TestClient(create_app(CountingOpenDartClient))
+        client = TestClient(
+            create_app(
+                CountingOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             env = {
@@ -552,7 +660,7 @@ class WebTests(TestCase):
                     "/analysis",
                     params={
                         "company_query": "Samsung Electronics",
-                        "recent_years": "3",
+                        "recent_years": "2",
                         "end_year": "2025",
                         "fs_div": "CFS",
                         "threshold_percent": "20",
@@ -566,6 +674,69 @@ class WebTests(TestCase):
         }
         self.assertEqual(fetched_years, {"2025"})
         self.assertIn("최신 1개 연도 갱신", second.text)
+
+
+    def test_ranking_page_filters_from_db_cache(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                "OPENDART_API_KEY": "test-key",
+                "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+            }
+            with patch.dict(os.environ, env):
+                first = client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "3",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+                second = client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Vinatac",
+                        "recent_years": "2",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.get(
+                    "/ranking",
+                    params={
+                        "recent_years": "2",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                        "max_per": "10",
+                        "min_roe": "20",
+                        "sort_by": "per",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("/ranking?", response.text)
+        self.assertIn("Samsung Electronics", response.text)
+        self.assertIn('href="/analysis?company_query=Samsung+Electronics', response.text)
 
 
 class FakeOpenDartClient:
@@ -722,6 +893,45 @@ class FakeKrxStockPriceClient:
             market_cap=Decimal("504448025000000"),
             listed_stock_count=Decimal("5969782550"),
         )
+
+
+class FakeNaverFinanceClient:
+    def fetch_snapshot(self, stock_code: str) -> object:
+        if stock_code == "126340":
+            return type(
+                "Snapshot",
+                (),
+                {
+                    "corp_name": "Vinatac",
+                    "market": "KOSDAQ",
+                    "close_price": Decimal("37100"),
+                    "market_cap": Decimal("561080217600"),
+                    "per": Decimal("9.1"),
+                    "pbr": Decimal("1.2"),
+                    "roe": Decimal("21.4"),
+                    "eps": Decimal("4100"),
+                    "base_date": "20260422",
+                    "source": "naver_finance",
+                    "fetched_at": "2026-04-22T07:30:00Z",
+                },
+            )()
+        return type(
+            "Snapshot",
+            (),
+            {
+                "corp_name": "Samsung Electronics",
+                "market": "KOSPI",
+                "close_price": Decimal("84500"),
+                "market_cap": Decimal("504448025000000"),
+                "per": Decimal("8.4"),
+                "pbr": Decimal("1.1"),
+                "roe": Decimal("23.0"),
+                "eps": Decimal("6564"),
+                "base_date": "20260422",
+                "source": "naver_finance",
+                "fetched_at": "2026-04-22T07:30:00Z",
+            },
+        )()
 
 
 class MissingKrxStockPriceClient:

@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse
 
 from .growth import ANNUAL_YOY, QUARTERLY_YOY, TRAILING_FOUR_QUARTER_YOY
 from .krx import KrxStockPriceClient, KrxStockPriceSnapshot
+from .naver_finance import NaverFinanceClient
 from .models import (
     DartCompany,
     FinancialPeriodValue,
@@ -36,12 +37,20 @@ from .reports import (
     _format_amount,
     _format_percent,
 )
+from .rankings import (
+    DEFAULT_SCREENING_GROWTH_METRIC,
+    DEFAULT_SCREENING_GROWTH_SERIES_TYPE,
+    ValuationSnapshot,
+)
 from .storage import (
+    build_database_company_screening_payload,
     read_dart_companies_from_database,
     read_latest_equity_price_snapshot,
+    read_latest_valuation_snapshot,
     read_financial_statement_rows_from_database,
     store_equity_price_snapshot,
     store_analysis_artifacts,
+    store_valuation_snapshot,
 )
 
 
@@ -53,6 +62,10 @@ DEFAULT_PERIOD_KEY = "quarterly"
 DEFAULT_METRIC_KEY = "revenue"
 DEFAULT_ANALYSIS_TAB = "financials"
 ANALYSIS_TABS = ("overview", "financials", "growth")
+DEFAULT_RANKING_SORT_BY = "market_cap"
+DEFAULT_MARKET_FILTER = "ALL"
+DEFAULT_RANKING_GROWTH_METRIC = DEFAULT_SCREENING_GROWTH_METRIC
+DEFAULT_RANKING_GROWTH_SERIES_TYPE = DEFAULT_SCREENING_GROWTH_SERIES_TYPE
 METRIC_SEQUENCE = ("revenue", "operating_income", "net_income", "eps")
 PERIOD_METRIC_SEQUENCE = {
     "quarterly": ("revenue", "operating_income", "net_income"),
@@ -114,7 +127,15 @@ class StockPriceClient(Protocol):
         stock_code: str,
         *,
         base_date: str,
-    ) -> KrxStockPriceSnapshot:
+        ) -> KrxStockPriceSnapshot:
+        ...
+
+
+class ValuationClient(Protocol):
+    def fetch_snapshot(
+        self,
+        stock_code: str,
+    ) -> object:
         ...
 
 
@@ -138,9 +159,23 @@ class CompareForm:
     threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
 
 
+@dataclass(frozen=True)
+class RankingForm:
+    market: str = DEFAULT_MARKET_FILTER
+    recent_years: str = str(DEFAULT_RECENT_YEARS)
+    end_year: str = ""
+    fs_div: str = "CFS"
+    threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
+    max_per: str = ""
+    max_pbr: str = ""
+    min_roe: str = ""
+    sort_by: str = DEFAULT_RANKING_SORT_BY
+
+
 def create_app(
     client_factory: Callable[[str], MajorAccountClient] = OpenDartClient,
     stock_client_factory: Callable[[str], StockPriceClient] = KrxStockPriceClient,
+    valuation_client_factory: Callable[[], ValuationClient] = NaverFinanceClient,
 ) -> FastAPI:
     app = FastAPI(title="ShowMeThePER")
 
@@ -184,10 +219,12 @@ def create_app(
 
         client = client_factory(api_key)
         stock_client = _build_stock_price_client(stock_client_factory)
+        valuation_client = valuation_client_factory()
         try:
             payload = _collect_browser_payload(
                 client,
                 stock_client=stock_client,
+                valuation_client=valuation_client,
                 company_query=request["company_query"],
                 request=request,
             )
@@ -240,16 +277,19 @@ def create_app(
 
         client = client_factory(api_key)
         stock_client = _build_stock_price_client(stock_client_factory)
+        valuation_client = valuation_client_factory()
         try:
             primary_payload = _collect_browser_payload(
                 client,
                 stock_client=stock_client,
+                valuation_client=valuation_client,
                 company_query=request["primary_company_query"],
                 request=request,
             )
             secondary_payload = _collect_browser_payload(
                 client,
                 stock_client=stock_client,
+                valuation_client=valuation_client,
                 company_query=request["secondary_company_query"],
                 request=request,
             )
@@ -272,6 +312,54 @@ def create_app(
                 },
             )
         )
+
+    @app.get("/ranking", response_class=HTMLResponse)
+    def ranking(
+        market: str = DEFAULT_MARKET_FILTER,
+        recent_years: str = str(DEFAULT_RECENT_YEARS),
+        end_year: str = "",
+        fs_div: str = "CFS",
+        threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
+        max_per: str = "",
+        max_pbr: str = "",
+        min_roe: str = "",
+        sort_by: str = DEFAULT_RANKING_SORT_BY,
+    ) -> HTMLResponse:
+        form = RankingForm(
+            market=(market or DEFAULT_MARKET_FILTER).strip().upper() or DEFAULT_MARKET_FILTER,
+            recent_years=recent_years.strip(),
+            end_year=end_year.strip() or str(default_end_year()),
+            fs_div=fs_div.strip().upper() or "CFS",
+            threshold_percent=threshold_percent.strip(),
+            max_per=max_per.strip(),
+            max_pbr=max_pbr.strip(),
+            min_roe=min_roe.strip(),
+            sort_by=sort_by.strip() or DEFAULT_RANKING_SORT_BY,
+        )
+
+        try:
+            request = parse_ranking_request(form)
+        except ValueError as error:
+            return HTMLResponse(render_ranking_page(form=form, error=str(error)))
+
+        database_path = _web_cache_database_path(str(request["fs_div"] or "ALL"))
+        payload = build_database_company_screening_payload(
+            database_path,
+            start_year=request["start_year"],
+            end_year=request["end_year"],
+            fs_div=request["fs_div"],
+            growth_metric=DEFAULT_RANKING_GROWTH_METRIC,
+            growth_series_type=DEFAULT_RANKING_GROWTH_SERIES_TYPE,
+            threshold_percent=request["threshold_percent"],
+            recent_annual_periods=request["recent_years"],
+            recent_quarterly_periods=request["recent_years"] * 4,
+            max_per=request["max_per"],
+            max_pbr=request["max_pbr"],
+            min_roe=request["min_roe"],
+            market=request["market"],
+            sort_by=request["sort_by"],
+        )
+        return HTMLResponse(render_ranking_page(form=form, payload=payload))
 
     return app
 
@@ -307,6 +395,7 @@ def parse_analysis_request(form: AnalysisForm) -> dict[str, object]:
         field_name="기준 연도",
     )
     start_year = max(MIN_OPENDART_YEAR, end_year - recent_years + 1)
+    collection_start_year = max(MIN_OPENDART_YEAR, start_year - 1)
     if start_year > end_year:
         raise ValueError("기준 연도는 2015년 이상이어야 합니다.")
 
@@ -321,7 +410,9 @@ def parse_analysis_request(form: AnalysisForm) -> dict[str, object]:
         "recent_years": recent_years,
         "start_year": start_year,
         "end_year": end_year,
-        "business_years": [str(year) for year in range(start_year, end_year + 1)],
+        "business_years": [
+            str(year) for year in range(collection_start_year, end_year + 1)
+        ],
         "fs_div": fs_div,
         "threshold_percent": threshold_percent,
     }
@@ -343,6 +434,36 @@ def parse_compare_request(form: CompareForm) -> dict[str, object]:
     request["primary_company_query"] = form.primary_company_query
     request["secondary_company_query"] = form.secondary_company_query
     return request
+
+
+def parse_ranking_request(form: RankingForm) -> dict[str, object]:
+    recent_years = _parse_int(form.recent_years, field_name="조회 연수")
+    if recent_years <= 0:
+        raise ValueError("조회 연수는 1 이상이어야 합니다.")
+
+    end_year = _parse_int(
+        form.end_year or str(default_end_year()),
+        field_name="기준 연도",
+    )
+    start_year = max(MIN_OPENDART_YEAR, end_year - recent_years + 1)
+    threshold_percent = _parse_decimal(
+        form.threshold_percent,
+        field_name="성장률 기준",
+    )
+    fs_div = _parse_fs_div(form.fs_div)
+
+    return {
+        "market": _parse_market(form.market),
+        "recent_years": recent_years,
+        "start_year": start_year,
+        "end_year": end_year,
+        "fs_div": fs_div,
+        "threshold_percent": threshold_percent,
+        "max_per": _parse_optional_decimal(form.max_per, field_name="PER 상한"),
+        "max_pbr": _parse_optional_decimal(form.max_pbr, field_name="PBR 상한"),
+        "min_roe": _parse_optional_decimal(form.min_roe, field_name="ROE 하한"),
+        "sort_by": _normalize_ranking_sort(sort_by=form.sort_by),
+    }
 
 
 def resolve_company_query(
@@ -406,10 +527,11 @@ def _collect_browser_payload(
     client: MajorAccountClient,
     *,
     stock_client: StockPriceClient | None,
+    valuation_client: ValuationClient,
     company_query: str,
     request: dict[str, object],
 ) -> dict[str, object]:
-    database_path = _web_cache_database_path(str(request["fs_div"]))
+    database_path = _web_cache_database_path(str(request["fs_div"] or "ALL"))
     try:
         company, company_source = _resolve_company_for_browser(
             client,
@@ -506,11 +628,24 @@ def _collect_browser_payload(
         company=company,
         stock_client=stock_client,
     )
+    valuation_profile = _load_valuation_profile(
+        database_path=database_path,
+        company=company,
+        valuation_client=valuation_client,
+    )
+    market_profile = _merge_market_profile_with_valuation(
+        market_profile,
+        valuation_profile,
+    )
     payload["market_profile"] = market_profile
+    payload["valuation_profile"] = valuation_profile
     _dict(payload["summary"])["market_profile_status"] = _market_profile_status_message(
         company=company,
         stock_client=stock_client,
         market_profile=market_profile,
+    )
+    _dict(payload["summary"])["valuation_profile_status"] = _valuation_profile_status_message(
+        valuation_profile
     )
     return payload
 
@@ -788,6 +923,104 @@ def _market_profile_json(
     }
 
 
+def _load_valuation_profile(
+    *,
+    database_path: Path,
+    company: DartCompany,
+    valuation_client: ValuationClient,
+    today: date | None = None,
+) -> dict[str, object]:
+    stock_code = normalize_stock_code(company.stock_code)
+    if not stock_code:
+        return {}
+
+    cached = read_latest_valuation_snapshot(
+        database_path,
+        stock_code=stock_code,
+    )
+    target_date = (today or date.today()).strftime("%Y%m%d")
+    if cached is not None and cached.base_date == target_date:
+        return _valuation_profile_json(cached, source="cache")
+
+    try:
+        raw_snapshot = valuation_client.fetch_snapshot(stock_code)
+    except Exception:
+        if cached is not None:
+            return _valuation_profile_json(cached, source="cache")
+        return {}
+
+    snapshot = _valuation_snapshot_from_company(company, raw_snapshot)
+    store_valuation_snapshot(database_path, snapshot)
+    return _valuation_profile_json(
+        snapshot,
+        source="cache" if cached is not None else "network",
+    )
+
+
+def _valuation_snapshot_from_company(
+    company: DartCompany,
+    raw_snapshot: object,
+) -> ValuationSnapshot:
+    return ValuationSnapshot(
+        corp_code=company.corp_code,
+        corp_name=company.corp_name or str(getattr(raw_snapshot, "corp_name", "")),
+        stock_code=normalize_stock_code(company.stock_code),
+        per=getattr(raw_snapshot, "per", None),
+        pbr=getattr(raw_snapshot, "pbr", None),
+        roe=getattr(raw_snapshot, "roe", None),
+        eps=getattr(raw_snapshot, "eps", None),
+        close_price=getattr(raw_snapshot, "close_price", None),
+        market_cap=getattr(raw_snapshot, "market_cap", None),
+        market=getattr(raw_snapshot, "market", None),
+        base_date=str(getattr(raw_snapshot, "base_date", "")),
+        source=str(getattr(raw_snapshot, "source", "")),
+        fetched_at=str(getattr(raw_snapshot, "fetched_at", "")),
+    )
+
+
+def _valuation_profile_json(
+    snapshot: ValuationSnapshot,
+    *,
+    source: str,
+) -> dict[str, object]:
+    return {
+        "stock_code": snapshot.stock_code,
+        "corp_code": snapshot.corp_code,
+        "corp_name": snapshot.corp_name,
+        "base_date": snapshot.base_date,
+        "market": snapshot.market,
+        "close_price": None if snapshot.close_price is None else str(snapshot.close_price),
+        "market_cap": None if snapshot.market_cap is None else str(snapshot.market_cap),
+        "per": None if snapshot.per is None else str(snapshot.per),
+        "pbr": None if snapshot.pbr is None else str(snapshot.pbr),
+        "roe": None if snapshot.roe is None else str(snapshot.roe),
+        "eps": None if snapshot.eps is None else str(snapshot.eps),
+        "source": source,
+        "fetched_at": snapshot.fetched_at,
+    }
+
+
+def _merge_market_profile_with_valuation(
+    market_profile: dict[str, object],
+    valuation_profile: dict[str, object],
+) -> dict[str, object]:
+    if not valuation_profile:
+        return market_profile
+    merged = dict(market_profile)
+    for key in ("stock_code", "base_date", "market", "close_price", "market_cap"):
+        if merged.get(key) in {None, ""} and valuation_profile.get(key) not in {None, ""}:
+            merged[key] = valuation_profile.get(key)
+    if not merged.get("source"):
+        merged["source"] = valuation_profile.get("source", "")
+    return merged
+
+
+def _valuation_profile_status_message(profile: dict[str, object]) -> str:
+    if profile:
+        return ""
+    return "밸류에이션 정보 없음"
+
+
 def render_analysis_page(
     *,
     form: AnalysisForm,
@@ -834,6 +1067,25 @@ def render_compare_page(
             render_compare_dashboard(_dict(payload))
             if payload is not None
             else render_compare_empty_state(form)
+        ),
+        message_html=render_message(error=error),
+    )
+
+
+def render_ranking_page(
+    *,
+    form: RankingForm,
+    payload: dict[str, object] | None = None,
+    error: str | None = None,
+) -> str:
+    return render_shell(
+        company_title="랭킹/검색",
+        top_tabs_html=render_ranking_top_tabs(form),
+        toolbar_html=render_ranking_header(form),
+        content_html=(
+            render_ranking_results(_dict(payload))
+            if payload is not None
+            else render_ranking_empty_state()
         ),
         message_html=render_message(error=error),
     )
@@ -904,6 +1156,12 @@ def render_analysis_top_tabs(
         fs_div=fs_div,
         threshold_percent=threshold_percent,
     )
+    ranking_href = _build_ranking_href(
+        recent_years=recent_years,
+        end_year=end_year,
+        fs_div=fs_div,
+        threshold_percent=threshold_percent,
+    )
     tabs = (
         (
             "요약",
@@ -945,6 +1203,7 @@ def render_analysis_top_tabs(
             "growth",
         ),
         ("VS 기업비교", compare_href, "compare"),
+        ("랭킹/검색", ranking_href, "ranking"),
     )
     return render_top_tabs(form.top_tab, tabs)
 
@@ -1013,8 +1272,43 @@ def render_compare_top_tabs(
             ),
             "compare",
         ),
+        (
+            "랭킹/검색",
+            _build_ranking_href(
+                recent_years=form.recent_years,
+                end_year=form.end_year or str(default_end_year()),
+                fs_div=form.fs_div,
+                threshold_percent=form.threshold_percent,
+            ),
+            "ranking",
+        ),
     )
     return render_top_tabs("compare", tabs)
+
+
+def render_ranking_top_tabs(form: RankingForm) -> str:
+    tabs = (
+        ("요약", "/", "overview"),
+        ("재무정보", "/", "financials"),
+        ("성장률", "/", "growth"),
+        ("VS 기업비교", _build_compare_href(primary_company_query="", recent_years=form.recent_years, end_year=form.end_year or str(default_end_year()), fs_div=form.fs_div, threshold_percent=form.threshold_percent), "compare"),
+        (
+            "랭킹/검색",
+            _build_ranking_href(
+                market=form.market,
+                recent_years=form.recent_years,
+                end_year=form.end_year or str(default_end_year()),
+                fs_div=form.fs_div,
+                threshold_percent=form.threshold_percent,
+                max_per=form.max_per,
+                max_pbr=form.max_pbr,
+                min_roe=form.min_roe,
+                sort_by=form.sort_by,
+            ),
+            "ranking",
+        ),
+    )
+    return render_top_tabs("ranking", tabs)
 
 
 def render_top_tabs(
@@ -1152,6 +1446,78 @@ def render_compare_header(
     """
 
 
+def render_ranking_header(form: RankingForm) -> str:
+    return f"""
+    <section class="toolbar-surface">
+      <div class="section-tabs">
+        <span class="section-tab is-active">랭킹/검색</span>
+        <span class="section-tab">성장률 + 밸류에이션</span>
+        <span class="section-tab">DB 캐시 기반</span>
+      </div>
+      <form id="ranking-form" class="query-form query-form-ranking" data-loading-form method="get" action="/ranking">
+        <input id="ranking-recent-years" type="hidden" name="recent_years" value="{escape(form.recent_years or str(DEFAULT_RECENT_YEARS))}">
+        <label class="field">
+          <span>시장</span>
+          <select name="market">
+            {_option("ALL", "전체", form.market)}
+            {_option("KOSPI", "KOSPI", form.market)}
+            {_option("KOSDAQ", "KOSDAQ", form.market)}
+          </select>
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input name="end_year" value="{escape(form.end_year or str(default_end_year()))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select name="fs_div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>성장률 기준</span>
+          <input name="threshold_percent" value="{escape(form.threshold_percent)}" inputmode="decimal">
+        </label>
+        <label class="field">
+          <span>PER 상한</span>
+          <input name="max_per" value="{escape(form.max_per)}" inputmode="decimal" placeholder="선택">
+        </label>
+        <label class="field">
+          <span>PBR 상한</span>
+          <input name="max_pbr" value="{escape(form.max_pbr)}" inputmode="decimal" placeholder="선택">
+        </label>
+        <label class="field">
+          <span>ROE 하한</span>
+          <input name="min_roe" value="{escape(form.min_roe)}" inputmode="decimal" placeholder="선택">
+        </label>
+        <label class="field">
+          <span>정렬</span>
+          <select name="sort_by">
+            {_option("market_cap", "시가총액", form.sort_by)}
+            {_option("roe", "ROE", form.sort_by)}
+            {_option("per", "PER", form.sort_by)}
+            {_option("pbr", "PBR", form.sort_by)}
+          </select>
+        </label>
+        <button id="ranking-submit-button" type="submit" class="primary-button">
+          <span data-submit-label>조회</span>
+          <span data-submit-loading hidden>조회 중...</span>
+        </button>
+      </form>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="segmented" role="group" aria-label="조회 연수">
+          {render_year_preset_button("3년", "3", form.recent_years, "ranking-form", "ranking-recent-years")}
+          {render_year_preset_button("5년", "5", form.recent_years, "ranking-form", "ranking-recent-years")}
+          {render_year_preset_button("10년", "10", form.recent_years, "ranking-form", "ranking-recent-years")}
+        </div>
+        <div class="toolbar-note">기본 성장률 게이트는 최근 {escape(form.recent_years or str(DEFAULT_RECENT_YEARS))}년 연간 매출 YoY입니다.</div>
+      </div>
+    </section>
+    """
+
+
 def render_year_preset_button(
     label: str,
     years: str,
@@ -1229,11 +1595,40 @@ def render_market_profile_pills(
     return "".join(pills)
 
 
+def render_valuation_profile_pills(
+    profile: dict[str, object],
+    *,
+    unavailable_status: str = "",
+) -> str:
+    if not profile:
+        if not unavailable_status:
+            return ""
+        return (
+            '<span class="inline-pill inline-pill-muted">'
+            f"{escape(unavailable_status)}"
+            "</span>"
+        )
+
+    pills: list[str] = []
+    for label, key, suffix in (
+        ("PER", "per", "배"),
+        ("PBR", "pbr", "배"),
+        ("ROE", "roe", "%"),
+        ("EPS", "eps", "원"),
+    ):
+        value = _format_ratio(profile.get(key), suffix=suffix)
+        if value == "-":
+            continue
+        pills.append(f'<span class="inline-pill">{escape(label)} {escape(value)}</span>')
+    return "".join(pills)
+
+
 def render_compare_company_meta(
     company: dict[str, object],
     profile: dict[str, object],
     *,
     accent_class: str,
+    valuation_profile: dict[str, object] | None = None,
     unavailable_status: str = "",
 ) -> str:
     pills = [f'<span class="inline-pill {accent_class}">{escape(_company_name(company))}</span>']
@@ -1243,6 +1638,12 @@ def render_compare_company_meta(
     )
     if pills_html:
         pills.append(pills_html)
+    valuation_pills = render_valuation_profile_pills(
+        _dict(valuation_profile),
+        unavailable_status="",
+    )
+    if valuation_pills:
+        pills.append(valuation_pills)
     return f'<div class="compare-company-meta">{"".join(pills)}</div>'
 
 
@@ -1276,6 +1677,7 @@ def render_browser_report(
     company = _dict(payload.get("company"))
     summary = _dict(payload.get("summary"))
     market_profile = _dict(payload.get("market_profile"))
+    valuation_profile = _dict(payload.get("valuation_profile"))
     period_groups = [_dict(group) for group in _list(payload.get("period_groups"))]
     initial_metric = _default_metric_for_period_groups(period_groups)
     compare_href = _build_compare_href(
@@ -1297,6 +1699,7 @@ def render_browser_report(
         </div>
         <div class="company-actions">
           {render_market_profile_pills(market_profile, unavailable_status=str(summary.get("market_profile_status", "")))}
+          {render_valuation_profile_pills(valuation_profile, unavailable_status=str(summary.get("valuation_profile_status", "")))}
           {render_cache_status_pill(summary)}
           <span class="inline-pill">원천 row {escape(str(summary.get("raw_rows", 0)))}개</span>
           <span class="inline-pill">성장률 {escape(str(summary.get("growth_points", 0)))}개</span>
@@ -1538,6 +1941,96 @@ def render_compare_empty_state(form: CompareForm) -> str:
     """
 
 
+def render_ranking_empty_state() -> str:
+    return """
+    <section class="empty-state panel">
+      <h2>랭킹/검색</h2>
+      <p>DB에 저장된 재무 데이터와 밸류에이션 스냅샷을 조합해 기업을 걸러냅니다.</p>
+      <ul class="empty-list">
+        <li>먼저 몇 개 기업을 조회해 DB 캐시를 채우거나 CLI의 refresh-valuations로 valuation을 갱신해 주세요.</li>
+        <li>성장률은 기본 게이트이고, PER/PBR/ROE는 선택 필터와 정렬 기준으로 동작합니다.</li>
+      </ul>
+    </section>
+    """
+
+
+def render_ranking_results(payload: dict[str, object]) -> str:
+    summary = _dict(payload.get("summary"))
+    filters = _dict(payload.get("filters"))
+    rows = [_dict(row) for row in _list(payload.get("screening_rows"))]
+    info_html = (
+        f'<div class="toolbar-note">DB {escape(str(summary.get("database", "")))} 쨌 '
+        f'{escape(str(summary.get("screening_rows", 0)))}개 기업</div>'
+    )
+    if not rows:
+        return f"""
+        <section class="panel">
+          <div class="panel-heading">
+            <h3>조건에 맞는 기업이 없습니다</h3>
+            <p>DB에 데이터가 아직 적거나, 최근 연간 매출 성장률과 밸류에이션 조건이 너무 엄격할 수 있습니다.</p>
+          </div>
+          {info_html}
+        </section>
+        """
+
+    table_rows = []
+    for row in rows:
+        analysis_href = _build_analysis_href(
+            company_query=str(row.get("corp_name", "") or row.get("stock_code", "")),
+            recent_years=str(filters.get("recent_annual_periods", DEFAULT_RECENT_YEARS)),
+            end_year=str(summary.get("end_year", default_end_year())),
+            fs_div=str(filters.get("fs_div", "CFS") or "ALL"),
+            threshold_percent=str(filters.get("threshold_percent", DEFAULT_THRESHOLD_PERCENT)),
+            top_tab="financials",
+            fragment="financials-details",
+        )
+        table_rows.append(
+            "<tr>"
+            f'<td><a class="table-link" href="{escape(analysis_href)}">{escape(str(row.get("corp_name", "")))}</a></td>'
+            f'<td>{escape(str(row.get("market", "") or "-"))}</td>'
+            f'<td>{escape(_format_won(row.get("close_price")))}</td>'
+            f'<td>{escape(_format_market_cap(row.get("market_cap")))}</td>'
+            f'<td>{escape(_format_ratio(row.get("per"), suffix="배"))}</td>'
+            f'<td>{escape(_format_ratio(row.get("pbr"), suffix="배"))}</td>'
+            f'<td>{escape(_format_ratio(row.get("roe"), suffix="%"))}</td>'
+            f'<td>{escape(_format_ratio(row.get("eps"), suffix="원"))}</td>'
+            f'<td>{escape(str(row.get("minimum_growth_rate", "-")))}%</td>'
+            f'<td>{("통과" if row.get("passed") else "실패")}</td>'
+            "</tr>"
+        )
+
+    return f"""
+    <section class="panel">
+      <div class="panel-heading panel-heading-split">
+        <div>
+          <h3>성장률 + 밸류에이션 랭킹</h3>
+          <p>최근 연간 매출 성장률을 먼저 통과한 기업만 밸류에이션 조건으로 정렬합니다.</p>
+        </div>
+        {info_html}
+      </div>
+      <div class="table-scroll">
+        <table class="screening-table">
+          <thead>
+            <tr>
+              <th>기업명</th>
+              <th>시장</th>
+              <th>전일 종가</th>
+              <th>시가총액</th>
+              <th>PER</th>
+              <th>PBR</th>
+              <th>ROE</th>
+              <th>EPS</th>
+              <th>최소 성장률</th>
+              <th>통과</th>
+            </tr>
+          </thead>
+          <tbody>{''.join(table_rows)}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
 def render_compare_dashboard(payload: dict[str, object]) -> str:
     primary = _dict(payload.get("primary"))
     secondary = _dict(payload.get("secondary"))
@@ -1545,6 +2038,8 @@ def render_compare_dashboard(payload: dict[str, object]) -> str:
     secondary_company = _dict(secondary.get("company"))
     primary_market_profile = _dict(primary.get("market_profile"))
     secondary_market_profile = _dict(secondary.get("market_profile"))
+    primary_valuation_profile = _dict(primary.get("valuation_profile"))
+    secondary_valuation_profile = _dict(secondary.get("valuation_profile"))
     primary_summary = _dict(primary.get("summary"))
     secondary_summary = _dict(secondary.get("summary"))
     summary = _dict(payload.get("summary"))
@@ -1559,8 +2054,8 @@ def render_compare_dashboard(payload: dict[str, object]) -> str:
           <p>조회 기간 {escape(str(summary.get("recent_years", DEFAULT_RECENT_YEARS)))}년 · 기준 연도 {escape(str(summary.get("end_year", default_end_year())))} · 재무제표 {escape(str(summary.get("fs_div", "")))}</p>
         </div>
         <div class="company-actions company-actions-compare">
-          {render_compare_company_meta(primary_company, primary_market_profile, accent_class="inline-pill-accent", unavailable_status=str(primary_summary.get("market_profile_status", "")))}
-          {render_compare_company_meta(secondary_company, secondary_market_profile, accent_class="inline-pill-contrast", unavailable_status=str(secondary_summary.get("market_profile_status", "")))}
+          {render_compare_company_meta(primary_company, primary_market_profile, valuation_profile=primary_valuation_profile, accent_class="inline-pill-accent", unavailable_status=str(primary_summary.get("market_profile_status", "")))}
+          {render_compare_company_meta(secondary_company, secondary_market_profile, valuation_profile=secondary_valuation_profile, accent_class="inline-pill-contrast", unavailable_status=str(secondary_summary.get("market_profile_status", "")))}
         </div>
       </section>
       {render_dashboard_toolbar()}
@@ -3208,6 +3703,14 @@ def _format_market_cap(value: object) -> str:
     return _format_won(parsed)
 
 
+def _format_ratio(value: object, *, suffix: str = "") -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+    text = format(parsed, "f").rstrip("0").rstrip(".")
+    return f"{text}{suffix}"
+
+
 def _format_display_won(value: object) -> str:
     parsed = _to_decimal(value)
     if parsed is None:
@@ -3512,6 +4015,13 @@ def _parse_decimal(value: str, *, field_name: str) -> Decimal:
         raise ValueError(f"{field_name}은 숫자로 입력해 주세요.") from error
 
 
+def _parse_optional_decimal(value: str, *, field_name: str) -> Decimal | None:
+    text = value.strip()
+    if not text:
+        return None
+    return _parse_decimal(text, field_name=field_name)
+
+
 def _parse_fs_div(value: str) -> str | None:
     normalized = value.strip().upper()
     if normalized in {"", "ALL"}:
@@ -3519,6 +4029,22 @@ def _parse_fs_div(value: str) -> str | None:
     if normalized not in {"CFS", "OFS"}:
         raise ValueError("재무제표는 연결, 별도, 전체 중 하나를 선택해 주세요.")
     return normalized
+
+
+def _parse_market(value: str) -> str | None:
+    normalized = value.strip().upper()
+    if normalized in {"", "ALL"}:
+        return None
+    if normalized not in {"KOSPI", "KOSDAQ"}:
+        raise ValueError("시장은 KOSPI, KOSDAQ, 전체 중 하나를 선택해 주세요.")
+    return normalized
+
+
+def _normalize_ranking_sort(*, sort_by: str) -> str:
+    normalized = sort_by.strip().lower()
+    if normalized in {"market_cap", "per", "pbr", "roe"}:
+        return normalized
+    return DEFAULT_RANKING_SORT_BY
 
 
 def _normalize_company_name(value: str) -> str:
@@ -3596,6 +4122,38 @@ def _build_compare_href(
     filtered = {key: value for key, value in params.items() if str(value).strip()}
     query = urlencode(filtered)
     return f"/compare?{query}" if query else "/compare"
+
+
+def _build_ranking_href(
+    *,
+    market: str = DEFAULT_MARKET_FILTER,
+    recent_years: str,
+    end_year: str,
+    fs_div: str,
+    threshold_percent: str,
+    max_per: str = "",
+    max_pbr: str = "",
+    min_roe: str = "",
+    sort_by: str = DEFAULT_RANKING_SORT_BY,
+) -> str:
+    params = {
+        "market": market,
+        "recent_years": recent_years,
+        "end_year": end_year,
+        "fs_div": fs_div,
+        "threshold_percent": threshold_percent,
+        "max_per": max_per,
+        "max_pbr": max_pbr,
+        "min_roe": min_roe,
+        "sort_by": sort_by,
+    }
+    filtered = {
+        key: value
+        for key, value in params.items()
+        if str(value).strip() and not (key == "market" and str(value).strip().upper() == "ALL")
+    }
+    query = urlencode(filtered)
+    return f"/ranking?{query}" if query else "/ranking"
 
 
 def _normalize_analysis_tab(value: str) -> str:
@@ -3745,6 +4303,9 @@ def _page_styles() -> str:
     }
     .query-form-compare {
       grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) repeat(3, minmax(120px, 0.7fr)) auto;
+    }
+    .query-form-ranking {
+      grid-template-columns: repeat(8, minmax(110px, 1fr)) auto;
     }
     .field {
       display: grid;
@@ -4177,6 +4738,21 @@ def _page_styles() -> str:
     td:first-child {
       text-align: left;
     }
+    .table-scroll {
+      overflow-x: auto;
+    }
+    .screening-table thead th {
+      background: #fafbfd;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .table-link {
+      color: var(--accent-strong);
+      font-weight: 700;
+    }
+    .table-link:hover {
+      text-decoration: underline;
+    }
     th {
       background: #fafbfd;
       color: #415264;
@@ -4268,7 +4844,8 @@ def _page_styles() -> str:
     }
     @media (max-width: 1180px) {
       .query-form,
-      .query-form-compare {
+      .query-form-compare,
+      .query-form-ranking {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
       .overview-layout,
@@ -4282,6 +4859,7 @@ def _page_styles() -> str:
       }
       .query-form,
       .query-form-compare,
+      .query-form-ranking,
       .dashboard-grid,
       .compare-stat-grid {
         grid-template-columns: 1fr;
