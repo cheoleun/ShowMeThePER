@@ -172,8 +172,61 @@ class WebTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("EPS", response.text)
         self.assertIn("KOSDAQ", response.text)
+        self.assertIn('data-metric-toggle="eps"', response.text)
+        self.assertIn('data-metric-periods="annual"', response.text)
         self.assertIn("시가총액", response.text)
         self.assertIn("전일 종가", response.text)
+
+    def test_analysis_shows_market_status_when_krx_key_is_missing(self) -> None:
+        client = TestClient(create_app(FakeOpenDartClient))
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Vinatac",
+                        "recent_years": "5",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("전일 시세 정보 비활성화", response.text)
+
+    def test_analysis_shows_market_status_when_krx_lookup_fails(self) -> None:
+        client = TestClient(create_app(FakeOpenDartClient, MissingKrxStockPriceClient))
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Vinatac",
+                        "recent_years": "5",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("전일 시가총액 정보 없음", response.text)
 
     def test_compare_empty_page_renders_form(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
@@ -222,8 +275,38 @@ class WebTests(TestCase):
         self.assertIn("KOSDAQ", response.text)
         self.assertIn("시가총액", response.text)
         self.assertIn("전일 종가", response.text)
+        self.assertIn("EPS", response.text)
+        self.assertIn('data-metric-toggle="eps"', response.text)
+        self.assertIn('data-metric-periods="annual"', response.text)
         self.assertNotIn("Samsung Electronics (005930)", response.text)
         self.assertNotIn("Vinatac (126340)", response.text)
+
+    def test_dashboard_metric_script_resets_eps_outside_annual_period(self) -> None:
+        client = TestClient(create_app(FakeOpenDartClient))
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "5",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('data-metric-toggle="eps" data-metric-periods="annual"', response.text)
+        self.assertIn("button.hidden = !allowed;", response.text)
+        self.assertIn("allowedMetricButtons[0]", response.text)
 
     def test_compare_top_tabs_keep_both_companies(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
@@ -630,6 +713,19 @@ class FakeKrxStockPriceClient:
             market_cap=Decimal("504448025000000"),
             listed_stock_count=Decimal("5969782550"),
         )
+
+
+class MissingKrxStockPriceClient:
+    def __init__(self, service_key: str) -> None:
+        self.service_key = service_key
+
+    def fetch_stock_price(
+        self,
+        stock_code: str,
+        *,
+        base_date: str,
+    ) -> KrxStockPriceSnapshot:
+        raise LookupError(f"missing stock price for {stock_code} on {base_date}")
 
 
 class CountingOpenDartClient(FakeOpenDartClient):

@@ -53,7 +53,12 @@ DEFAULT_PERIOD_KEY = "quarterly"
 DEFAULT_METRIC_KEY = "revenue"
 DEFAULT_ANALYSIS_TAB = "financials"
 ANALYSIS_TABS = ("overview", "financials", "growth")
-METRIC_SEQUENCE = ("revenue", "operating_income", "net_income")
+METRIC_SEQUENCE = ("revenue", "operating_income", "net_income", "eps")
+PERIOD_METRIC_SEQUENCE = {
+    "quarterly": ("revenue", "operating_income", "net_income"),
+    "trailing": ("revenue", "operating_income", "net_income"),
+    "annual": ("revenue", "operating_income", "net_income", "eps"),
+}
 PERIOD_DEFS = (
     {
         "key": "quarterly",
@@ -501,8 +506,12 @@ def _collect_browser_payload(
         company=company,
         stock_client=stock_client,
     )
-    if market_profile:
-        payload["market_profile"] = market_profile
+    payload["market_profile"] = market_profile
+    _dict(payload["summary"])["market_profile_status"] = _market_profile_status_message(
+        company=company,
+        stock_client=stock_client,
+        market_profile=market_profile,
+    )
     return payload
 
 
@@ -729,6 +738,21 @@ def _load_market_profile(
         return _market_profile_json(cached, source="cache")
 
     return {}
+
+
+def _market_profile_status_message(
+    *,
+    company: DartCompany,
+    stock_client: StockPriceClient | None,
+    market_profile: dict[str, object],
+) -> str:
+    if market_profile:
+        return ""
+    if not normalize_stock_code(company.stock_code):
+        return "전일 시가총액 정보 없음"
+    if stock_client is None:
+        return "전일 시세 정보 비활성화"
+    return "전일 시가총액 정보 없음"
 
 
 def _candidate_market_dates(today: date, attempts: int = 7) -> list[str]:
@@ -1171,9 +1195,19 @@ def render_cache_status_pill(summary: dict[str, object]) -> str:
     return f'<span class="{class_name}">{escape(status)}</span>'
 
 
-def render_market_profile_pills(profile: dict[str, object]) -> str:
+def render_market_profile_pills(
+    profile: dict[str, object],
+    *,
+    unavailable_status: str = "",
+) -> str:
     if not profile:
-        return ""
+        if not unavailable_status:
+            return ""
+        return (
+            '<span class="inline-pill inline-pill-muted">'
+            f"{escape(unavailable_status)}"
+            "</span>"
+        )
 
     pills: list[str] = []
     market = str(profile.get("market", "") or "").strip()
@@ -1200,9 +1234,13 @@ def render_compare_company_meta(
     profile: dict[str, object],
     *,
     accent_class: str,
+    unavailable_status: str = "",
 ) -> str:
     pills = [f'<span class="inline-pill {accent_class}">{escape(_company_name(company))}</span>']
-    pills_html = render_market_profile_pills(profile)
+    pills_html = render_market_profile_pills(
+        profile,
+        unavailable_status=unavailable_status,
+    )
     if pills_html:
         pills.append(pills_html)
     return f'<div class="compare-company-meta">{"".join(pills)}</div>'
@@ -1238,7 +1276,8 @@ def render_browser_report(
     company = _dict(payload.get("company"))
     summary = _dict(payload.get("summary"))
     market_profile = _dict(payload.get("market_profile"))
-    period_groups = _list(payload.get("period_groups"))
+    period_groups = [_dict(group) for group in _list(payload.get("period_groups"))]
+    initial_metric = _default_metric_for_period_groups(period_groups)
     compare_href = _build_compare_href(
         primary_company_query=str(summary.get("company_query", "")),
         recent_years=str(summary.get("recent_years", DEFAULT_RECENT_YEARS)),
@@ -1250,14 +1289,14 @@ def render_browser_report(
     )
 
     return f"""
-    <section class="report-shell" data-dashboard data-initial-period="{DEFAULT_PERIOD_KEY}" data-initial-metric="{DEFAULT_METRIC_KEY}">
+    <section class="report-shell" data-dashboard data-initial-period="{DEFAULT_PERIOD_KEY}" data-initial-metric="{escape(initial_metric)}">
       <section class="company-header panel">
         <div>
           <h2>{escape(_company_title(company))}</h2>
           <p>고유번호 {escape(str(company.get("corp_code", "")))} · 조회 기간 {escape(str(summary.get("start_year", "")))}-{escape(str(summary.get("end_year", "")))} · 재무제표 {escape(str(summary.get("fs_div", "")))}</p>
         </div>
         <div class="company-actions">
-          {render_market_profile_pills(market_profile)}
+          {render_market_profile_pills(market_profile, unavailable_status=str(summary.get("market_profile_status", "")))}
           {render_cache_status_pill(summary)}
           <span class="inline-pill">원천 row {escape(str(summary.get("raw_rows", 0)))}개</span>
           <span class="inline-pill">성장률 {escape(str(summary.get("growth_points", 0)))}개</span>
@@ -1280,9 +1319,9 @@ def render_browser_report(
               <h3>대표 차트</h3>
               <p>기간과 지표를 바꾸면 오른쪽 차트가 바로 바뀝니다.</p>
             </div>
-            {render_metric_switches()}
+            {render_metric_switches(period_groups, initial_metric=initial_metric)}
           </div>
-          {"".join(render_focus_panel(_dict(group)) for group in period_groups)}
+          {"".join(render_focus_panel(group, initial_metric=initial_metric) for group in period_groups)}
         </section>
       </section>
       <section class="panel">
@@ -1327,16 +1366,29 @@ def render_dashboard_toolbar() -> str:
     )
 
 
-def render_metric_switches() -> str:
+def render_metric_switches(
+    period_groups: list[dict[str, object]],
+    *,
+    initial_metric: str,
+) -> str:
+    metric_periods: dict[str, list[str]] = {}
+    for group in period_groups:
+        period_key = str(group.get("key", ""))
+        for metric in _metrics_for_group(group):
+            metric_periods.setdefault(metric, []).append(period_key)
+
     buttons = []
     for metric in METRIC_SEQUENCE:
+        periods = metric_periods.get(metric, [])
+        if not periods:
+            continue
         class_name = (
             "metric-switch is-active"
-            if metric == DEFAULT_METRIC_KEY
+            if metric == initial_metric
             else "metric-switch"
         )
         buttons.append(
-            f'<button type="button" class="{class_name}" data-metric-toggle="{escape(metric)}">{escape(METRIC_LABELS.get(metric, metric))}</button>'
+            f'<button type="button" class="{class_name}" data-metric-toggle="{escape(metric)}" data-metric-periods="{escape(",".join(periods))}">{escape(METRIC_LABELS.get(metric, metric))}</button>'
         )
     return f'<div class="metric-switches">{"".join(buttons)}</div>'
 
@@ -1349,6 +1401,47 @@ def _available_metrics_for_rows(rows: list[object]) -> tuple[str, ...]:
         if _to_decimal(_dict(cell).get("amount")) is not None
     }
     return tuple(sorted(metrics, key=lambda metric: METRIC_ORDER.get(metric, 999)))
+
+
+def _display_metrics_for_rows(
+    period_key: str,
+    rows: list[object],
+) -> tuple[str, ...]:
+    available = set(_available_metrics_for_rows(rows))
+    return tuple(
+        metric
+        for metric in PERIOD_METRIC_SEQUENCE.get(period_key, METRIC_SEQUENCE)
+        if metric in available
+    )
+
+
+def _metrics_for_group(group: dict[str, object]) -> tuple[str, ...]:
+    period_key = str(group.get("key", ""))
+    rows = _list(group.get("rows"))
+    if rows:
+        return _display_metrics_for_rows(period_key, rows)
+
+    primary_rows = _list(group.get("primary_rows"))
+    secondary_rows = _list(group.get("secondary_rows"))
+    available = set(_available_metrics_for_rows(primary_rows))
+    available.update(_available_metrics_for_rows(secondary_rows))
+    return tuple(
+        metric
+        for metric in PERIOD_METRIC_SEQUENCE.get(period_key, METRIC_SEQUENCE)
+        if metric in available
+    )
+
+
+def _default_metric_for_period_groups(groups: list[dict[str, object]]) -> str:
+    for group in groups:
+        if str(group.get("key", "")) != DEFAULT_PERIOD_KEY:
+            continue
+        metrics = _metrics_for_group(group)
+        if DEFAULT_METRIC_KEY in metrics:
+            return DEFAULT_METRIC_KEY
+        if metrics:
+            return metrics[0]
+    return DEFAULT_METRIC_KEY
 
 
 def render_snapshot_matrix(group: dict[str, object]) -> str:
@@ -1389,13 +1482,17 @@ def render_snapshot_matrix(group: dict[str, object]) -> str:
     )
 
 
-def render_focus_panel(group: dict[str, object]) -> str:
+def render_focus_panel(
+    group: dict[str, object],
+    *,
+    initial_metric: str,
+) -> str:
     rows = _list(group.get("rows"))
     panels = []
-    for metric in METRIC_SEQUENCE:
+    for metric in _metrics_for_group(group):
         panels.append(
             f'<div class="chart-focus-panel" data-panel data-period="{escape(str(group.get("key", "")))}" '
-            f'data-metric="{escape(metric)}" {"hidden" if not (group.get("key") == DEFAULT_PERIOD_KEY and metric == DEFAULT_METRIC_KEY) else ""}>'
+            f'data-metric="{escape(metric)}" {"hidden" if not (group.get("key") == DEFAULT_PERIOD_KEY and metric == initial_metric) else ""}>'
             f'{render_metric_amount_chart(metric, rows, period_key=str(group.get("key", "")), growth_label=str(group.get("growth_label", "")), include_qoq=bool(group.get("include_qoq")), width=820, height=350)}'
             "</div>"
         )
@@ -1448,19 +1545,22 @@ def render_compare_dashboard(payload: dict[str, object]) -> str:
     secondary_company = _dict(secondary.get("company"))
     primary_market_profile = _dict(primary.get("market_profile"))
     secondary_market_profile = _dict(secondary.get("market_profile"))
+    primary_summary = _dict(primary.get("summary"))
+    secondary_summary = _dict(secondary.get("summary"))
     summary = _dict(payload.get("summary"))
-    period_groups = _build_compare_period_groups(primary, secondary)
+    period_groups = [_dict(group) for group in _build_compare_period_groups(primary, secondary)]
+    initial_metric = _default_metric_for_period_groups(period_groups)
 
     return f"""
-    <section class="report-shell" data-dashboard data-initial-period="{DEFAULT_PERIOD_KEY}" data-initial-metric="{DEFAULT_METRIC_KEY}">
+    <section class="report-shell" data-dashboard data-initial-period="{DEFAULT_PERIOD_KEY}" data-initial-metric="{escape(initial_metric)}">
       <section class="company-header panel">
         <div>
           <h2>{escape(_company_name(primary_company))} VS {escape(_company_name(secondary_company))}</h2>
           <p>조회 기간 {escape(str(summary.get("recent_years", DEFAULT_RECENT_YEARS)))}년 · 기준 연도 {escape(str(summary.get("end_year", default_end_year())))} · 재무제표 {escape(str(summary.get("fs_div", "")))}</p>
         </div>
         <div class="company-actions company-actions-compare">
-          {render_compare_company_meta(primary_company, primary_market_profile, accent_class="inline-pill-accent")}
-          {render_compare_company_meta(secondary_company, secondary_market_profile, accent_class="inline-pill-contrast")}
+          {render_compare_company_meta(primary_company, primary_market_profile, accent_class="inline-pill-accent", unavailable_status=str(primary_summary.get("market_profile_status", "")))}
+          {render_compare_company_meta(secondary_company, secondary_market_profile, accent_class="inline-pill-contrast", unavailable_status=str(secondary_summary.get("market_profile_status", "")))}
         </div>
       </section>
       {render_dashboard_toolbar()}
@@ -1478,13 +1578,13 @@ def render_compare_dashboard(payload: dict[str, object]) -> str:
               <h3>대표 비교 차트</h3>
               <p>같은 구간, 같은 지표를 한 축에서 비교합니다.</p>
             </div>
-            {render_metric_switches()}
+            {render_metric_switches(period_groups, initial_metric=initial_metric)}
           </div>
-          {"".join(render_compare_focus_panel(_dict(group), primary_company, secondary_company) for group in period_groups)}
+          {"".join(render_compare_focus_panel(group, primary_company, secondary_company, initial_metric=initial_metric) for group in period_groups)}
         </section>
       </section>
       <section class="dashboard-grid">
-        {"".join(render_compare_grid(_dict(group), primary_company, secondary_company) for group in period_groups)}
+        {"".join(render_compare_grid(group, primary_company, secondary_company) for group in period_groups)}
       </section>
     </section>
     """
@@ -1498,7 +1598,7 @@ def render_compare_latest_cards(
     latest_left = _dict(_list(group.get("primary_rows"))[:1][0]) if _list(group.get("primary_rows")) else {}
     latest_right = _dict(_list(group.get("secondary_rows"))[:1][0]) if _list(group.get("secondary_rows")) else {}
     cards = []
-    for metric in METRIC_SEQUENCE:
+    for metric in _metrics_for_group(group):
         left_cell = _dict(_dict(latest_left.get("values")).get(metric))
         right_cell = _dict(_dict(latest_right.get("values")).get(metric))
         delta = _subtract_decimal(left_cell.get("amount"), right_cell.get("amount"))
@@ -1523,13 +1623,15 @@ def render_compare_focus_panel(
     group: dict[str, object],
     primary_company: dict[str, object],
     secondary_company: dict[str, object],
+    *,
+    initial_metric: str,
 ) -> str:
     panels = []
-    for metric in METRIC_SEQUENCE:
+    for metric in _metrics_for_group(group):
         chart_title = f"{group.get('label')} · {METRIC_LABELS.get(metric, metric)} 비교"
         panels.append(
             f'<div class="chart-focus-panel" data-panel data-period="{escape(str(group.get("key", "")))}" data-metric="{escape(metric)}" '
-            f'{"hidden" if not (group.get("key") == DEFAULT_PERIOD_KEY and metric == DEFAULT_METRIC_KEY) else ""}>'
+            f'{"hidden" if not (group.get("key") == DEFAULT_PERIOD_KEY and metric == initial_metric) else ""}>'
             f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), period_key=str(group.get("key", "")), primary_name=_company_name(primary_company), secondary_name=_company_name(secondary_company), title=chart_title)}'
             "</div>"
         )
@@ -1542,7 +1644,7 @@ def render_compare_grid(
     secondary_company: dict[str, object],
 ) -> str:
     cards = []
-    for metric in METRIC_SEQUENCE:
+    for metric in _metrics_for_group(group):
         chart_title = f"{group.get('label')} · {METRIC_LABELS.get(metric, metric)}"
         cards.append(
             f'<article class="panel grid-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
@@ -1552,7 +1654,7 @@ def render_compare_grid(
     cards.append(
         f'<article class="panel info-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
         f'<div class="panel-heading"><h3>{escape(str(group.get("label", "")))} 최근 비교 표</h3></div>'
-        f'{render_compare_table(_list(group.get("primary_rows")), _list(group.get("secondary_rows")), _company_name(primary_company), _company_name(secondary_company))}'
+        f'{render_compare_table(_list(group.get("primary_rows")), _list(group.get("secondary_rows")), _company_name(primary_company), _company_name(secondary_company), period_key=str(group.get("key", "")))}'
         "</article>"
     )
     return "".join(cards)
@@ -2122,8 +2224,17 @@ def render_compare_table(
     secondary_rows: list[object],
     primary_name: str,
     secondary_name: str,
+    *,
+    period_key: str,
 ) -> str:
     paired = []
+    metrics = _metrics_for_group(
+        {
+            "key": period_key,
+            "primary_rows": primary_rows,
+            "secondary_rows": secondary_rows,
+        }
+    )
     left_index = {str(_dict(row).get("period", "")): _dict(row) for row in primary_rows[:5]}
     right_index = {str(_dict(row).get("period", "")): _dict(row) for row in secondary_rows[:5]}
     periods = []
@@ -2137,15 +2248,26 @@ def render_compare_table(
     for period in periods:
         left_row = left_index.get(period, {})
         right_row = right_index.get(period, {})
-        paired.append(
-            "<tr>"
-            f"<td>{escape(period)}</td>"
-            f"<td>{escape(_format_chart_amount(_dict(_dict(left_row.get('values')).get(DEFAULT_METRIC_KEY)).get('amount')))}</td>"
-            f"<td>{escape(_format_chart_amount(_dict(_dict(right_row.get('values')).get(DEFAULT_METRIC_KEY)).get('amount')))}</td>"
-            f"<td>{escape(_format_percent(_dict(_dict(left_row.get('values')).get(DEFAULT_METRIC_KEY)).get('growth_rate')))}</td>"
-            f"<td>{escape(_format_percent(_dict(_dict(right_row.get('values')).get(DEFAULT_METRIC_KEY)).get('growth_rate')))}</td>"
-            "</tr>"
-        )
+        for metric in metrics:
+            left_cell = _dict(_dict(left_row.get("values")).get(metric))
+            right_cell = _dict(_dict(right_row.get("values")).get(metric))
+            paired.append(
+                "<tr>"
+                f"<td>{escape(period)}</td>"
+                f"<td>{escape(METRIC_LABELS.get(metric, metric))}</td>"
+                f"<td>{escape(_format_chart_amount(left_cell.get('amount')))}</td>"
+                f"<td>{escape(_format_chart_amount(right_cell.get('amount')))}</td>"
+                f"<td>{escape(_format_percent(left_cell.get('growth_rate')))}</td>"
+                f"<td>{escape(_format_percent(right_cell.get('growth_rate')))}</td>"
+                "</tr>"
+            )
+
+    return (
+        "<table>"
+        f"<thead><tr><th>기간</th><th>지표</th><th>{escape(primary_name)} 금액</th><th>{escape(secondary_name)} 금액</th><th>{escape(primary_name)} YoY</th><th>{escape(secondary_name)} YoY</th></tr></thead>"
+        f"<tbody>{''.join(paired)}</tbody>"
+        "</table>"
+    )
 
     return (
         "<table>"
@@ -3708,6 +3830,11 @@ def _page_styles() -> str:
       border-color: #ffccd7;
       color: #be123c;
     }
+    .inline-pill-muted {
+      background: #f6f7fb;
+      border-color: #d6dbe7;
+      color: #66758a;
+    }
     .segmented {
       display: inline-flex;
       gap: 6px;
@@ -4263,14 +4390,42 @@ def _page_script() -> str:
           "";
 
         const applyState = () => {
+          const allowedMetricButtons = metricButtons.filter((button) => {
+            const periods = (
+              button.getAttribute("data-metric-periods") || ""
+            )
+              .split(",")
+              .map((value) => value.trim())
+              .filter(Boolean);
+            return periods.length === 0 || periods.includes(activePeriod);
+          });
+          if (
+            !allowedMetricButtons.some(
+              (button) => button.getAttribute("data-metric-toggle") === activeMetric
+            )
+          ) {
+            activeMetric =
+              (allowedMetricButtons[0] &&
+                allowedMetricButtons[0].getAttribute("data-metric-toggle")) ||
+              "";
+          }
           periodButtons.forEach((button) => {
             const selected =
               button.getAttribute("data-period-toggle") === activePeriod;
             button.classList.toggle("is-active", selected);
           });
           metricButtons.forEach((button) => {
+            const periods = (
+              button.getAttribute("data-metric-periods") || ""
+            )
+              .split(",")
+              .map((value) => value.trim())
+              .filter(Boolean);
+            const allowed =
+              periods.length === 0 || periods.includes(activePeriod);
             const selected =
-              button.getAttribute("data-metric-toggle") === activeMetric;
+              allowed && button.getAttribute("data-metric-toggle") === activeMetric;
+            button.hidden = !allowed;
             button.classList.toggle("is-active", selected);
           });
           panels.forEach((panel) => {
