@@ -52,6 +52,8 @@ MIN_OPENDART_YEAR = 2015
 DEFAULT_WEB_CACHE_DIR = Path("data/web-cache")
 DEFAULT_PERIOD_KEY = "quarterly"
 DEFAULT_METRIC_KEY = "revenue"
+DEFAULT_ANALYSIS_TAB = "financials"
+ANALYSIS_TABS = ("overview", "financials", "growth")
 METRIC_SEQUENCE = ("revenue", "operating_income", "net_income")
 PERIOD_DEFS = (
     {
@@ -119,6 +121,7 @@ class AnalysisForm:
     end_year: str = ""
     fs_div: str = "CFS"
     threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
+    top_tab: str = DEFAULT_ANALYSIS_TAB
 
 
 @dataclass(frozen=True)
@@ -150,6 +153,7 @@ def create_app(
         end_year: str = "",
         fs_div: str = "CFS",
         threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
+        tab: str = DEFAULT_ANALYSIS_TAB,
     ) -> HTMLResponse:
         form = AnalysisForm(
             company_query=(company_query or corp_code).strip(),
@@ -157,6 +161,7 @@ def create_app(
             end_year=end_year.strip() or str(default_end_year()),
             fs_div=fs_div.strip().upper() or "CFS",
             threshold_percent=threshold_percent.strip(),
+            top_tab=_normalize_analysis_tab(tab),
         )
 
         try:
@@ -769,14 +774,15 @@ def render_analysis_page(
     company = _dict(payload.get("company")) if payload else {}
     company_title = _company_title(company) if company else ""
     header_html = render_analysis_header(form, payload)
+    top_tabs_html = render_analysis_top_tabs(form, payload)
     body_html = (
-        render_browser_report(payload)
+        render_browser_report(payload, top_tab=form.top_tab)
         if payload is not None
         else render_analysis_empty_state()
     )
     return render_shell(
         company_title=company_title,
-        active_tab="financials",
+        top_tabs_html=top_tabs_html,
         toolbar_html=header_html,
         content_html=body_html,
         message_html=render_message(error=error),
@@ -799,7 +805,7 @@ def render_compare_page(
 
     return render_shell(
         company_title=company_title,
-        active_tab="compare",
+        top_tabs_html=render_compare_top_tabs(form, payload),
         toolbar_html=render_compare_header(form, payload),
         content_html=(
             render_compare_dashboard(_dict(payload))
@@ -813,7 +819,7 @@ def render_compare_page(
 def render_shell(
     *,
     company_title: str,
-    active_tab: str,
+    top_tabs_html: str,
     toolbar_html: str,
     content_html: str,
     message_html: str = "",
@@ -834,7 +840,7 @@ def render_shell(
       <div class="context-chip">{escape(company_title or "기업 선택")}</div>
       <div class="context-meta">KOSPI/KOSDAQ 상장기업 재무 데이터 탐색</div>
     </div>
-    {render_top_tabs(active_tab)}
+    {top_tabs_html}
   </header>
   <main class="shell-main">
     <section class="notice loading-indicator" id="loading-indicator" aria-live="polite">
@@ -856,19 +862,149 @@ def render_shell(
 """
 
 
-def render_top_tabs(active_tab: str) -> str:
+def render_analysis_top_tabs(
+    form: AnalysisForm,
+    payload: dict[str, object] | None,
+) -> str:
+    summary = _dict(payload.get("summary")) if payload else {}
+    company_query = str(summary.get("company_query", "")).strip() or form.company_query
+    recent_years = str(summary.get("recent_years", form.recent_years or DEFAULT_RECENT_YEARS))
+    end_year = str(summary.get("end_year", form.end_year or default_end_year()))
+    threshold_percent = str(
+        summary.get("threshold_percent", form.threshold_percent or DEFAULT_THRESHOLD_PERCENT)
+    )
+    fs_div = _analysis_form_fs_div(form, summary)
+    compare_href = _build_compare_href(
+        primary_company_query=company_query,
+        recent_years=recent_years,
+        end_year=end_year,
+        fs_div=fs_div,
+        threshold_percent=threshold_percent,
+    )
+    tabs = (
+        (
+            "요약",
+            _build_analysis_href(
+                company_query=company_query,
+                recent_years=recent_years,
+                end_year=end_year,
+                fs_div=fs_div,
+                threshold_percent=threshold_percent,
+                top_tab="overview",
+                fragment="overview-summary",
+            ),
+            "overview",
+        ),
+        (
+            "재무정보",
+            _build_analysis_href(
+                company_query=company_query,
+                recent_years=recent_years,
+                end_year=end_year,
+                fs_div=fs_div,
+                threshold_percent=threshold_percent,
+                top_tab="financials",
+                fragment="financials-details",
+            ),
+            "financials",
+        ),
+        (
+            "성장률",
+            _build_analysis_href(
+                company_query=company_query,
+                recent_years=recent_years,
+                end_year=end_year,
+                fs_div=fs_div,
+                threshold_percent=threshold_percent,
+                top_tab="growth",
+                fragment="growth-details",
+            ),
+            "growth",
+        ),
+        ("VS 기업비교", compare_href, "compare"),
+    )
+    return render_top_tabs(form.top_tab, tabs)
+
+
+def render_compare_top_tabs(
+    form: CompareForm,
+    payload: dict[str, object] | None,
+) -> str:
+    primary_company = _dict(_dict(payload or {}).get("primary")).get("company")
+    secondary_company = _dict(_dict(payload or {}).get("secondary")).get("company")
+    primary_company_query = str(
+        form.primary_company_query or _dict(primary_company).get("corp_name", "")
+    )
+    secondary_company_query = str(
+        form.secondary_company_query or _dict(secondary_company).get("corp_name", "")
+    )
+    tabs = (
+        (
+            "요약",
+            _build_analysis_href(
+                company_query=primary_company_query,
+                recent_years=form.recent_years,
+                end_year=form.end_year or str(default_end_year()),
+                fs_div=form.fs_div,
+                threshold_percent=form.threshold_percent,
+                top_tab="overview",
+                fragment="overview-summary",
+            ),
+            "overview",
+        ),
+        (
+            "재무정보",
+            _build_analysis_href(
+                company_query=primary_company_query,
+                recent_years=form.recent_years,
+                end_year=form.end_year or str(default_end_year()),
+                fs_div=form.fs_div,
+                threshold_percent=form.threshold_percent,
+                top_tab="financials",
+                fragment="financials-details",
+            ),
+            "financials",
+        ),
+        (
+            "성장률",
+            _build_analysis_href(
+                company_query=primary_company_query,
+                recent_years=form.recent_years,
+                end_year=form.end_year or str(default_end_year()),
+                fs_div=form.fs_div,
+                threshold_percent=form.threshold_percent,
+                top_tab="growth",
+                fragment="growth-details",
+            ),
+            "growth",
+        ),
+        (
+            "VS 기업비교",
+            _build_compare_href(
+                primary_company_query=primary_company_query,
+                secondary_company_query=secondary_company_query,
+                recent_years=form.recent_years,
+                end_year=form.end_year or str(default_end_year()),
+                fs_div=form.fs_div,
+                threshold_percent=form.threshold_percent,
+            ),
+            "compare",
+        ),
+    )
+    return render_top_tabs("compare", tabs)
+
+
+def render_top_tabs(
+    active_tab: str,
+    tabs: Iterable[tuple[str, str, str]],
+) -> str:
     def tab(label: str, href: str, key: str) -> str:
         class_name = "top-tab is-active" if active_tab == key else "top-tab"
         return f'<a class="{class_name}" href="{escape(href)}">{escape(label)}</a>'
 
-    return (
-        '<nav class="top-tabs" aria-label="화면 탭">'
-        f'{tab("요약", "/analysis", "overview")}'
-        f'{tab("재무정보", "/analysis", "financials")}'
-        f'{tab("성장률", "/analysis#growth-details", "growth")}'
-        f'{tab("VS 기업비교", "/compare", "compare")}'
-        "</nav>"
-    )
+    return '<nav class="top-tabs" aria-label="화면 탭">' + "".join(
+        tab(label, href, key) for label, href, key in tabs
+    ) + "</nav>"
 
 
 def render_analysis_header(
@@ -1082,7 +1218,11 @@ def render_analysis_empty_state() -> str:
     """
 
 
-def render_browser_report(payload: dict[str, object]) -> str:
+def render_browser_report(
+    payload: dict[str, object],
+    *,
+    top_tab: str = DEFAULT_ANALYSIS_TAB,
+) -> str:
     company = _dict(payload.get("company"))
     summary = _dict(payload.get("summary"))
     market_profile = _dict(payload.get("market_profile"))
@@ -1114,7 +1254,7 @@ def render_browser_report(payload: dict[str, object]) -> str:
       </section>
       {render_collection_errors(_list(payload.get("collection_errors")))}
       {render_dashboard_toolbar()}
-      <section class="overview-layout">
+      <section id="overview-summary" class="overview-layout">
         <section class="panel">
           <div class="panel-heading">
             <h3>최근 구간 요약</h3>
@@ -1139,11 +1279,11 @@ def render_browser_report(payload: dict[str, object]) -> str:
           <p>선택한 기간별로 최근 구간 최소 성장률과 통과 여부를 요약했습니다.</p>
         </div>
       </section>
-      <section class="dashboard-grid">
+      <section id="financials-details" class="dashboard-grid">
         {"".join(render_period_grid(_dict(group), compare_href) for group in period_groups)}
       </section>
       <section id="growth-details" class="growth-section">
-        <details class="panel">
+        <details class="panel"{" open" if top_tab == "growth" else ""}>
           <summary>성장률 상세 보기</summary>
           {render_growth_sections(_list(payload.get("growth_sections")))}
         </details>
@@ -3132,6 +3272,8 @@ def _build_analysis_href(
     end_year: str,
     fs_div: str,
     threshold_percent: str,
+    top_tab: str = "",
+    fragment: str = "",
 ) -> str:
     params = {
         "company_query": company_query,
@@ -3139,15 +3281,18 @@ def _build_analysis_href(
         "end_year": end_year,
         "fs_div": fs_div,
         "threshold_percent": threshold_percent,
+        "tab": _normalize_analysis_tab(top_tab) if top_tab else "",
     }
     filtered = {key: value for key, value in params.items() if str(value).strip()}
     query = urlencode(filtered)
-    return f"/analysis?{query}" if query else "/analysis"
+    href = f"/analysis?{query}" if query else "/analysis"
+    return f"{href}#{fragment}" if fragment else href
 
 
 def _build_compare_href(
     *,
     primary_company_query: str,
+    secondary_company_query: str = "",
     recent_years: str,
     end_year: str,
     fs_div: str,
@@ -3155,6 +3300,7 @@ def _build_compare_href(
 ) -> str:
     params = {
         "primary_company_query": primary_company_query,
+        "secondary_company_query": secondary_company_query,
         "recent_years": recent_years,
         "end_year": end_year,
         "fs_div": fs_div,
@@ -3163,6 +3309,27 @@ def _build_compare_href(
     filtered = {key: value for key, value in params.items() if str(value).strip()}
     query = urlencode(filtered)
     return f"/compare?{query}" if query else "/compare"
+
+
+def _normalize_analysis_tab(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in ANALYSIS_TABS:
+        return normalized
+    return DEFAULT_ANALYSIS_TAB
+
+
+def _analysis_form_fs_div(
+    form: AnalysisForm,
+    summary: dict[str, object],
+) -> str:
+    summary_fs_div = str(summary.get("fs_div", "")).strip()
+    if summary_fs_div == "연결":
+        return "CFS"
+    if summary_fs_div == "별도":
+        return "OFS"
+    if summary_fs_div == "전체":
+        return "ALL"
+    return form.fs_div
 
 
 def _dict(value: object) -> dict[str, object]:

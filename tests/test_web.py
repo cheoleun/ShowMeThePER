@@ -74,6 +74,74 @@ class WebTests(TestCase):
         self.assertIn("/compare?primary_company_query=Samsung+Electronics", response.text)
         self.assertIn("OpenDART 신규 수집", response.text)
 
+    def test_analysis_top_tabs_keep_company_context(self) -> None:
+        client = TestClient(create_app(FakeOpenDartClient))
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Vinatac",
+                        "recent_years": "10",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                        "tab": "overview",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            'class="top-tab is-active" href="/analysis?company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=overview#overview-summary"',
+            response.text,
+        )
+        self.assertIn(
+            '/analysis?company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials#financials-details',
+            response.text,
+        )
+        self.assertIn(
+            '/analysis?company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=growth#growth-details',
+            response.text,
+        )
+        self.assertIn(
+            '/compare?primary_company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20',
+            response.text,
+        )
+
+    def test_growth_tab_opens_growth_details_without_losing_data(self) -> None:
+        client = TestClient(create_app(FakeOpenDartClient))
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "5",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                        "tab": "growth",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Samsung Electronics", response.text)
+        self.assertIn('<details class="panel" open>', response.text)
+
     def test_analysis_renders_eps_and_market_summary(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient, FakeKrxStockPriceClient))
 
@@ -145,6 +213,39 @@ class WebTests(TestCase):
         self.assertIn("Samsung Electronics", response.text)
         self.assertIn("Vinatac", response.text)
         self.assertIn("<svg", response.text)
+
+    def test_compare_top_tabs_keep_both_companies(self) -> None:
+        client = TestClient(create_app(FakeOpenDartClient))
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.get(
+                    "/compare",
+                    params={
+                        "primary_company_query": "Samsung Electronics",
+                        "secondary_company_query": "Vinatac",
+                        "recent_years": "5",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            '/compare?primary_company_query=Samsung+Electronics&amp;secondary_company_query=Vinatac&amp;recent_years=5&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20',
+            response.text,
+        )
+        self.assertIn(
+            '/analysis?company_query=Samsung+Electronics&amp;recent_years=5&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials#financials-details',
+            response.text,
+        )
 
     def test_analysis_validation_errors_stay_in_browser(self) -> None:
         client = TestClient(create_app(FakeOpenDartClient))
