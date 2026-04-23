@@ -5,7 +5,7 @@ import json
 from typing import Any, Iterable
 from urllib.parse import urlencode
 from urllib.request import urlopen
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 import xml.etree.ElementTree as ET
 
 from .models import DartCompany, FinancialStatementRow, parse_decimal_amount
@@ -69,12 +69,25 @@ class OpenDartClient:
 
 
 def parse_corp_code_zip(content: bytes) -> list[DartCompany]:
-    with ZipFile(BytesIO(content)) as archive:
-        xml_names = [name for name in archive.namelist() if name.lower().endswith(".xml")]
-        if not xml_names:
-            raise ValueError("OpenDART corp code archive does not contain an XML file.")
-        with archive.open(xml_names[0]) as xml_file:
-            return parse_corp_code_xml(xml_file.read())
+    try:
+        with ZipFile(BytesIO(content)) as archive:
+            xml_names = [
+                name for name in archive.namelist() if name.lower().endswith(".xml")
+            ]
+            if not xml_names:
+                raise ValueError(
+                    "OpenDART corp code archive does not contain an XML file."
+                )
+            with archive.open(xml_names[0]) as xml_file:
+                return parse_corp_code_xml(xml_file.read())
+    except BadZipFile as error:
+        try:
+            companies = parse_corp_code_xml(content)
+        except ET.ParseError:
+            companies = []
+        if companies:
+            return companies
+        raise ValueError(_describe_corp_code_payload(content)) from error
 
 
 def parse_corp_code_xml(content: bytes | str) -> list[DartCompany]:
@@ -162,3 +175,47 @@ def _field(item: dict[str, Any], key: str) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _describe_corp_code_payload(content: bytes) -> str:
+    decoded = content.decode("utf-8", errors="ignore").strip()
+    if not decoded:
+        return "OpenDART corp code request failed: empty response"
+
+    status, message = _extract_corp_code_status_and_message(decoded)
+    if status or message:
+        status_text = status or "unknown"
+        message_text = message or "Unknown OpenDART error"
+        return f"OpenDART corp code request failed: {status_text} {message_text}"
+
+    snippet = " ".join(decoded.split())
+    if len(snippet) > 200:
+        snippet = snippet[:197] + "..."
+    return f"OpenDART corp code request failed: {snippet}"
+
+
+def _extract_corp_code_status_and_message(content: str) -> tuple[str, str]:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        status = str(payload.get("status", "") or "").strip()
+        message = str(payload.get("message", "") or "").strip()
+        return status, message
+
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return "", ""
+
+    status = _find_text(root, "status")
+    message = _find_text(root, "message")
+    return status, message
+
+
+def _find_text(root: ET.Element, child_name: str) -> str:
+    element = root.find(f".//{child_name}")
+    if element is None or element.text is None:
+        return ""
+    return element.text.strip()

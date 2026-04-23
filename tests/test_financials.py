@@ -253,6 +253,37 @@ class FinancialOutputTests(unittest.TestCase):
             ["annual", "quarter"],
         )
 
+    def test_build_period_values_keeps_eps_annual_only(self) -> None:
+        rows = [
+            financial_row(
+                report_code="11013",
+                account_id="ifrs-full_BasicEarningsLossPerShare",
+                account_name="Basic earnings per share",
+                current_amount=Decimal("80"),
+                previous_amount=None,
+                before_previous_amount=None,
+            ),
+            financial_row(
+                report_code="11011",
+                account_id="ifrs-full_BasicEarningsLossPerShare",
+                account_name="Basic earnings per share",
+                current_amount=Decimal("310"),
+                previous_amount=Decimal("250"),
+                before_previous_amount=Decimal("200"),
+            ),
+        ]
+
+        values = build_period_values_from_rows(rows)
+
+        self.assertEqual(
+            [(value.metric, value.period_type, value.fiscal_year) for value in values],
+            [
+                ("eps", "annual", 2025),
+                ("eps", "annual", 2024),
+                ("eps", "annual", 2023),
+            ],
+        )
+
     def test_map_financial_account_to_metric_uses_name_fallback(self) -> None:
         self.assertEqual(
             map_financial_account_to_metric("", "당기순이익"),

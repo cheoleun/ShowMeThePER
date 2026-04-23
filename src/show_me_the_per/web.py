@@ -1,0 +1,8101 @@
+﻿from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
+from html import escape
+import os
+from pathlib import Path
+from typing import Callable, Iterable, Protocol
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+from .growth import ANNUAL_YOY, QUARTERLY_QOQ, QUARTERLY_YOY, TRAILING_FOUR_QUARTER_YOY
+from .krx import (
+    KrxApiError,
+    KrxClient,
+    KrxStockPriceClient,
+    KrxStockPriceSnapshot,
+    diagnose_krx_service,
+)
+from .matching import match_listings_to_dart
+from .naver_finance import NaverFinanceClient
+from .models import (
+    DartCompany,
+    FinancialPeriodValue,
+    FinancialStatementRow,
+    normalize_stock_code,
+)
+from .opendart import OpenDartClient
+from .pipeline import (
+    DEFAULT_REPORT_CODES,
+    AnalysisArtifacts,
+    MajorAccountClient,
+    build_analysis_artifacts,
+    collect_financial_statement_run,
+)
+from .reports import (
+    METRIC_LABELS,
+    METRIC_ORDER,
+    SERIES_LABELS,
+    SERIES_ORDER,
+    _format_amount,
+    _format_percent,
+)
+from .rankings import (
+    DEFAULT_SCREENING_GROWTH_CONDITIONS,
+    DEFAULT_SCREENING_GROWTH_METRIC,
+    DEFAULT_SCREENING_GROWTH_SERIES_TYPE,
+    GROWTH_METRIC_LABELS,
+    GROWTH_SERIES_LABELS,
+    ValuationSnapshot,
+    default_recent_periods_for_series,
+    format_growth_condition_period_label,
+    growth_condition_period_unit,
+    normalize_growth_conditions,
+)
+from .storage import (
+    activate_opendart_api_key,
+    build_database_company_screening_payload,
+    create_refresh_job,
+    delete_opendart_api_key,
+    extract_opendart_status_code,
+    list_opendart_api_keys,
+    normalize_refresh_job_error_reason,
+    read_company_master_entries,
+    read_company_master_status,
+    read_dart_companies_from_database,
+    read_active_opendart_api_key,
+    read_collection_errors_from_database,
+    read_latest_refresh_job,
+    read_latest_equity_price_snapshot,
+    read_latest_valuation_snapshot,
+    read_financial_period_values_from_database,
+    read_financial_statement_rows_from_database,
+    read_growth_filter_results_from_database,
+    read_growth_points_from_database,
+    read_refresh_job,
+    read_refresh_job_items,
+    reset_database_cache,
+    replace_company_analysis_artifacts,
+    record_refresh_job_item_result,
+    retry_failed_refresh_job_items,
+    store_equity_price_snapshot,
+    store_analysis_artifacts,
+    store_company_master_entries,
+    store_opendart_api_key,
+    store_valuation_snapshot,
+    update_refresh_job_status,
+)
+
+
+DEFAULT_RECENT_YEARS = 10
+DEFAULT_THRESHOLD_PERCENT = Decimal("20")
+MIN_OPENDART_YEAR = 2015
+DEFAULT_PERIOD_KEY = "quarterly"
+DEFAULT_METRIC_KEY = "revenue"
+DEFAULT_ANALYSIS_TAB = "financials"
+ANALYSIS_TABS = ("overview", "financials", "growth")
+TAB_RETURN_PARAM_KEYS = (
+    "return_analysis",
+    "return_compare",
+    "return_ranking",
+    "return_db_update",
+)
+DEFAULT_RANKING_SORT_BY = "market_cap"
+DEFAULT_MARKET_FILTER = "ALL"
+DEFAULT_RANKING_DISPLAY_LIMIT = 100
+MAX_RANKING_DISPLAY_LIMIT = 1000
+RANKING_DISPLAY_LIMIT_OPTIONS = (50, 100, 200, 500, 1000)
+DEFAULT_RANKING_GROWTH_METRIC = DEFAULT_SCREENING_GROWTH_METRIC
+DEFAULT_RANKING_GROWTH_SERIES_TYPE = DEFAULT_SCREENING_GROWTH_SERIES_TYPE
+DEFAULT_RANKING_GROWTH_CONDITIONS = tuple(
+    f"{item['series_type']}:{item['metric']}:{item['recent_periods']}"
+    for item in DEFAULT_SCREENING_GROWTH_CONDITIONS
+)
+RANKING_SORT_OPTIONS = (
+    ("market_cap", "시가총액"),
+    ("overall_minimum_growth_rate", "전체 최소 성장률"),
+)
+GROWTH_CONDITION_SERIES = (
+    ANNUAL_YOY,
+    QUARTERLY_YOY,
+    QUARTERLY_QOQ,
+    TRAILING_FOUR_QUARTER_YOY,
+)
+GROWTH_CONDITION_METRICS = ("revenue", "operating_income", "net_income")
+METRIC_SEQUENCE = ("revenue", "operating_income", "net_income", "eps")
+PERIOD_METRIC_SEQUENCE = {
+    "quarterly": ("revenue", "operating_income", "net_income"),
+    "trailing": ("revenue", "operating_income", "net_income"),
+    "annual": ("revenue", "operating_income", "net_income", "eps"),
+}
+PERIOD_DEFS = (
+    {
+        "key": "quarterly",
+        "label": "분기",
+        "rows_key": "quarterly_rows",
+        "growth_label": "YoY 성장률",
+        "filter_series_type": QUARTERLY_YOY,
+        "include_qoq": True,
+    },
+    {
+        "key": "trailing",
+        "label": "4분기 누적",
+        "rows_key": "trailing_rows",
+        "growth_label": "YoY 성장률",
+        "filter_series_type": TRAILING_FOUR_QUARTER_YOY,
+        "include_qoq": False,
+    },
+    {
+        "key": "annual",
+        "label": "연간",
+        "rows_key": "annual_rows",
+        "growth_label": "YoY 성장률",
+        "filter_series_type": ANNUAL_YOY,
+        "include_qoq": False,
+    },
+)
+
+QUARTER_COLORS = {
+    1: "#a5b4fc",
+    2: "#fdba74",
+    3: "#86efac",
+    4: "#fde68a",
+}
+AMOUNT_BAR_COLOR = "#bfdbfe"
+AMOUNT_BAR_STROKE = "#60a5fa"
+GROWTH_LINE_COLORS = {
+    "growth_rate": "#c4b5fd",
+    "qoq_growth_rate": "#f9a8d4",
+}
+GROWTH_LINE_STROKE_WIDTH = "1.6"
+GROWTH_LINE_MARKER_RADIUS = "2.5"
+GROWTH_LINE_COMPACT_MARKER_RADIUS = "2.25"
+GROWTH_LINE_MARKER_STROKE_WIDTH = "1.0"
+COMPARE_LINE_COLORS = {
+    "primary": "#2563eb",
+    "secondary": "#f97316",
+}
+
+
+class StockPriceClient(Protocol):
+    def fetch_stock_price(
+        self,
+        stock_code: str,
+        *,
+        base_date: str,
+        ) -> KrxStockPriceSnapshot:
+        ...
+
+
+class ListingClient(Protocol):
+    def fetch_listings(
+        self,
+        base_date: str | None = None,
+        page_size: int = 1000,
+        max_pages: int | None = None,
+    ) -> list[object]:
+        ...
+
+
+class ValuationClient(Protocol):
+    def fetch_snapshot(
+        self,
+        stock_code: str,
+    ) -> object:
+        ...
+
+
+@dataclass(frozen=True)
+class AnalysisForm:
+    company_query: str = ""
+    recent_years: str = str(DEFAULT_RECENT_YEARS)
+    end_year: str = ""
+    fs_div: str = "CFS"
+    threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
+    top_tab: str = DEFAULT_ANALYSIS_TAB
+    refresh: str = ""
+    return_analysis: str = ""
+    return_compare: str = ""
+    return_ranking: str = ""
+    return_db_update: str = ""
+
+
+@dataclass(frozen=True)
+class CompareForm:
+    primary_company_query: str = ""
+    secondary_company_query: str = ""
+    recent_years: str = str(DEFAULT_RECENT_YEARS)
+    end_year: str = ""
+    fs_div: str = "CFS"
+    threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
+    return_analysis: str = ""
+    return_compare: str = ""
+    return_ranking: str = ""
+    return_db_update: str = ""
+
+
+@dataclass(frozen=True)
+class RankingForm:
+    growth_conditions: tuple[str, ...] = DEFAULT_RANKING_GROWTH_CONDITIONS
+    growth_period_inputs: tuple[tuple[str, str], ...] = ()
+    growth_threshold_inputs: tuple[tuple[str, str], ...] = ()
+    market: str = DEFAULT_MARKET_FILTER
+    recent_years: str = str(DEFAULT_RECENT_YEARS)
+    display_limit: str = str(DEFAULT_RANKING_DISPLAY_LIMIT)
+    end_year: str = ""
+    fs_div: str = "CFS"
+    threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
+    sort_by: str = DEFAULT_RANKING_SORT_BY
+    submitted: str = ""
+    return_analysis: str = ""
+    return_compare: str = ""
+    return_ranking: str = ""
+    return_db_update: str = ""
+
+
+def create_app(
+    client_factory: Callable[[str], MajorAccountClient] = OpenDartClient,
+    stock_client_factory: Callable[[str], StockPriceClient] = KrxStockPriceClient,
+    valuation_client_factory: Callable[[], ValuationClient] = NaverFinanceClient,
+    listing_client_factory: Callable[[str], ListingClient] = KrxClient,
+) -> FastAPI:
+    app = FastAPI(title="ShowMeThePER")
+
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> HTMLResponse:
+        form = AnalysisForm(end_year=str(default_end_year()))
+        return HTMLResponse(render_analysis_page(form=form))
+
+    @app.get("/analysis", response_class=HTMLResponse)
+    def analysis(
+        company_query: str = "",
+        corp_code: str = "",
+        recent_years: str = str(DEFAULT_RECENT_YEARS),
+        end_year: str = "",
+        fs_div: str = "CFS",
+        threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
+        tab: str = DEFAULT_ANALYSIS_TAB,
+        refresh: str = "",
+        return_analysis: str = "",
+        return_compare: str = "",
+        return_ranking: str = "",
+        return_db_update: str = "",
+    ) -> HTMLResponse:
+        form = AnalysisForm(
+            company_query=(company_query or corp_code).strip(),
+            recent_years=recent_years.strip(),
+            end_year=end_year.strip() or str(default_end_year()),
+            fs_div=fs_div.strip().upper() or "CFS",
+            threshold_percent=threshold_percent.strip(),
+            top_tab=_normalize_analysis_tab(tab),
+            refresh=refresh.strip(),
+            return_analysis=_normalize_return_href(return_analysis),
+            return_compare=_normalize_return_href(return_compare),
+            return_ranking=_normalize_return_href(return_ranking),
+            return_db_update=_normalize_return_href(return_db_update),
+        )
+
+        try:
+            request = parse_analysis_request(form)
+        except ValueError as error:
+            return HTMLResponse(render_analysis_page(form=form, error=str(error)))
+
+        api_key, _ = _selected_opendart_api_key()
+        if not api_key:
+            return HTMLResponse(
+                render_analysis_page(
+                    form=form,
+                    error="OpenDART 키를 먼저 설정해 주세요.",
+                )
+            )
+
+        client = client_factory(api_key)
+        stock_client = _build_stock_price_client(stock_client_factory)
+        valuation_client = valuation_client_factory()
+        try:
+            payload = _collect_browser_payload(
+                client,
+                stock_client=stock_client,
+                valuation_client=valuation_client,
+                company_query=request["company_query"],
+                request=request,
+            )
+        except ValueError as error:
+            return HTMLResponse(render_analysis_page(form=form, error=str(error)))
+        except RuntimeError as error:
+            return HTMLResponse(
+                render_analysis_page(
+                    form=form,
+                    error=str(error),
+                )
+            )
+
+        payload["opendart_keys"] = _renderable_opendart_keys(
+            list_opendart_api_keys(_settings_database_path())
+        )
+        payload["opendart_key_source"] = _selected_opendart_api_key()[1]
+        payload["update_job"] = read_latest_refresh_job(
+            _web_cache_database_path(str(request["fs_div"] or "ALL"))
+        ) or {}
+        return HTMLResponse(render_analysis_page(form=form, payload=payload))
+
+    @app.get("/compare", response_class=HTMLResponse)
+    def compare(
+        primary_company_query: str = "",
+        secondary_company_query: str = "",
+        recent_years: str = str(DEFAULT_RECENT_YEARS),
+        end_year: str = "",
+        fs_div: str = "CFS",
+        threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
+        return_analysis: str = "",
+        return_compare: str = "",
+        return_ranking: str = "",
+        return_db_update: str = "",
+    ) -> HTMLResponse:
+        form = CompareForm(
+            primary_company_query=primary_company_query.strip(),
+            secondary_company_query=secondary_company_query.strip(),
+            recent_years=recent_years.strip(),
+            end_year=end_year.strip() or str(default_end_year()),
+            fs_div=fs_div.strip().upper() or "CFS",
+            threshold_percent=threshold_percent.strip(),
+            return_analysis=_normalize_return_href(return_analysis),
+            return_compare=_normalize_return_href(return_compare),
+            return_ranking=_normalize_return_href(return_ranking),
+            return_db_update=_normalize_return_href(return_db_update),
+        )
+
+        if not form.primary_company_query and not form.secondary_company_query:
+            return HTMLResponse(render_compare_page(form=form))
+
+        try:
+            request = parse_compare_request(form)
+        except ValueError as error:
+            return HTMLResponse(render_compare_page(form=form, error=str(error)))
+
+        api_key, _ = _selected_opendart_api_key()
+        if not api_key:
+            return HTMLResponse(
+                render_compare_page(
+                    form=form,
+                    error="OpenDART 키를 먼저 설정해 주세요.",
+                )
+            )
+
+        client = client_factory(api_key)
+        stock_client = _build_stock_price_client(stock_client_factory)
+        valuation_client = valuation_client_factory()
+        try:
+            primary_payload = _collect_browser_payload(
+                client,
+                stock_client=stock_client,
+                valuation_client=valuation_client,
+                company_query=request["primary_company_query"],
+                request=request,
+            )
+            secondary_payload = _collect_browser_payload(
+                client,
+                stock_client=stock_client,
+                valuation_client=valuation_client,
+                company_query=request["secondary_company_query"],
+                request=request,
+            )
+        except ValueError as error:
+            return HTMLResponse(render_compare_page(form=form, error=str(error)))
+        except RuntimeError as error:
+            return HTMLResponse(render_compare_page(form=form, error=str(error)))
+
+        return HTMLResponse(
+            render_compare_page(
+                form=form,
+                payload={
+                    "primary": primary_payload,
+                    "secondary": secondary_payload,
+                    "summary": {
+                        "recent_years": request["recent_years"],
+                        "end_year": request["end_year"],
+                        "fs_div": request["fs_div"] or "전체",
+                    },
+                    "opendart_keys": _renderable_opendart_keys(
+                        list_opendart_api_keys(_settings_database_path())
+                    ),
+                    "opendart_key_source": _selected_opendart_api_key()[1],
+                    "update_job": read_latest_refresh_job(
+                        _web_cache_database_path(str(request["fs_div"] or "ALL"))
+                    ) or {},
+                },
+            )
+        )
+
+    @app.get("/ranking", response_class=HTMLResponse)
+    def ranking(
+        request: Request,
+        growth_condition: list[str] = Query(default=[]),
+        growth_condition_key: list[str] = Query(default=[]),
+        market: str = DEFAULT_MARKET_FILTER,
+        recent_years: str = str(DEFAULT_RECENT_YEARS),
+        display_limit: str = str(DEFAULT_RANKING_DISPLAY_LIMIT),
+        end_year: str = "",
+        fs_div: str = "CFS",
+        threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
+        sort_by: str = DEFAULT_RANKING_SORT_BY,
+        submitted: str = "",
+        return_analysis: str = "",
+        return_compare: str = "",
+        return_ranking: str = "",
+        return_db_update: str = "",
+    ) -> HTMLResponse:
+        growth_period_inputs = _read_growth_period_inputs(request)
+        growth_threshold_inputs = _read_growth_threshold_inputs(request)
+        form = RankingForm(
+            growth_conditions=tuple(
+                growth_condition
+                or growth_condition_key
+                or DEFAULT_RANKING_GROWTH_CONDITIONS
+            ),
+            growth_period_inputs=tuple(growth_period_inputs.items()),
+            growth_threshold_inputs=tuple(growth_threshold_inputs.items()),
+            market=(market or DEFAULT_MARKET_FILTER).strip().upper() or DEFAULT_MARKET_FILTER,
+            recent_years=recent_years.strip(),
+            display_limit=display_limit.strip(),
+            end_year=end_year.strip() or str(default_end_year()),
+            fs_div=fs_div.strip().upper() or "CFS",
+            threshold_percent=threshold_percent.strip(),
+            sort_by=sort_by.strip() or DEFAULT_RANKING_SORT_BY,
+            submitted=submitted.strip(),
+            return_analysis=_normalize_return_href(return_analysis),
+            return_compare=_normalize_return_href(return_compare),
+            return_ranking=_normalize_return_href(return_ranking),
+            return_db_update=_normalize_return_href(return_db_update),
+        )
+
+        if not _parse_submitted(form.submitted):
+            return HTMLResponse(
+                render_ranking_page(
+                    form=form,
+                    update_job=read_latest_refresh_job(_web_cache_database_path(form.fs_div)) or {},
+                )
+            )
+
+        try:
+            ranking_request = parse_ranking_request(form)
+        except ValueError as error:
+            return HTMLResponse(render_ranking_page(form=form, error=str(error)))
+
+        if _ranking_request_requires_redirect(
+            request=request,
+            growth_condition_key=growth_condition_key,
+        ):
+            return RedirectResponse(
+                _build_ranking_href(
+                    growth_conditions=tuple(
+                        _growth_condition_value(
+                            series_type=str(condition["series_type"]),
+                            metric=str(condition["metric"]),
+                            recent_periods=int(condition["recent_periods"]),
+                        )
+                        for condition in ranking_request["growth_conditions"]
+                    ),
+                    market=form.market,
+                    recent_years=form.recent_years,
+                    display_limit=form.display_limit,
+                    growth_threshold_inputs=growth_threshold_inputs,
+                    end_year=form.end_year or str(default_end_year()),
+                    fs_div=form.fs_div,
+                    threshold_percent=form.threshold_percent,
+                    sort_by=form.sort_by,
+                    submitted=True,
+                    return_analysis=form.return_analysis,
+                    return_compare=form.return_compare,
+                    return_ranking=form.return_ranking,
+                    return_db_update=form.return_db_update,
+                ),
+                status_code=303,
+            )
+
+        database_path = _web_cache_database_path(str(ranking_request["fs_div"] or "ALL"))
+        payload = build_database_company_screening_payload(
+            database_path,
+            start_year=ranking_request["start_year"],
+            end_year=ranking_request["end_year"],
+            fs_div=ranking_request["fs_div"],
+            growth_conditions=ranking_request["growth_conditions"],
+            include_failed_growth=False,
+            threshold_percent=ranking_request["threshold_percent"],
+            market=ranking_request["market"],
+            sort_by=ranking_request["sort_by"],
+            result_limit=int(ranking_request["display_limit"]),
+        )
+        payload["company_master_status"] = read_company_master_status(database_path)
+        payload["update_job"] = read_latest_refresh_job(database_path) or {}
+        payload["opendart_keys"] = _renderable_opendart_keys(
+            list_opendart_api_keys(_settings_database_path())
+        )
+        payload["opendart_key_source"] = _selected_opendart_api_key()[1]
+        return HTMLResponse(render_ranking_page(form=form, payload=payload))
+
+    @app.get("/db-update", response_class=HTMLResponse)
+    def db_update(
+        request: Request,
+        growth_condition: list[str] = Query(default=[]),
+        growth_condition_key: list[str] = Query(default=[]),
+        market: str = DEFAULT_MARKET_FILTER,
+        recent_years: str = str(DEFAULT_RECENT_YEARS),
+        display_limit: str = str(DEFAULT_RANKING_DISPLAY_LIMIT),
+        end_year: str = "",
+        fs_div: str = "CFS",
+        threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
+        sort_by: str = DEFAULT_RANKING_SORT_BY,
+        return_analysis: str = "",
+        return_compare: str = "",
+        return_ranking: str = "",
+        return_db_update: str = "",
+    ) -> HTMLResponse:
+        growth_period_inputs = _read_growth_period_inputs(request)
+        growth_threshold_inputs = _read_growth_threshold_inputs(request)
+        form = RankingForm(
+            growth_conditions=tuple(
+                growth_condition
+                or growth_condition_key
+                or DEFAULT_RANKING_GROWTH_CONDITIONS
+            ),
+            growth_period_inputs=tuple(growth_period_inputs.items()),
+            growth_threshold_inputs=tuple(growth_threshold_inputs.items()),
+            market=(market or DEFAULT_MARKET_FILTER).strip().upper() or DEFAULT_MARKET_FILTER,
+            recent_years=recent_years.strip(),
+            display_limit=display_limit.strip(),
+            end_year=end_year.strip() or str(default_end_year()),
+            fs_div=fs_div.strip().upper() or "CFS",
+            threshold_percent=threshold_percent.strip(),
+            sort_by=sort_by.strip() or DEFAULT_RANKING_SORT_BY,
+            return_analysis=_normalize_return_href(return_analysis),
+            return_compare=_normalize_return_href(return_compare),
+            return_ranking=_normalize_return_href(return_ranking),
+            return_db_update=_normalize_return_href(return_db_update),
+        )
+
+        try:
+            ranking_request = parse_ranking_request(form)
+        except ValueError as error:
+            return HTMLResponse(render_db_update_page(form=form, error=str(error)))
+
+        database_path = _web_cache_database_path(str(ranking_request["fs_div"] or "ALL"))
+        payload = {
+            "company_master_status": read_company_master_status(database_path),
+            "update_job": read_latest_refresh_job(database_path) or {},
+            "opendart_keys": _renderable_opendart_keys(
+                list_opendart_api_keys(_settings_database_path())
+            ),
+            "opendart_key_source": _selected_opendart_api_key()[1],
+        }
+        return HTMLResponse(render_db_update_page(form=form, payload=payload))
+
+    @app.post("/ranking/company-master/sync")
+    async def ranking_company_master_sync(
+        request: Request,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        master_status = read_company_master_status(database_path)
+        if master_status.get("count", 0) and master_status.get("is_stale") is not True:
+            return JSONResponse(
+                {
+                    "status": "ok",
+                    "message": (
+                        "오늘 이미 동기화됨. "
+                        f"마지막 동기화 {_format_datetime_text(master_status.get('last_synced_at')) or '-'}"
+                    ),
+                    "skipped_today": True,
+                    "company_master_status": master_status,
+                }
+            )
+        api_key, _ = _selected_opendart_api_key()
+        service_key = os.getenv("KRX_SERVICE_KEY", "").strip()
+        if not api_key:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "OpenDART 키가 필요합니다."},
+            )
+        if not service_key:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "KRX_SERVICE_KEY가 필요합니다."},
+            )
+        _ = await _read_request_json(request)
+        try:
+            summary = _sync_company_master_for_database(
+                database_path=database_path,
+                opendart_client=client_factory(api_key),
+                listing_client=listing_client_factory(service_key),
+            )
+        except KrxApiError as error:
+            return JSONResponse(
+                status_code=403 if error.status_code == 403 else 502,
+                content={"status": "error", "message": str(error)},
+            )
+        except ValueError as error:
+            return JSONResponse(
+                status_code=502,
+                content={"status": "error", "message": str(error)},
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "message": "회사 목록 동기화 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+                },
+            )
+        return JSONResponse({"status": "ok", **summary})
+
+    @app.post("/ranking/opendart-keys")
+    async def ranking_add_opendart_key(
+        request: Request,
+    ) -> JSONResponse:
+        payload = await _read_request_json(request)
+        try:
+            keys = store_opendart_api_key(
+                _settings_database_path(),
+                label=str(payload.get("label", "")).strip(),
+                api_key=str(payload.get("api_key", "")).strip(),
+            )
+        except ValueError as error:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": str(error)},
+            )
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "OpenDART 키를 저장했습니다.",
+                "keys": _renderable_opendart_keys(keys),
+            }
+        )
+
+    @app.post("/ranking/opendart-keys/{key_id}/activate")
+    async def ranking_activate_opendart_key(
+        key_id: int,
+    ) -> JSONResponse:
+        try:
+            keys = activate_opendart_api_key(_settings_database_path(), key_id=key_id)
+        except LookupError as error:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": str(error)},
+            )
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "활성 OpenDART 키를 변경했습니다. 이어받기를 눌러 같은 작업을 재개할 수 있습니다.",
+                "keys": _renderable_opendart_keys(keys),
+            }
+        )
+
+    @app.delete("/ranking/opendart-keys/{key_id}")
+    async def ranking_delete_opendart_key(
+        key_id: int,
+    ) -> JSONResponse:
+        try:
+            keys = delete_opendart_api_key(_settings_database_path(), key_id=key_id)
+        except LookupError as error:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": str(error)},
+            )
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "OpenDART 키를 삭제했습니다.",
+                "keys": _renderable_opendart_keys(keys),
+            }
+        )
+
+    @app.post("/ranking/reset-databases")
+    async def ranking_reset_databases(
+        request: Request,
+    ) -> JSONResponse:
+        _ = await _read_request_json(request)
+        databases = _reset_web_cache_databases()
+        summary = {
+            "cleared": sum(1 for item in databases if item.get("status") == "cleared"),
+            "skipped": sum(1 for item in databases if item.get("status") == "skipped"),
+            "errors": sum(1 for item in databases if item.get("status") == "error"),
+            "cleared_rows": sum(int(item.get("cleared_rows", 0) or 0) for item in databases),
+        }
+        if summary["errors"]:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "message": "일부 DB 초기화에 실패했습니다. databases 항목을 확인해 주세요.",
+                    "databases": databases,
+                    "summary": summary,
+                },
+            )
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "전체 DB 캐시 초기화 완료. 회사목록, 재무, 시세, 작업 상태가 모두 삭제되었습니다.",
+                "databases": databases,
+                "summary": summary,
+            }
+        )
+
+    @app.post("/ranking/krx-diagnostics")
+    async def ranking_krx_diagnostics(
+        request: Request,
+    ) -> JSONResponse:
+        _ = await _read_request_json(request)
+        service_key = os.getenv("KRX_SERVICE_KEY", "").strip()
+        if not service_key:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "KRX_SERVICE_KEY가 필요합니다.",
+                },
+            )
+        diagnostics = diagnose_krx_service(service_key)
+        probes = diagnostics.get("probes", [])
+        parts: list[str] = []
+        detail_lines: list[str] = [
+            (
+                "서버 KRX 키: "
+                f"{diagnostics.get('service_key_masked') or '-'} "
+                f"(길이 {diagnostics.get('service_key_length') or 0})"
+            )
+        ]
+        status_codes: list[int] = []
+        for probe in probes:
+            if not isinstance(probe, dict):
+                continue
+            probe_name = "회사목록" if probe.get("name") == "company_list" else "시세"
+            status_code = probe.get("status_code")
+            if isinstance(status_code, int):
+                status_codes.append(status_code)
+            parts.append(
+                f"{probe_name} {probe.get('status_code') or '-'} "
+                f"({probe.get('result_code') or '-'} {probe.get('result_message') or ''})".strip()
+            )
+            preview = str(probe.get("response_preview") or "").strip()
+            if len(preview) > 180:
+                preview = preview[:177] + "..."
+            if preview:
+                detail_lines.append(
+                    f"- {probe_name}: HTTP {probe.get('status_code') or '-'} / "
+                    f"result {probe.get('result_code') or '-'} / preview {preview}"
+                )
+            else:
+                detail_lines.append(
+                    f"- {probe_name}: HTTP {probe.get('status_code') or '-'} / "
+                    f"result {probe.get('result_code') or '-'}"
+                )
+        summary = " | ".join(parts) if parts else "KRX 연결 점검 결과를 확인해 주세요."
+        if status_codes and all(code == 401 for code in status_codes):
+            detail_lines.append(
+                "두 API가 모두 401이면 현재 서버 프로세스가 다른 KRX_SERVICE_KEY를 보고 있을 가능성이 큽니다. "
+                "같은 터미널 창에서 KRX_SERVICE_KEY를 다시 설정한 뒤 서버를 재시작해 주세요."
+            )
+        message = summary
+        if detail_lines:
+            message += "\n" + "\n".join(detail_lines)
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": message,
+                "diagnostics": diagnostics,
+            }
+        )
+
+    @app.post("/ranking/update-jobs")
+    async def create_ranking_update_job(
+        request: Request,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        payload = await _read_request_json(request)
+        scope = _normalize_refresh_scope(str(payload.get("scope", "ALL")))
+        job_fs_div = _normalize_refresh_job_fs_div(
+            str(payload.get("fs_div", fs_div or "CFS"))
+        )
+        year_from = int(payload.get("year_from", default_end_year() - DEFAULT_RECENT_YEARS + 1))
+        year_to = int(payload.get("year_to", default_end_year()))
+        batch_size = _normalize_refresh_batch_size(int(payload.get("batch_size", 25)))
+        master_status = read_company_master_status(database_path)
+        if master_status.get("count", 0) == 0 or master_status.get("is_stale") is True:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "requires_company_sync",
+                    "message": "회사 목록 동기화가 먼저 필요합니다.",
+                    "company_master_status": master_status,
+                },
+            )
+
+        companies = read_company_master_entries(
+            database_path,
+            market=None if scope == "ALL" else scope,
+        )
+        try:
+            job = create_refresh_job(
+                database_path,
+                scope=scope,
+                fs_div=job_fs_div,
+                year_from=year_from,
+                year_to=year_to,
+                batch_size=batch_size,
+                companies=companies,
+                status="running",
+            )
+        except ValueError as error:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": str(error)},
+            )
+        return JSONResponse({"status": "ok", "job": job})
+
+    @app.get("/ranking/update-jobs/{job_id}")
+    def ranking_update_job_status(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = read_refresh_job(database_path, job_id=job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        return JSONResponse({"status": "ok", "job": job})
+
+    @app.post("/ranking/update-jobs/{job_id}/run-next-batch")
+    def ranking_run_next_batch(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = read_refresh_job(database_path, job_id=job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        if str(job.get("status", "")) in {"paused", "blocked"}:
+            return JSONResponse({"status": "ok", "job": job})
+
+        api_key, _ = _selected_opendart_api_key()
+        if not api_key:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "OpenDART 키가 필요합니다."},
+            )
+
+        update_refresh_job_status(
+            database_path,
+            job_id=job_id,
+            status="running",
+            last_error="",
+        )
+        client = client_factory(api_key)
+        result_job = _run_refresh_job_batch(
+            database_path=database_path,
+            job_id=job_id,
+            client=client,
+        )
+        return JSONResponse({"status": "ok", "job": result_job})
+
+    @app.post("/ranking/update-jobs/{job_id}/pause")
+    def ranking_pause_update_job(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = update_refresh_job_status(database_path, job_id=job_id, status="paused")
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        return JSONResponse({"status": "ok", "job": job})
+
+    @app.post("/ranking/update-jobs/{job_id}/resume")
+    def ranking_resume_update_job(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = update_refresh_job_status(
+            database_path,
+            job_id=job_id,
+            status="running",
+            last_error="",
+        )
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        return JSONResponse({"status": "ok", "job": job})
+
+    @app.post("/ranking/update-jobs/{job_id}/retry-failed")
+    def ranking_retry_failed_update_job(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = retry_failed_refresh_job_items(database_path, job_id=job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        return JSONResponse({"status": "ok", "job": job})
+
+    return app
+
+
+app = create_app()
+
+
+def default_end_year(today: date | None = None) -> int:
+    current = today or date.today()
+    return current.year - 1
+
+
+def _build_stock_price_client(
+    stock_client_factory: Callable[[str], StockPriceClient],
+) -> StockPriceClient | None:
+    service_key = os.getenv("KRX_SERVICE_KEY", "").strip()
+    if not service_key:
+        return None
+    return stock_client_factory(service_key)
+
+
+def parse_analysis_request(form: AnalysisForm) -> dict[str, object]:
+    company_query = form.company_query.strip()
+    if not company_query:
+        raise ValueError("기업 이름을 입력해 주세요.")
+
+    recent_years = _parse_int(form.recent_years, field_name="조회 연수")
+    if recent_years <= 0:
+        raise ValueError("조회 연수는 1 이상이어야 합니다.")
+
+    end_year = _parse_int(
+        form.end_year or str(default_end_year()),
+        field_name="기준 연도",
+    )
+    start_year = max(MIN_OPENDART_YEAR, end_year - recent_years + 1)
+    collection_start_year = max(MIN_OPENDART_YEAR, start_year - 1)
+    if start_year > end_year:
+        raise ValueError("기준 연도는 2015년 이상이어야 합니다.")
+
+    threshold_percent = _parse_decimal(
+        form.threshold_percent,
+        field_name="성장률 기준",
+    )
+    fs_div = _parse_fs_div(form.fs_div)
+
+    return {
+        "company_query": company_query,
+        "recent_years": recent_years,
+        "start_year": start_year,
+        "end_year": end_year,
+        "business_years": [
+            str(year) for year in range(collection_start_year, end_year + 1)
+        ],
+        "fs_div": fs_div,
+        "threshold_percent": threshold_percent,
+        "refresh": _parse_refresh(form.refresh),
+    }
+
+
+def parse_compare_request(form: CompareForm) -> dict[str, object]:
+    if not form.primary_company_query or not form.secondary_company_query:
+        raise ValueError("비교할 두 기업을 모두 입력해 주세요.")
+
+    request = parse_analysis_request(
+        AnalysisForm(
+            company_query=form.primary_company_query,
+            recent_years=form.recent_years,
+            end_year=form.end_year,
+            fs_div=form.fs_div,
+            threshold_percent=form.threshold_percent,
+        )
+    )
+    request["primary_company_query"] = form.primary_company_query
+    request["secondary_company_query"] = form.secondary_company_query
+    return request
+
+
+def _parse_refresh(value: object) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "on"}
+
+
+def _parse_submitted(value: object) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "on", "submit"}
+
+
+def parse_ranking_request(form: RankingForm) -> dict[str, object]:
+    recent_years = _parse_int(form.recent_years, field_name="조회 연수")
+    if recent_years <= 0:
+        raise ValueError("조회 연수는 1 이상이어야 합니다.")
+
+    end_year = _parse_int(
+        form.end_year or str(default_end_year()),
+        field_name="기준 연도",
+    )
+    start_year = max(MIN_OPENDART_YEAR, end_year - recent_years + 1)
+    threshold_percent = _parse_decimal(
+        form.threshold_percent,
+        field_name="성장률 기준",
+    )
+    fs_div = _parse_fs_div(form.fs_div)
+
+    return {
+        "market": _parse_market(form.market),
+        "recent_years": recent_years,
+        "start_year": start_year,
+        "end_year": end_year,
+        "fs_div": fs_div,
+        "threshold_percent": threshold_percent,
+        "max_per": None,
+        "max_pbr": None,
+        "min_roe": None,
+        "sort_by": "market_cap",
+    }
+
+
+def resolve_company_query(
+    companies: Iterable[DartCompany],
+    query: str,
+) -> DartCompany:
+    normalized_query = _normalize_company_name(query)
+    copied_companies = list(companies)
+    if not normalized_query:
+        raise ValueError("기업 이름을 입력해 주세요.")
+
+    corp_code_matches = [
+        company for company in copied_companies if company.corp_code == query.strip()
+    ]
+    if len(corp_code_matches) == 1:
+        return corp_code_matches[0]
+    if not corp_code_matches and query.strip().isdigit() and len(query.strip()) == 8:
+        return DartCompany(
+            corp_code=query.strip(),
+            corp_name="",
+            stock_code="",
+            modify_date="",
+        )
+
+    stock_code = normalize_stock_code(query)
+    stock_matches = [
+        company
+        for company in copied_companies
+        if company.normalized_stock_code
+        and company.normalized_stock_code == stock_code
+    ]
+    if len(stock_matches) == 1:
+        return stock_matches[0]
+    if len(stock_matches) > 1:
+        raise ValueError(_ambiguous_company_message(query, stock_matches))
+
+    exact_name_matches = [
+        company
+        for company in copied_companies
+        if _normalize_company_name(company.corp_name) == normalized_query
+    ]
+    if len(exact_name_matches) == 1:
+        return exact_name_matches[0]
+    if len(exact_name_matches) > 1:
+        raise ValueError(_ambiguous_company_message(query, exact_name_matches))
+
+    partial_name_matches = [
+        company
+        for company in copied_companies
+        if normalized_query in _normalize_company_name(company.corp_name)
+    ]
+    if len(partial_name_matches) == 1:
+        return partial_name_matches[0]
+    if len(partial_name_matches) > 1:
+        raise ValueError(_ambiguous_company_message(query, partial_name_matches))
+
+    raise ValueError(f"'{query}'에 해당하는 상장기업을 찾지 못했습니다.")
+
+
+def _collect_browser_payload(
+    client: MajorAccountClient,
+    *,
+    stock_client: StockPriceClient | None,
+    valuation_client: ValuationClient,
+    company_query: str,
+    request: dict[str, object],
+) -> dict[str, object]:
+    database_path = _web_cache_database_path(str(request["fs_div"] or "ALL"))
+    force_refresh = bool(request.get("refresh"))
+    try:
+        company, company_source = _resolve_company_for_browser(
+            client,
+            database_path=database_path,
+            company_query=company_query,
+        )
+    except ValueError:
+        raise
+    except Exception as error:  # pragma: no cover - exercised through route tests
+        raise RuntimeError(
+            _format_request_error(
+                "기업 목록을 가져오는 중 오류가 발생했습니다.",
+                error,
+            )
+        ) from error
+
+    cached_rows = (
+        read_financial_statement_rows_from_database(
+            database_path,
+            corp_code=company.corp_code,
+        )
+        if database_path.exists()
+        else []
+    )
+    cached_years = sorted({row.business_year for row in cached_rows})
+    missing_years = [
+        business_year
+        for business_year in request["business_years"]
+        if business_year not in cached_years
+    ]
+
+    try:
+        if force_refresh:
+            run = collect_financial_statement_run(
+                client,
+                corp_codes=[company.corp_code],
+                business_years=request["business_years"],
+                report_codes=DEFAULT_REPORT_CODES,
+                fs_div=request["fs_div"],
+                continue_on_error=True,
+            )
+            artifacts = _build_browser_analysis_artifacts(
+                rows=run.rows,
+                corp_code=company.corp_code,
+                request=request,
+                collection_errors=run.errors,
+            )
+            if run.errors or artifacts.collection_errors:
+                raise RuntimeError(_summarize_collection_errors(run.errors, artifacts))
+            replace_company_analysis_artifacts(
+                database_path,
+                corp_code=company.corp_code,
+                artifacts=artifacts,
+            )
+            artifacts = _read_browser_analysis_artifacts_from_database(
+                database_path=database_path,
+                corp_code=company.corp_code,
+            ) or artifacts
+            source_label = "refresh"
+            available_years = sorted({row.business_year for row in artifacts.financial_statement_rows})
+            fetched_business_years = list(request["business_years"])
+        elif missing_years:
+            run = collect_financial_statement_run(
+                client,
+                corp_codes=[company.corp_code],
+                business_years=missing_years,
+                report_codes=DEFAULT_REPORT_CODES,
+                fs_div=request["fs_div"],
+                continue_on_error=True,
+            )
+            merged_rows = _merge_financial_statement_rows(cached_rows, run.rows)
+            artifacts = _build_browser_analysis_artifacts(
+                rows=merged_rows,
+                corp_code=company.corp_code,
+                request=request,
+                collection_errors=run.errors,
+            )
+            store_analysis_artifacts(database_path, artifacts)
+            artifacts = _read_browser_analysis_artifacts_from_database(
+                database_path=database_path,
+                corp_code=company.corp_code,
+            ) or artifacts
+            source_label = "network" if not cached_rows else "cache+network"
+            available_years = sorted({row.business_year for row in artifacts.financial_statement_rows})
+            fetched_business_years = missing_years
+        else:
+            artifacts = _read_browser_analysis_artifacts_from_database(
+                database_path=database_path,
+                corp_code=company.corp_code,
+            ) or _build_browser_analysis_artifacts(
+                rows=cached_rows,
+                corp_code=company.corp_code,
+                request=request,
+                collection_errors=[],
+            )
+            source_label = "cache"
+            available_years = sorted({row.business_year for row in artifacts.financial_statement_rows})
+            fetched_business_years = []
+    except Exception as error:  # pragma: no cover - exercised through route tests
+        raise RuntimeError(
+            _format_request_error(
+                "재무제표를 수집하는 중 오류가 발생했습니다.",
+                error,
+            )
+        ) from error
+
+    payload = build_browser_report_payload(
+        artifacts,
+        company=company,
+        company_query=company_query,
+        start_year=request["start_year"],
+        end_year=request["end_year"],
+        recent_years=request["recent_years"],
+        fs_div=request["fs_div"],
+        threshold_percent=request["threshold_percent"],
+    )
+    _dict(payload["summary"]).update(
+        {
+            "cache_database": str(database_path),
+            "data_source": source_label,
+            "company_source": company_source,
+            "cached_business_years": available_years,
+            "fetched_business_years": fetched_business_years,
+            "refresh_requested": force_refresh,
+            "cache_status": _describe_cache_status(
+                source_label=source_label,
+                fetched_business_years=fetched_business_years,
+                force_refresh=force_refresh,
+            ),
+        }
+    )
+    market_profile = _load_market_profile(
+        database_path=database_path,
+        company=company,
+        stock_client=stock_client,
+    )
+    valuation_profile = _load_valuation_profile(
+        database_path=database_path,
+        company=company,
+        valuation_client=valuation_client,
+    )
+    market_profile = _merge_market_profile_with_valuation(
+        market_profile,
+        valuation_profile,
+    )
+    payload["market_profile"] = market_profile
+    payload["valuation_profile"] = valuation_profile
+    _dict(payload["summary"])["market_profile_status"] = _market_profile_status_message(
+        company=company,
+        stock_client=stock_client,
+        market_profile=market_profile,
+    )
+    _dict(payload["summary"])["valuation_profile_status"] = _valuation_profile_status_message(
+        valuation_profile
+    )
+    return payload
+
+
+def build_browser_report_payload(
+    artifacts: AnalysisArtifacts,
+    *,
+    company: DartCompany,
+    company_query: str,
+    start_year: int,
+    end_year: int,
+    recent_years: int,
+    fs_div: str | None,
+    threshold_percent: Decimal,
+) -> dict[str, object]:
+    values = [
+        value
+        for value in artifacts.financial_period_values
+        if start_year <= value.fiscal_year <= end_year
+    ]
+    growth_points = [
+        point
+        for point in _growth_points_from_payload(artifacts.growth_metrics)
+        if start_year <= int(point.get("fiscal_year", 0) or 0) <= end_year
+    ]
+    filter_results = _filter_results_from_payload(artifacts.growth_metrics)
+    annual_rows = _pivot_period_values(
+        (value for value in values if value.period_type == "annual"),
+        growth_points=growth_points,
+        series_type=ANNUAL_YOY,
+    )
+    quarterly_rows = _pivot_period_values(
+        (value for value in values if value.period_type == "quarter"),
+        growth_points=growth_points,
+        series_type=QUARTERLY_YOY,
+    )
+    trailing_rows = _pivot_growth_amount_rows(
+        growth_points,
+        series_type=TRAILING_FOUR_QUARTER_YOY,
+    )
+
+    payload = {
+        "company": _company_from_rows(company, artifacts.financial_statement_rows),
+        "summary": {
+            "company_query": company_query,
+            "start_year": start_year,
+            "end_year": end_year,
+            "recent_years": recent_years,
+            "fs_div": fs_div or "전체",
+            "threshold_percent": str(threshold_percent),
+            "raw_rows": len(artifacts.financial_statement_rows),
+            "period_values": len(values),
+            "growth_points": len(growth_points),
+            "collection_errors": len(artifacts.collection_errors),
+        },
+        "annual_rows": annual_rows,
+        "quarterly_rows": quarterly_rows,
+        "trailing_rows": trailing_rows,
+        "filter_results": sorted(
+            filter_results,
+            key=lambda item: (
+                METRIC_ORDER.get(str(item.get("metric", "")), 999),
+                SERIES_ORDER.get(str(item.get("series_type", "")), 999),
+            ),
+        ),
+        "growth_sections": _group_growth_points(growth_points),
+        "collection_errors": [
+            {
+                "business_year": error.business_year,
+                "report_code": error.report_code,
+                "error_type": error.error_type,
+                "message": error.message,
+            }
+            for error in artifacts.collection_errors
+        ],
+    }
+    payload["period_groups"] = _build_period_groups(payload)
+    return payload
+
+
+def _build_browser_analysis_artifacts(
+    *,
+    rows: list[FinancialStatementRow],
+    corp_code: str,
+    request: dict[str, object],
+    collection_errors: list[object],
+) -> AnalysisArtifacts:
+    return build_analysis_artifacts(
+        rows,
+        collection_errors=list(collection_errors),
+        expected_corp_codes=[corp_code],
+        expected_business_years=[str(year) for year in request["business_years"]],
+        expected_report_codes=DEFAULT_REPORT_CODES,
+        threshold_percent=request["threshold_percent"],
+        recent_annual_periods=3,
+        recent_quarterly_periods=12,
+    )
+
+
+def _read_browser_analysis_artifacts_from_database(
+    *,
+    database_path: Path,
+    corp_code: str,
+) -> AnalysisArtifacts | None:
+    if not database_path.exists():
+        return None
+    rows = read_financial_statement_rows_from_database(
+        database_path,
+        corp_code=corp_code,
+    )
+    if not rows:
+        return None
+    period_values = read_financial_period_values_from_database(
+        database_path,
+        corp_code=corp_code,
+    )
+    growth_points = read_growth_points_from_database(
+        database_path,
+        corp_code=corp_code,
+    )
+    filter_results = read_growth_filter_results_from_database(
+        database_path,
+        corp_code=corp_code,
+    )
+    collection_errors = read_collection_errors_from_database(
+        database_path,
+        corp_code=corp_code,
+    )
+    return AnalysisArtifacts(
+        financial_statement_rows=rows,
+        financial_period_values=period_values,
+        growth_metrics=_growth_metrics_payload_from_database(
+            growth_points=growth_points,
+            filter_results=filter_results,
+        ),
+        coverage_report={},
+        collection_errors=collection_errors,
+    )
+
+
+def _growth_metrics_payload_from_database(
+    *,
+    growth_points: list[object],
+    filter_results: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "growth_points": [
+            {
+                "corp_code": str(getattr(point, "corp_code", "") or ""),
+                "metric": str(getattr(point, "metric", "") or ""),
+                "series_type": str(getattr(point, "series_type", "") or ""),
+                "fiscal_year": int(getattr(point, "fiscal_year", 0) or 0),
+                "fiscal_quarter": getattr(point, "fiscal_quarter", None),
+                "amount": _decimal_storage_text(getattr(point, "amount", None)),
+                "base_amount": _decimal_storage_text(getattr(point, "base_amount", None)),
+                "growth_rate": _decimal_storage_text(getattr(point, "growth_rate", None)),
+            }
+            for point in growth_points
+        ],
+        "filter": {
+            "results": [
+                {
+                    **result,
+                    "minimum_growth_rate": _decimal_storage_text(
+                        result.get("minimum_growth_rate")
+                    ),
+                }
+                for result in filter_results
+            ]
+        },
+    }
+
+
+def _decimal_storage_text(value: object) -> str | None:
+    if value in {None, ""}:
+        return None
+    return str(value)
+
+
+def _summarize_collection_errors(
+    run_errors: list[object],
+    artifacts: AnalysisArtifacts,
+) -> str:
+    messages = [
+        str(getattr(error, "message", "")).strip()
+        for error in run_errors
+        if str(getattr(error, "message", "")).strip()
+    ]
+    if not messages:
+        messages = [
+            str(getattr(error, "message", "")).strip()
+            for error in artifacts.collection_errors
+            if str(getattr(error, "message", "")).strip()
+        ]
+    if messages:
+        return messages[0]
+    return "강제 재수집 중 일부 연도 데이터를 완전히 수집하지 못했습니다."
+
+
+def _classify_refresh_job_error(message: object) -> dict[str, str]:
+    text = str(message or "").strip()
+    reason = normalize_refresh_job_error_reason(text)
+    status_code = extract_opendart_status_code(text)
+    if status_code in {"020", "010", "011", "012", "901"}:
+        return {"job_status": "blocked", "item_status": "pending", "reason": reason}
+    if reason == "데이터 없음":
+        return {"job_status": "running", "item_status": "skipped", "reason": reason}
+    return {"job_status": "running", "item_status": "failed", "reason": reason}
+
+
+def _blocked_refresh_job_message(message: object) -> str:
+    text = str(message or "").strip()
+    reason = normalize_refresh_job_error_reason(text)
+    if extract_opendart_status_code(text) == "020":
+        guidance = "OpenDART 요청 한도에 도달해 작업을 멈췄습니다. 내일 다시 이어받거나 다른 키를 활성화한 뒤 이어받기를 눌러 주세요."
+    else:
+        guidance = "현재 OpenDART 키로 작업을 이어갈 수 없어 배치를 멈췄습니다. 다른 키를 저장하거나 활성화한 뒤 이어받기를 눌러 주세요."
+    if text and text != reason:
+        return f"{reason}. {guidance} 원문: {text}"
+    return f"{reason}. {guidance}"
+
+
+def _resolve_company_for_browser(
+    client: MajorAccountClient,
+    *,
+    database_path: Path,
+    company_query: str,
+) -> tuple[DartCompany, str]:
+    cached_company = _resolve_company_from_cache(database_path, company_query)
+    if cached_company is not None:
+        return cached_company, "cache"
+
+    companies = client.fetch_companies()
+    return resolve_company_query(companies, company_query), "opendart"
+
+
+def _resolve_company_from_cache(
+    database_path: Path,
+    company_query: str,
+) -> DartCompany | None:
+    if not database_path.exists():
+        return None
+    cached_companies = read_dart_companies_from_database(database_path)
+    if not cached_companies:
+        return None
+    try:
+        return resolve_company_query(cached_companies, company_query)
+    except ValueError:
+        return None
+
+
+def _merge_financial_statement_rows(
+    existing_rows: Iterable[FinancialStatementRow],
+    new_rows: Iterable[FinancialStatementRow],
+) -> list[FinancialStatementRow]:
+    merged: dict[tuple[str, ...], FinancialStatementRow] = {}
+    for row in [*existing_rows, *new_rows]:
+        key = (
+            row.corp_code,
+            row.business_year,
+            row.report_code,
+            row.fs_div,
+            row.statement_div,
+            row.statement_name,
+            row.account_id,
+            row.account_name,
+            row.current_term_name,
+        )
+        merged[key] = row
+    return sorted(
+        merged.values(),
+        key=lambda row: (
+            row.corp_code,
+            row.business_year,
+            row.report_code,
+            row.fs_div,
+            row.statement_div,
+            row.statement_name,
+            row.account_id,
+            row.account_name,
+            row.current_term_name,
+        ),
+    )
+
+
+def _web_cache_database_path(fs_div: str) -> Path:
+    base_dir = _default_web_cache_dir()
+    return base_dir / f"show-me-the-per-{(fs_div or 'ALL').lower()}.sqlite3"
+
+
+def _settings_database_path() -> Path:
+    return _default_web_cache_dir() / "show-me-the-per-settings.sqlite3"
+
+
+def _selected_opendart_api_key() -> tuple[str, str]:
+    active_key_entry = read_active_opendart_api_key(_settings_database_path())
+    active_key = str(active_key_entry.get("api_key", "") or "").strip() if active_key_entry else ""
+    if active_key:
+        return active_key, "local"
+    return os.getenv("OPENDART_API_KEY", "").strip(), "environment"
+
+
+def _masked_opendart_api_key(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    if len(text) <= 8:
+        return f"{text[:2]}{'*' * max(len(text) - 4, 1)}{text[-2:]}"
+    return f"{text[:4]}{'*' * max(len(text) - 8, 4)}{text[-4:]}"
+
+
+def _renderable_opendart_keys(
+    keys: Iterable[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "id": int(item.get("id", 0) or 0),
+            "label": str(item.get("label", "") or ""),
+            "masked_key": _masked_opendart_api_key(item.get("api_key")),
+            "is_active": item.get("is_active") is True,
+            "updated_at": _format_datetime_text(item.get("updated_at")),
+        }
+        for item in keys
+    ]
+
+
+def _default_web_cache_dir() -> Path:
+    override = os.getenv("SHOW_ME_THE_PER_WEB_CACHE_DIR", "").strip()
+    if override:
+        return Path(override)
+    if os.name == "nt":
+        local_appdata = os.getenv("LOCALAPPDATA", "").strip()
+        root = Path(local_appdata) if local_appdata else _safe_home_dir() / "AppData" / "Local"
+        return root / "ShowMeThePER" / "web-cache"
+    return _safe_home_dir() / ".cache" / "show_me_the_per" / "web-cache"
+
+
+def _reset_web_cache_databases() -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    for fs_div in ("CFS", "OFS", "ALL"):
+        database_path = _web_cache_database_path(fs_div)
+        try:
+            result = reset_database_cache(database_path)
+        except Exception as error:
+            result = {
+                "path": str(database_path),
+                "status": "error",
+                "before": {},
+                "after": {},
+                "cleared_rows": 0,
+                "error": str(error),
+            }
+        result["fs_div"] = fs_div
+        results.append(result)
+    return results
+
+
+def _safe_home_dir() -> Path:
+    try:
+        return Path.home()
+    except RuntimeError:
+        user_profile = os.getenv("USERPROFILE", "").strip()
+        if user_profile:
+            return Path(user_profile)
+        home_drive = os.getenv("HOMEDRIVE", "").strip()
+        home_path = os.getenv("HOMEPATH", "").strip()
+        if home_drive and home_path:
+            return Path(f"{home_drive}{home_path}")
+    return Path.cwd()
+
+
+def _describe_cache_status(
+    *,
+    source_label: str,
+    fetched_business_years: list[object],
+    force_refresh: bool = False,
+) -> str:
+    if force_refresh:
+        if fetched_business_years:
+            return f"OpenDART 강제 재수집 ({len(fetched_business_years)}개 연도)"
+        return "현재 기업 재무 재수집"
+    if source_label == "cache":
+        return "DB 캐시 사용"
+    if not fetched_business_years:
+        return "DB 캐시 사용"
+    if source_label == "network":
+        return f"OpenDART 신규 수집 ({len(fetched_business_years)}개 연도)"
+    return f"DB 캐시 + 최신 {len(fetched_business_years)}개 연도 갱신"
+
+
+def _load_market_profile(
+    *,
+    database_path: Path,
+    company: DartCompany,
+    stock_client: StockPriceClient | None,
+    today: date | None = None,
+) -> dict[str, object]:
+    stock_code = normalize_stock_code(company.stock_code)
+    if not stock_code:
+        return {}
+
+    cached = read_latest_equity_price_snapshot(
+        database_path,
+        stock_code=stock_code,
+    )
+    candidate_dates = _candidate_market_dates(today or date.today())
+
+    if cached is not None and cached.base_date in candidate_dates:
+        return _market_profile_json(cached, source="cache")
+
+    if stock_client is not None:
+        for base_date in candidate_dates:
+            try:
+                snapshot = stock_client.fetch_stock_price(
+                    stock_code,
+                    base_date=base_date,
+                )
+            except LookupError:
+                continue
+            except Exception:
+                break
+            store_equity_price_snapshot(database_path, snapshot)
+            return _market_profile_json(
+                snapshot,
+                source="cache" if cached is not None else "network",
+            )
+
+    if cached is not None:
+        return _market_profile_json(cached, source="cache")
+
+    return {}
+
+
+def _market_profile_status_message(
+    *,
+    company: DartCompany,
+    stock_client: StockPriceClient | None,
+    market_profile: dict[str, object],
+) -> str:
+    if market_profile:
+        return ""
+    if not normalize_stock_code(company.stock_code):
+        return "전일 시가총액 정보 없음"
+    if stock_client is None:
+        return "전일 시세 정보 비활성화"
+    return "전일 시가총액 정보 없음"
+
+
+def _candidate_market_dates(today: date, attempts: int = 7) -> list[str]:
+    dates: list[str] = []
+    cursor = today
+    while len(dates) < attempts:
+        cursor -= timedelta(days=1)
+        if cursor.weekday() < 5:
+            dates.append(cursor.strftime("%Y%m%d"))
+    return dates
+
+
+def _market_profile_json(
+    snapshot: KrxStockPriceSnapshot,
+    *,
+    source: str,
+) -> dict[str, object]:
+    return {
+        "stock_code": snapshot.stock_code,
+        "base_date": snapshot.base_date,
+        "market": snapshot.market,
+        "item_name": snapshot.item_name,
+        "close_price": (
+            None if snapshot.close_price is None else str(snapshot.close_price)
+        ),
+        "listed_stock_count": (
+            None
+            if snapshot.listed_stock_count is None
+            else str(snapshot.listed_stock_count)
+        ),
+        "market_cap": None if snapshot.market_cap is None else str(snapshot.market_cap),
+        "source": source,
+    }
+
+
+def _load_valuation_profile(
+    *,
+    database_path: Path,
+    company: DartCompany,
+    valuation_client: ValuationClient,
+    today: date | None = None,
+) -> dict[str, object]:
+    stock_code = normalize_stock_code(company.stock_code)
+    if not stock_code:
+        return {}
+
+    cached = read_latest_valuation_snapshot(
+        database_path,
+        stock_code=stock_code,
+    )
+    target_date = (today or date.today()).strftime("%Y%m%d")
+    if cached is not None and cached.base_date == target_date:
+        return _valuation_profile_json(cached, source="cache")
+
+    try:
+        raw_snapshot = valuation_client.fetch_snapshot(stock_code)
+    except Exception:
+        if cached is not None:
+            return _valuation_profile_json(cached, source="cache")
+        return {}
+
+    snapshot = _valuation_snapshot_from_company(company, raw_snapshot)
+    store_valuation_snapshot(database_path, snapshot)
+    return _valuation_profile_json(
+        snapshot,
+        source="cache" if cached is not None else "network",
+    )
+
+
+def _valuation_snapshot_from_company(
+    company: DartCompany,
+    raw_snapshot: object,
+) -> ValuationSnapshot:
+    return ValuationSnapshot(
+        corp_code=company.corp_code,
+        corp_name=company.corp_name or str(getattr(raw_snapshot, "corp_name", "")),
+        stock_code=normalize_stock_code(company.stock_code),
+        per=getattr(raw_snapshot, "per", None),
+        pbr=getattr(raw_snapshot, "pbr", None),
+        roe=getattr(raw_snapshot, "roe", None),
+        eps=getattr(raw_snapshot, "eps", None),
+        close_price=getattr(raw_snapshot, "close_price", None),
+        market_cap=getattr(raw_snapshot, "market_cap", None),
+        market=getattr(raw_snapshot, "market", None),
+        base_date=str(getattr(raw_snapshot, "base_date", "")),
+        source=str(getattr(raw_snapshot, "source", "")),
+        fetched_at=str(getattr(raw_snapshot, "fetched_at", "")),
+    )
+
+
+def _valuation_profile_json(
+    snapshot: ValuationSnapshot,
+    *,
+    source: str,
+) -> dict[str, object]:
+    return {
+        "stock_code": snapshot.stock_code,
+        "corp_code": snapshot.corp_code,
+        "corp_name": snapshot.corp_name,
+        "base_date": snapshot.base_date,
+        "market": snapshot.market,
+        "close_price": None if snapshot.close_price is None else str(snapshot.close_price),
+        "market_cap": None if snapshot.market_cap is None else str(snapshot.market_cap),
+        "per": None if snapshot.per is None else str(snapshot.per),
+        "pbr": None if snapshot.pbr is None else str(snapshot.pbr),
+        "roe": None if snapshot.roe is None else str(snapshot.roe),
+        "eps": None if snapshot.eps is None else str(snapshot.eps),
+        "source": source,
+        "fetched_at": snapshot.fetched_at,
+    }
+
+
+def _merge_market_profile_with_valuation(
+    market_profile: dict[str, object],
+    valuation_profile: dict[str, object],
+) -> dict[str, object]:
+    if not valuation_profile:
+        return market_profile
+    merged = dict(market_profile)
+    for key in ("stock_code", "base_date", "market", "close_price", "market_cap"):
+        if merged.get(key) in {None, ""} and valuation_profile.get(key) not in {None, ""}:
+            merged[key] = valuation_profile.get(key)
+    if not merged.get("source"):
+        merged["source"] = valuation_profile.get("source", "")
+    return merged
+
+
+def _valuation_profile_status_message(profile: dict[str, object]) -> str:
+    if profile:
+        return ""
+    return "밸류에이션 정보 없음"
+
+
+def render_analysis_page(
+    *,
+    form: AnalysisForm,
+    payload: dict[str, object] | None = None,
+    error: str | None = None,
+) -> str:
+    company = _dict(payload.get("company")) if payload else {}
+    company_title = _company_title(company) if company else ""
+    header_html = render_analysis_header(form, payload)
+    top_tabs_html = render_analysis_top_tabs(form, payload)
+    body_html = (
+        render_browser_report(payload, top_tab=form.top_tab)
+        if payload is not None
+        else render_analysis_empty_state()
+    )
+    body_html += render_background_refresh_job_script(
+        _dict(_dict(payload or {}).get("update_job")),
+        fs_div=form.fs_div,
+    )
+    return render_shell(
+        company_title=company_title,
+        top_tabs_html=top_tabs_html,
+        settings_html="",
+        toolbar_html=header_html,
+        content_html=body_html,
+        message_html=render_message(error=error),
+    )
+
+
+def render_compare_page(
+    *,
+    form: CompareForm,
+    payload: dict[str, object] | None = None,
+    error: str | None = None,
+) -> str:
+    primary = _dict(_dict(payload or {}).get("primary")).get("company")
+    secondary = _dict(_dict(payload or {}).get("secondary")).get("company")
+    company_title = ""
+    if primary and secondary:
+        company_title = (
+            f"{_company_name(_dict(primary))} VS {_company_name(_dict(secondary))}"
+        )
+
+    content_html = (
+        render_compare_dashboard(_dict(payload))
+        if payload is not None
+        else render_compare_empty_state(form)
+    )
+    content_html += render_background_refresh_job_script(
+        _dict(_dict(payload or {}).get("update_job")),
+        fs_div=form.fs_div,
+    )
+    return render_shell(
+        company_title=company_title,
+        top_tabs_html=render_compare_top_tabs(form, payload),
+        settings_html="",
+        toolbar_html=render_compare_header(form, payload),
+        content_html=content_html,
+        message_html=render_message(error=error),
+    )
+
+
+def render_ranking_page(
+    *,
+    form: RankingForm,
+    payload: dict[str, object] | None = None,
+    error: str | None = None,
+) -> str:
+    return render_shell(
+        company_title="랭킹/검색",
+        top_tabs_html=render_ranking_top_tabs(form),
+        toolbar_html=render_ranking_header(form),
+        content_html=(
+            render_ranking_results(_dict(payload))
+            if payload is not None
+            else render_ranking_empty_state()
+        ),
+        message_html=render_message(error=error),
+    )
+
+
+def render_shell(
+    *,
+    company_title: str,
+    top_tabs_html: str,
+    settings_html: str,
+    toolbar_html: str,
+    content_html: str,
+    message_html: str = "",
+) -> str:
+    return f"""<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShowMeThePER</title>
+  <style>
+{_page_styles()}
+  </style>
+</head>
+<body>
+  <header class="shell-header">
+    <div class="context-bar">
+      <div class="context-chip">{escape(company_title or "기업 선택")}</div>
+      <div class="context-meta">KOSPI/KOSDAQ 상장기업 재무 데이터 탐색</div>
+    </div>
+    {top_tabs_html}
+  </header>
+  <main class="shell-main">
+    <section class="notice loading-indicator" id="loading-indicator" aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <div>
+        <strong>조회 요청을 처리하고 있습니다.</strong>
+        <p class="loading-copy" id="loading-status">OpenDART에서 기업 목록과 재무 데이터를 가져오는 중입니다.</p>
+      </div>
+    </section>
+    {settings_html}
+    {toolbar_html}
+    {message_html}
+    {content_html}
+  </main>
+  <script>
+{_page_script()}
+  </script>
+</body>
+</html>
+"""
+
+
+def _renderable_shared_settings_context(
+    payload: dict[str, object] | None,
+) -> tuple[list[dict[str, object]], str]:
+    data = _dict(payload or {})
+    payload_keys = [_dict(item) for item in _list(data.get("opendart_keys"))]
+    payload_source = str(data.get("opendart_key_source", "") or "")
+    if payload_keys or payload_source:
+        return payload_keys, payload_source or "environment"
+    return (
+        _renderable_opendart_keys(list_opendart_api_keys(_settings_database_path())),
+        _selected_opendart_api_key()[1],
+    )
+
+
+def render_shared_settings_panel(payload: dict[str, object] | None = None) -> str:
+    opendart_keys, opendart_key_source = _renderable_shared_settings_context(payload)
+    return f"""
+    <details class="toolbar-surface toolbar-surface-tight settings-surface" data-shared-settings>
+      <summary class="settings-summary">데이터/API 설정</summary>
+      <div class="toolbar-note" style="margin-top: 8px;">OpenDART 키를 관리하고, 배치 업데이트가 차단됐을 때 키를 바꾼 뒤 다시 이어받을 수 있습니다.</div>
+      <div id="shared-settings-message" class="toolbar-note" style="margin-top: 6px;"></div>
+      {render_opendart_key_management_card(opendart_keys, key_source=opendart_key_source)}
+    </details>
+    """
+
+
+def render_background_refresh_job_script(
+    update_job: dict[str, object] | None,
+    *,
+    fs_div: str,
+) -> str:
+    job = _dict(update_job)
+    job_id = int(job.get("id", 0) or 0)
+    if job_id <= 0 or str(job.get("status", "")).strip().lower() != "running":
+        return ""
+    return f"""
+    <script>
+    (() => {{
+      if (document.querySelector("[data-refresh-panel]")) {{
+        return;
+      }}
+      const jobId = {job_id};
+      const fsDiv = "{escape(fs_div or 'CFS')}";
+      let pumpTimer = null;
+      let pumpBusy = false;
+
+      const callJson = async (url, method = "GET") => {{
+        const response = await fetch(url, {{ method }});
+        const payload = await response.json();
+        if (!response.ok) {{
+          throw new Error(payload.message || "요청 처리 중 오류가 발생했습니다.");
+        }}
+        return payload;
+      }};
+
+      const schedulePump = () => {{
+        if (pumpTimer) {{
+          window.clearTimeout(pumpTimer);
+        }}
+        pumpTimer = window.setTimeout(runPump, 1500);
+      }};
+
+      const runPump = async () => {{
+        if (pumpBusy) {{
+          schedulePump();
+          return;
+        }}
+        pumpBusy = true;
+        try {{
+          const statusPayload = await callJson(`/ranking/update-jobs/${{jobId}}?fs_div=${{encodeURIComponent(fsDiv)}}`);
+          const job = statusPayload.job;
+          if (!job || job.status !== "running") {{
+            return;
+          }}
+          const nextPayload = await callJson(`/ranking/update-jobs/${{jobId}}/run-next-batch?fs_div=${{encodeURIComponent(fsDiv)}}`, "POST");
+          if (nextPayload.job && nextPayload.job.status === "running") {{
+            schedulePump();
+          }}
+        }} catch (error) {{
+          schedulePump();
+        }} finally {{
+          pumpBusy = false;
+        }}
+      }};
+
+      schedulePump();
+      window.addEventListener("beforeunload", () => {{
+        if (pumpTimer) {{
+          window.clearTimeout(pumpTimer);
+        }}
+      }});
+    }})();
+    </script>
+    """
+
+
+def render_analysis_top_tabs(
+    form: AnalysisForm,
+    payload: dict[str, object] | None,
+) -> str:
+    summary = _dict(payload.get("summary")) if payload else {}
+    company_query = str(summary.get("company_query", "")).strip() or form.company_query
+    recent_years = str(summary.get("recent_years", form.recent_years or DEFAULT_RECENT_YEARS))
+    end_year = str(summary.get("end_year", form.end_year or default_end_year()))
+    threshold_percent = str(
+        summary.get("threshold_percent", form.threshold_percent or DEFAULT_THRESHOLD_PERCENT)
+    )
+    fs_div = _analysis_form_fs_div(form, summary)
+    current_analysis_href = _build_analysis_href(
+        company_query=company_query,
+        recent_years=recent_years,
+        end_year=end_year,
+        fs_div=fs_div,
+        threshold_percent=threshold_percent,
+        top_tab="financials",
+        fragment="financials-details",
+    )
+    compare_href = form.return_compare or _build_compare_href(
+        primary_company_query=company_query,
+        recent_years=recent_years,
+        end_year=end_year,
+        fs_div=fs_div,
+        threshold_percent=threshold_percent,
+    )
+    ranking_href = form.return_ranking or _build_ranking_href(
+        recent_years=recent_years,
+        end_year=end_year,
+        fs_div=fs_div,
+        threshold_percent=threshold_percent,
+        return_analysis=current_analysis_href,
+    )
+    db_update_href = form.return_db_update or _build_db_update_href(
+        recent_years=recent_years,
+        end_year=end_year,
+        fs_div=fs_div,
+        threshold_percent=threshold_percent,
+        return_analysis=current_analysis_href,
+    )
+    compare_href = _append_tab_return_params(
+        compare_href,
+        return_analysis=current_analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    ranking_href = _append_tab_return_params(
+        ranking_href,
+        return_analysis=current_analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    db_update_href = _append_tab_return_params(
+        db_update_href,
+        return_analysis=current_analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    current_analysis_href = _append_tab_return_params(
+        current_analysis_href,
+        return_analysis=current_analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    tabs = (
+        (
+            "재무정보",
+            current_analysis_href,
+            "financials",
+        ),
+        ("VS 기업비교", compare_href, "compare"),
+        ("기업필터", ranking_href, "ranking"),
+        ("DB 업데이트", db_update_href, "db-update"),
+    )
+    return render_top_tabs("financials", tabs)
+
+
+def render_compare_top_tabs(
+    form: CompareForm,
+    payload: dict[str, object] | None,
+) -> str:
+    primary_company = _dict(_dict(payload or {}).get("primary")).get("company")
+    secondary_company = _dict(_dict(payload or {}).get("secondary")).get("company")
+    primary_company_query = str(
+        form.primary_company_query or _dict(primary_company).get("corp_name", "")
+    )
+    secondary_company_query = str(
+        form.secondary_company_query or _dict(secondary_company).get("corp_name", "")
+    )
+    current_analysis_href = form.return_analysis or _build_analysis_href(
+        company_query=primary_company_query,
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        top_tab="financials",
+        fragment="financials-details",
+    )
+    current_compare_href = _build_compare_href(
+        primary_company_query=primary_company_query,
+        secondary_company_query=secondary_company_query,
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+    )
+    ranking_href = form.return_ranking or _build_ranking_href(
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+    )
+    db_update_href = form.return_db_update or _build_db_update_href(
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+    )
+    current_analysis_href = _append_tab_return_params(
+        current_analysis_href,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    current_compare_href = _append_tab_return_params(
+        current_compare_href,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    ranking_href = _append_tab_return_params(
+        ranking_href,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    db_update_href = _append_tab_return_params(
+        db_update_href,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    tabs = (
+        (
+            "재무정보",
+            current_analysis_href,
+            "financials",
+        ),
+        ("VS 기업비교", current_compare_href, "compare"),
+        ("기업필터", ranking_href, "ranking"),
+        ("DB 업데이트", db_update_href, "db-update"),
+    )
+    return render_top_tabs("compare", tabs)
+
+
+def render_ranking_top_tabs(form: RankingForm) -> str:
+    tabs = (
+        ("요약", "/", "overview"),
+        ("재무정보", "/", "financials"),
+        ("성장률", "/", "growth"),
+        ("VS 기업비교", _build_compare_href(primary_company_query="", recent_years=form.recent_years, end_year=form.end_year or str(default_end_year()), fs_div=form.fs_div, threshold_percent=form.threshold_percent), "compare"),
+        (
+            "랭킹/검색",
+            _build_ranking_href(
+                market=form.market,
+                recent_years=form.recent_years,
+                end_year=form.end_year or str(default_end_year()),
+                fs_div=form.fs_div,
+                threshold_percent=form.threshold_percent,
+            ),
+            "ranking",
+        ),
+    )
+    return render_top_tabs("ranking", tabs)
+
+
+def render_top_tabs(
+    active_tab: str,
+    tabs: Iterable[tuple[str, str, str]],
+) -> str:
+    def tab(label: str, href: str, key: str) -> str:
+        class_name = "top-tab is-active" if active_tab == key else "top-tab"
+        return f'<a class="{class_name}" href="{escape(href)}">{escape(label)}</a>'
+
+    return '<nav class="top-tabs" aria-label="화면 탭">' + "".join(
+        tab(label, href, key) for label, href, key in tabs
+    ) + "</nav>"
+
+
+def render_analysis_header(
+    form: AnalysisForm,
+    payload: dict[str, object] | None,
+) -> str:
+    company = _dict(payload.get("company")) if payload else {}
+    summary = _dict(payload.get("summary")) if payload else {}
+    query = str(summary.get("company_query", "")) if payload else form.company_query
+    compare_href = _build_compare_href(
+        primary_company_query=query or form.company_query,
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+    )
+    refresh_href = ""
+    if query or form.company_query:
+        refresh_href = _build_analysis_href(
+            company_query=query or form.company_query,
+            recent_years=form.recent_years,
+            end_year=form.end_year or str(default_end_year()),
+            fs_div=form.fs_div,
+            threshold_percent=form.threshold_percent,
+            top_tab=form.top_tab,
+            fragment=_analysis_tab_fragment(form.top_tab),
+            refresh=True,
+        )
+    refresh_link = (
+        f'<a class="ghost-link" href="{escape(refresh_href)}">재무 재수집</a>'
+        if refresh_href
+        else ""
+    )
+    return f"""
+    <section class="toolbar-surface">
+      <div class="section-tabs">
+        <span class="section-tab is-active">손익계산서</span>
+        <span class="section-tab">성장률 요약</span>
+        <a class="section-tab" href="{escape(compare_href)}">VS 비교 준비</a>
+      </div>
+      <form id="analysis-form" class="query-form" data-loading-form method="get" action="/analysis">
+        <input id="analysis-recent-years" type="hidden" name="recent_years" value="{escape(form.recent_years or str(DEFAULT_RECENT_YEARS))}">
+        <input type="hidden" name="tab" value="{escape(_normalize_analysis_tab(form.top_tab))}">
+        <label class="field field-grow">
+          <span>기업명</span>
+          <input name="company_query" value="{escape(form.company_query)}" placeholder="예: 삼성전자" required>
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input name="end_year" value="{escape(form.end_year or str(default_end_year()))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select name="fs_div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>기본 성장률</span>
+          <input name="threshold_percent" value="{escape(form.threshold_percent)}" inputmode="decimal">
+        </label>
+        <button id="submit-button" type="submit" class="primary-button">
+          <span data-submit-label>조회</span>
+          <span data-submit-loading hidden>조회 중...</span>
+        </button>
+      </form>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="segmented" role="group" aria-label="조회 연수">
+          {render_year_preset_button("3년", "3", form.recent_years, "analysis-form", "analysis-recent-years")}
+          {render_year_preset_button("5년", "5", form.recent_years, "analysis-form", "analysis-recent-years")}
+          {render_year_preset_button("10년", "10", form.recent_years, "analysis-form", "analysis-recent-years")}
+        </div>
+        {refresh_link}
+        <a class="ghost-link" href="{escape(compare_href)}">VS 기업비교 열기</a>
+        {render_toolbar_meta(company, form)}
+      </div>
+    </section>
+    """
+
+
+def render_compare_header(
+    form: CompareForm,
+    payload: dict[str, object] | None,
+) -> str:
+    primary = _dict(_dict(payload or {}).get("primary")).get("company")
+    analysis_href = _build_analysis_href(
+        company_query=str(form.primary_company_query or _dict(primary).get("corp_name", "")),
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+    )
+    return f"""
+    <section class="toolbar-surface">
+      <div class="section-tabs">
+        <a class="section-tab" href="{escape(analysis_href)}">재무정보</a>
+        <span class="section-tab is-active">VS 기업비교</span>
+        <span class="section-tab">비교 요약</span>
+      </div>
+      <form id="compare-form" class="query-form query-form-compare" data-loading-form method="get" action="/compare">
+        <input id="compare-recent-years" type="hidden" name="recent_years" value="{escape(form.recent_years or str(DEFAULT_RECENT_YEARS))}">
+        <label class="field field-grow">
+          <span>기준 기업</span>
+          <input name="primary_company_query" value="{escape(form.primary_company_query)}" placeholder="예: 비나텍" required>
+        </label>
+        <label class="field field-grow">
+          <span>비교 기업</span>
+          <input name="secondary_company_query" value="{escape(form.secondary_company_query)}" placeholder="예: 삼성전자" required>
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input name="end_year" value="{escape(form.end_year or str(default_end_year()))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select name="fs_div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>성장률 기준</span>
+          <input name="threshold_percent" value="{escape(form.threshold_percent)}" inputmode="decimal">
+        </label>
+        <button id="compare-submit-button" type="submit" class="primary-button">
+          <span data-submit-label>비교</span>
+          <span data-submit-loading hidden>비교 중...</span>
+        </button>
+      </form>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="segmented" role="group" aria-label="조회 연수">
+          {render_year_preset_button("3년", "3", form.recent_years, "compare-form", "compare-recent-years")}
+          {render_year_preset_button("5년", "5", form.recent_years, "compare-form", "compare-recent-years")}
+          {render_year_preset_button("10년", "10", form.recent_years, "compare-form", "compare-recent-years")}
+        </div>
+        <div class="toolbar-note">두 기업의 같은 기간 실적을 같은 축으로 비교합니다.</div>
+      </div>
+    </section>
+    """
+
+
+def render_ranking_header(form: RankingForm) -> str:
+    return f"""
+    <section class="toolbar-surface">
+      <div class="section-tabs">
+        <span class="section-tab is-active">랭킹/검색</span>
+        <span class="section-tab">성장률 + 시장정보</span>
+        <span class="section-tab">DB 캐시 기반</span>
+      </div>
+      <form id="ranking-form" class="query-form query-form-ranking" data-loading-form method="get" action="/ranking">
+        <input id="ranking-recent-years" type="hidden" name="recent_years" value="{escape(form.recent_years or str(DEFAULT_RECENT_YEARS))}">
+        <label class="field">
+          <span>시장</span>
+          <select name="market">
+            {_option("ALL", "전체", form.market)}
+            {_option("KOSPI", "KOSPI", form.market)}
+            {_option("KOSDAQ", "KOSDAQ", form.market)}
+          </select>
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input name="end_year" value="{escape(form.end_year or str(default_end_year()))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select name="fs_div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>성장률 기준</span>
+          <input name="threshold_percent" value="{escape(form.threshold_percent)}" inputmode="decimal">
+        </label>
+        <button id="ranking-submit-button" type="submit" class="primary-button">
+          <span data-submit-label>조회</span>
+          <span data-submit-loading hidden>조회 중...</span>
+        </button>
+      </form>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="segmented" role="group" aria-label="조회 연수">
+          {render_year_preset_button("3년", "3", form.recent_years, "ranking-form", "ranking-recent-years")}
+          {render_year_preset_button("5년", "5", form.recent_years, "ranking-form", "ranking-recent-years")}
+          {render_year_preset_button("10년", "10", form.recent_years, "ranking-form", "ranking-recent-years")}
+        </div>
+        <div class="toolbar-note">기본 성장률 게이트는 최근 {escape(form.recent_years or str(DEFAULT_RECENT_YEARS))}년 연간 매출 YoY입니다.</div>
+      </div>
+    </section>
+    """
+
+
+def render_year_preset_button(
+    label: str,
+    years: str,
+    current_years: str,
+    form_id: str,
+    input_id: str,
+) -> str:
+    class_name = (
+        "segmented-button is-active"
+        if years == (current_years or str(DEFAULT_RECENT_YEARS))
+        else "segmented-button"
+    )
+    return (
+        f'<button type="button" class="{class_name}" '
+        f'data-year-preset="{escape(years)}" '
+        f'data-year-form="{escape(form_id)}" '
+        f'data-year-input="{escape(input_id)}">{escape(label)}</button>'
+    )
+
+
+def render_toolbar_meta(company: dict[str, object], form: AnalysisForm) -> str:
+    pills = []
+    if company:
+        pills.append(
+            f'<span class="inline-pill">{escape(_company_title(company))}</span>'
+        )
+    pills.append(f'<span class="inline-pill">최근 {escape(form.recent_years)}년</span>')
+    pills.append(f'<span class="inline-pill">기준 {escape(form.end_year or str(default_end_year()))}</span>')
+    return f'<div class="toolbar-meta">{"".join(pills)}</div>'
+
+
+def render_cache_status_pill(summary: dict[str, object]) -> str:
+    status = str(summary.get("cache_status", "") or "").strip()
+    if not status:
+        return ""
+    class_name = "inline-pill"
+    if status == "DB 캐시 사용":
+        class_name = "inline-pill inline-pill-accent"
+    elif "OpenDART 신규 수집" in status or "OpenDART 강제 재수집" in status:
+        class_name = "inline-pill inline-pill-contrast"
+    return f'<span class="{class_name}">{escape(status)}</span>'
+
+
+def render_market_profile_pills(
+    profile: dict[str, object],
+    *,
+    unavailable_status: str = "",
+) -> str:
+    if not profile:
+        if not unavailable_status:
+            return ""
+        return (
+            '<span class="inline-pill inline-pill-muted">'
+            f"{escape(unavailable_status)}"
+            "</span>"
+        )
+
+    pills: list[str] = []
+    market = str(profile.get("market", "") or "").strip()
+    if market:
+        pills.append(f'<span class="inline-pill">{escape(market)}</span>')
+
+    close_price = _format_won(profile.get("close_price"))
+    if close_price != "-":
+        pills.append(f'<span class="inline-pill">전일 종가 {escape(close_price)}</span>')
+
+    market_cap = _format_market_cap(profile.get("market_cap"))
+    if market_cap != "-":
+        pills.append(f'<span class="inline-pill">시가총액 {escape(market_cap)}</span>')
+
+    base_date = _format_base_date(profile.get("base_date"))
+    if base_date:
+        pills.append(f'<span class="inline-pill">기준 {escape(base_date)}</span>')
+
+    return "".join(pills)
+
+
+def render_valuation_profile_pills(
+    profile: dict[str, object],
+    *,
+    unavailable_status: str = "",
+) -> str:
+    if not profile:
+        return ""
+
+    eps = _format_ratio(profile.get("eps"), suffix="원")
+    if eps == "-":
+        return ""
+    return f'<span class="inline-pill">EPS {escape(eps)}</span>'
+
+
+def render_compare_company_meta(
+    company: dict[str, object],
+    profile: dict[str, object],
+    *,
+    accent_class: str,
+    valuation_profile: dict[str, object] | None = None,
+    unavailable_status: str = "",
+) -> str:
+    pills = [f'<span class="inline-pill {accent_class}">{escape(_company_name(company))}</span>']
+    pills_html = render_market_profile_pills(
+        profile,
+        unavailable_status=unavailable_status,
+    )
+    if pills_html:
+        pills.append(pills_html)
+    valuation_pills = render_valuation_profile_pills(
+        _dict(valuation_profile),
+        unavailable_status="",
+    )
+    if valuation_pills:
+        pills.append(valuation_pills)
+    return f'<div class="compare-company-meta">{"".join(pills)}</div>'
+
+
+def render_message(error: str | None = None, info: str | None = None) -> str:
+    if error:
+        return f'<section class="notice error">{escape(error)}</section>'
+    if info:
+        return f'<section class="notice info">{escape(info)}</section>'
+    return ""
+
+
+def render_analysis_empty_state() -> str:
+    return """
+    <section class="empty-state panel">
+      <h2>재무정보 대시보드</h2>
+      <p>기업명을 입력하면 최근 N년 동안의 연간, 분기, 4분기 누적 실적과 YoY 성장률을 숫자와 차트로 바로 보여줍니다.</p>
+      <ul class="empty-list">
+        <li>상단 툴바에서 연결/별도와 기준 연도를 조정할 수 있습니다.</li>
+        <li>오른쪽 상단 탭에서 VS 기업비교 화면으로 바로 넘어갈 수 있습니다.</li>
+        <li>분기 화면에서는 YoY와 QoQ를 함께 볼 수 있습니다.</li>
+      </ul>
+    </section>
+    """
+
+
+def render_browser_report(
+    payload: dict[str, object],
+    *,
+    top_tab: str = DEFAULT_ANALYSIS_TAB,
+) -> str:
+    company = _dict(payload.get("company"))
+    summary = _dict(payload.get("summary"))
+    market_profile = _dict(payload.get("market_profile"))
+    valuation_profile = _dict(payload.get("valuation_profile"))
+    period_groups = [_dict(group) for group in _list(payload.get("period_groups"))]
+    initial_metric = _default_metric_for_period_groups(period_groups)
+    compare_href = _build_compare_href(
+        primary_company_query=str(summary.get("company_query", "")),
+        recent_years=str(summary.get("recent_years", DEFAULT_RECENT_YEARS)),
+        end_year=str(summary.get("end_year", default_end_year())),
+        fs_div="CFS" if str(summary.get("fs_div", "전체")) == "연결" else (
+            "OFS" if str(summary.get("fs_div", "전체")) == "별도" else "ALL"
+        ),
+        threshold_percent=str(summary.get("threshold_percent", DEFAULT_THRESHOLD_PERCENT)),
+    )
+    refresh_href = _build_analysis_href(
+        company_query=str(summary.get("company_query", "")),
+        recent_years=str(summary.get("recent_years", DEFAULT_RECENT_YEARS)),
+        end_year=str(summary.get("end_year", default_end_year())),
+        fs_div="CFS" if str(summary.get("fs_div", "전체")) == "연결" else (
+            "OFS" if str(summary.get("fs_div", "전체")) == "별도" else "ALL"
+        ),
+        threshold_percent=str(summary.get("threshold_percent", DEFAULT_THRESHOLD_PERCENT)),
+        top_tab=top_tab,
+        fragment=_analysis_tab_fragment(top_tab),
+        refresh=True,
+    )
+
+    return f"""
+    <section class="report-shell" data-dashboard data-initial-period="{DEFAULT_PERIOD_KEY}" data-initial-metric="{escape(initial_metric)}">
+      <section class="company-header panel">
+        <div>
+          <h2>{escape(_company_title(company))}</h2>
+          <p>고유번호 {escape(str(company.get("corp_code", "")))} · 조회 기간 {escape(str(summary.get("start_year", "")))}-{escape(str(summary.get("end_year", "")))} · 재무제표 {escape(str(summary.get("fs_div", "")))}</p>
+        </div>
+        <div class="company-actions">
+          {render_market_profile_pills(market_profile, unavailable_status=str(summary.get("market_profile_status", "")))}
+          {render_valuation_profile_pills(valuation_profile, unavailable_status=str(summary.get("valuation_profile_status", "")))}
+          {render_cache_status_pill(summary)}
+          <span class="inline-pill">원천 row {escape(str(summary.get("raw_rows", 0)))}개</span>
+          <span class="inline-pill">성장률 {escape(str(summary.get("growth_points", 0)))}개</span>
+          <a class="ghost-link" href="{escape(refresh_href)}">재무 재수집</a>
+          <a class="ghost-link" href="{escape(compare_href)}">이 기업으로 비교 시작</a>
+        </div>
+      </section>
+      {render_collection_errors(_list(payload.get("collection_errors")))}
+      {render_dashboard_toolbar()}
+      <section id="overview-summary" class="overview-layout">
+        <section class="panel">
+          <div class="panel-heading">
+            <h3>최근 구간 요약</h3>
+            <p>선택한 기간 기준으로 최근 5개 구간의 금액과 성장률을 정리했습니다.</p>
+          </div>
+          {"".join(render_snapshot_matrix(_dict(group)) for group in period_groups)}
+        </section>
+        <section class="panel">
+          <div class="panel-heading panel-heading-split">
+            <div>
+              <h3>대표 차트</h3>
+              <p>기간과 지표를 바꾸면 오른쪽 차트가 바로 바뀝니다.</p>
+            </div>
+            {render_metric_switches(period_groups, initial_metric=initial_metric)}
+          </div>
+          {"".join(render_focus_panel(group, initial_metric=initial_metric) for group in period_groups)}
+        </section>
+      </section>
+      <section class="panel">
+        <div class="panel-heading">
+          <h3>성장률 필터 결과</h3>
+          <p>선택한 기간별로 최근 구간 최소 성장률과 통과 여부를 요약했습니다.</p>
+        </div>
+      </section>
+      <section id="financials-details" class="dashboard-grid">
+        {"".join(render_period_grid(_dict(group), compare_href) for group in period_groups)}
+      </section>
+      <section id="growth-details" class="growth-section">
+        <details class="panel"{" open" if top_tab == "growth" else ""}>
+          <summary>성장률 상세 보기</summary>
+          {render_growth_sections(_list(payload.get("growth_sections")))}
+        </details>
+      </section>
+    </section>
+    """
+
+
+def render_dashboard_toolbar() -> str:
+    period_buttons = []
+    for group in PERIOD_DEFS:
+        class_name = (
+            "segmented-button is-active"
+            if group["key"] == DEFAULT_PERIOD_KEY
+            else "segmented-button"
+        )
+        period_buttons.append(
+            f'<button type="button" class="{class_name}" data-period-toggle="{escape(str(group["key"]))}">{escape(str(group["label"]))}</button>'
+        )
+    return (
+        '<section class="toolbar-surface toolbar-surface-tight">'
+        '<div class="toolbar-row toolbar-row-dense">'
+        '<div class="segmented" role="group" aria-label="표시 기간">'
+        f'{"".join(period_buttons)}'
+        "</div>"
+        '<div class="toolbar-note">분기 / 4분기 누적 / 연간 데이터를 같은 구성으로 비교할 수 있습니다.</div>'
+        "</div>"
+        "</section>"
+    )
+
+
+def render_metric_switches(
+    period_groups: list[dict[str, object]],
+    *,
+    initial_metric: str,
+) -> str:
+    metric_periods: dict[str, list[str]] = {}
+    for group in period_groups:
+        period_key = str(group.get("key", ""))
+        for metric in _metrics_for_group(group):
+            metric_periods.setdefault(metric, []).append(period_key)
+
+    buttons = []
+    for metric in METRIC_SEQUENCE:
+        periods = metric_periods.get(metric, [])
+        if not periods:
+            continue
+        class_name = (
+            "metric-switch is-active"
+            if metric == initial_metric
+            else "metric-switch"
+        )
+        buttons.append(
+            f'<button type="button" class="{class_name}" data-metric-toggle="{escape(metric)}" data-metric-periods="{escape(",".join(periods))}">{escape(METRIC_LABELS.get(metric, metric))}</button>'
+        )
+    return f'<div class="metric-switches">{"".join(buttons)}</div>'
+
+
+def _available_metrics_for_rows(rows: list[object]) -> tuple[str, ...]:
+    metrics = {
+        metric
+        for row in rows
+        for metric, cell in _dict(_dict(row).get("values")).items()
+        if _to_decimal(_dict(cell).get("amount")) is not None
+    }
+    return tuple(sorted(metrics, key=lambda metric: METRIC_ORDER.get(metric, 999)))
+
+
+def _display_metrics_for_rows(
+    period_key: str,
+    rows: list[object],
+) -> tuple[str, ...]:
+    available = set(_available_metrics_for_rows(rows))
+    return tuple(
+        metric
+        for metric in PERIOD_METRIC_SEQUENCE.get(period_key, METRIC_SEQUENCE)
+        if metric in available
+    )
+
+
+def _metrics_for_group(group: dict[str, object]) -> tuple[str, ...]:
+    period_key = str(group.get("key", ""))
+    rows = _list(group.get("rows"))
+    if rows:
+        return _display_metrics_for_rows(period_key, rows)
+
+    primary_rows = _list(group.get("primary_rows"))
+    secondary_rows = _list(group.get("secondary_rows"))
+    available = set(_available_metrics_for_rows(primary_rows))
+    available.update(_available_metrics_for_rows(secondary_rows))
+    return tuple(
+        metric
+        for metric in PERIOD_METRIC_SEQUENCE.get(period_key, METRIC_SEQUENCE)
+        if metric in available
+    )
+
+
+def _default_metric_for_period_groups(groups: list[dict[str, object]]) -> str:
+    for group in groups:
+        if str(group.get("key", "")) != DEFAULT_PERIOD_KEY:
+            continue
+        metrics = _metrics_for_group(group)
+        if DEFAULT_METRIC_KEY in metrics:
+            return DEFAULT_METRIC_KEY
+        if metrics:
+            return metrics[0]
+    return DEFAULT_METRIC_KEY
+
+
+def render_snapshot_matrix(group: dict[str, object]) -> str:
+    rows = [_dict(row) for row in reversed(_list(group.get("rows"))[:5])]
+    metrics = _available_metrics_for_rows(rows)
+    headers = "".join(
+        f"<th>{escape(str(row.get('period', '')))}</th>"
+        for row in rows
+    )
+    body = []
+    for metric in metrics:
+        cells = []
+        for row in rows:
+            cell = _dict(_dict(row.get("values")).get(metric))
+            growth = _growth_class(cell.get("growth_rate"))
+            cells.append(
+                "<td>"
+                f'<div class="matrix-amount">{escape(_format_chart_amount(cell.get("amount")))}</div>'
+                f'<div class="matrix-growth {growth}">{escape(_format_percent(cell.get("growth_rate")))}</div>'
+                "</td>"
+            )
+        body.append(
+            "<tr>"
+            f"<th>{escape(METRIC_LABELS.get(metric, metric))}</th>"
+            f"{''.join(cells)}"
+            "</tr>"
+        )
+
+    return (
+        f'<div class="period-panel" data-panel data-period="{escape(str(group.get("key", "")))}"'
+        f' {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
+        f'<div class="matrix-heading">{escape(str(group.get("label", "")))}</div>'
+        "<table class=\"matrix-table\">"
+        f"<thead><tr><th>지표</th>{headers}</tr></thead>"
+        f"<tbody>{''.join(body)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
+def render_focus_panel(
+    group: dict[str, object],
+    *,
+    initial_metric: str,
+) -> str:
+    rows = _list(group.get("rows"))
+    panels = []
+    for metric in _metrics_for_group(group):
+        panels.append(
+            f'<div class="chart-focus-panel" data-panel data-period="{escape(str(group.get("key", "")))}" '
+            f'data-metric="{escape(metric)}" {"hidden" if not (group.get("key") == DEFAULT_PERIOD_KEY and metric == initial_metric) else ""}>'
+            f'{render_metric_amount_chart(metric, rows, period_key=str(group.get("key", "")), growth_label=str(group.get("growth_label", "")), include_qoq=bool(group.get("include_qoq")), width=820, height=350)}'
+            "</div>"
+        )
+    return "".join(panels)
+
+
+def render_period_grid(group: dict[str, object], compare_href: str) -> str:
+    rows = _list(group.get("rows"))
+    cards = []
+    for metric in _available_metrics_for_rows(rows):
+        cards.append(
+            f'<article class="panel grid-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
+            f'<div class="panel-heading"><h3>{escape(str(group.get("label", "")))} · {escape(METRIC_LABELS.get(metric, metric))}</h3></div>'
+            f'{render_metric_amount_chart(metric, rows, period_key=str(group.get("key", "")), growth_label=str(group.get("growth_label", "")), include_qoq=bool(group.get("include_qoq")), width=540, height=320)}'
+            "</article>"
+        )
+
+    cards.append(
+        f'<article class="panel info-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
+        f'<div class="panel-heading"><h3>{escape(str(group.get("label", "")))} 필터 상태</h3></div>'
+        f'{render_filter_results_for_group(_list(group.get("filter_results")))}'
+        '<div class="info-card-footer">'
+        f'<a class="ghost-link" href="{escape(compare_href)}">이 구간으로 VS 비교 이어가기</a>'
+        "</div>"
+        "</article>"
+    )
+
+    return "".join(cards)
+
+
+def render_compare_empty_state(form: CompareForm) -> str:
+    preset = escape(form.primary_company_query or "비나텍")
+    return f"""
+    <section class="empty-state panel">
+      <h2>VS 기업비교</h2>
+      <p>두 기업의 같은 기간 실적을 같은 화면에서 비교합니다. 기준 기업 하나만 정해둔 상태라면 비교 기업만 추가해도 됩니다.</p>
+      <ul class="empty-list">
+        <li>예: 기준 기업을 {preset}으로 두고, 비교 기업에 삼성전자를 넣어 보세요.</li>
+        <li>기간 토글은 재무정보 화면과 같은 방식으로 동작합니다.</li>
+        <li>비교 차트는 같은 축에서 두 회사의 추세를 보여줍니다.</li>
+      </ul>
+    </section>
+    """
+
+
+def render_ranking_empty_state() -> str:
+    return """
+    <section class="empty-state panel">
+      <h2>기업필터</h2>
+      <p>조건을 설정한 뒤 조회를 누르면, DB에 저장된 재무 데이터와 시장 정보 스냅샷을 기준으로 조건에 맞는 기업을 보여줍니다.</p>
+      <ul class="empty-list">
+        <li>먼저 재무정보 화면에서 몇 개 기업을 조회해 DB 캐시를 채워 주세요.</li>
+        <li>회사 목록 동기화와 배치 업데이트는 DB 업데이트 페이지에서 진행할 수 있습니다.</li>
+      </ul>
+    </section>
+    """
+
+
+def render_ranking_results(payload: dict[str, object]) -> str:
+    summary = _dict(payload.get("summary"))
+    filters = _dict(payload.get("filters"))
+    rows = [_dict(row) for row in _list(payload.get("screening_rows"))]
+    info_html = (
+        f'<div class="toolbar-note">DB {escape(str(summary.get("database", "")))} 쨌 '
+        f'{escape(str(summary.get("screening_rows", 0)))}개 기업</div>'
+    )
+    if not rows:
+        return f"""
+        <section class="panel">
+          <div class="panel-heading">
+            <h3>조건에 맞는 기업이 없습니다</h3>
+            <p>DB에 데이터가 아직 적거나, 최근 연간 매출 성장률 기준을 만족하는 기업이 없을 수 있습니다.</p>
+          </div>
+          {info_html}
+        </section>
+        """
+
+    table_rows = []
+    for row in rows:
+        analysis_href = _build_analysis_href(
+            company_query=str(row.get("corp_name", "") or row.get("stock_code", "")),
+            recent_years=str(filters.get("recent_annual_periods", DEFAULT_RECENT_YEARS)),
+            end_year=str(summary.get("end_year", default_end_year())),
+            fs_div=str(filters.get("fs_div", "CFS") or "ALL"),
+            threshold_percent=str(filters.get("threshold_percent", DEFAULT_THRESHOLD_PERCENT)),
+            top_tab="financials",
+            fragment="financials-details",
+        )
+        table_rows.append(
+            "<tr>"
+            f'<td><a class="table-link" href="{escape(analysis_href)}">{escape(str(row.get("corp_name", "")))}</a></td>'
+            f'<td>{escape(str(row.get("market", "") or "-"))}</td>'
+            f'<td>{escape(_format_won(row.get("close_price")))}</td>'
+            f'<td>{escape(_format_market_cap(row.get("market_cap")))}</td>'
+            f'<td>{escape(_format_ratio(row.get("eps"), suffix="원"))}</td>'
+            f'<td>{escape(str(row.get("minimum_growth_rate", "-")))}%</td>'
+            f'<td>{("통과" if row.get("passed") else "실패")}</td>'
+            "</tr>"
+        )
+
+    return f"""
+    <section class="panel">
+      <div class="panel-heading panel-heading-split">
+        <div>
+          <h3>성장률 랭킹</h3>
+          <p>최근 연간 매출 성장률을 먼저 통과한 기업을 시가총액 순으로 정렬합니다.</p>
+        </div>
+        {info_html}
+      </div>
+      <div class="table-scroll">
+        <table class="screening-table">
+          <thead>
+            <tr>
+              <th>기업명</th>
+              <th>시장</th>
+              <th>전일 종가</th>
+              <th>시가총액</th>
+              <th>EPS</th>
+              <th>최소 성장률</th>
+              <th>통과</th>
+            </tr>
+          </thead>
+          <tbody>{''.join(table_rows)}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def render_compare_dashboard(payload: dict[str, object]) -> str:
+    primary = _dict(payload.get("primary"))
+    secondary = _dict(payload.get("secondary"))
+    primary_company = _dict(primary.get("company"))
+    secondary_company = _dict(secondary.get("company"))
+    primary_market_profile = _dict(primary.get("market_profile"))
+    secondary_market_profile = _dict(secondary.get("market_profile"))
+    primary_valuation_profile = _dict(primary.get("valuation_profile"))
+    secondary_valuation_profile = _dict(secondary.get("valuation_profile"))
+    primary_summary = _dict(primary.get("summary"))
+    secondary_summary = _dict(secondary.get("summary"))
+    summary = _dict(payload.get("summary"))
+    period_groups = [_dict(group) for group in _build_compare_period_groups(primary, secondary)]
+    initial_metric = _default_metric_for_period_groups(period_groups)
+
+    return f"""
+    <section class="report-shell" data-dashboard data-initial-period="{DEFAULT_PERIOD_KEY}" data-initial-metric="{escape(initial_metric)}">
+      <section class="company-header panel">
+        <div>
+          <h2>{escape(_company_name(primary_company))} VS {escape(_company_name(secondary_company))}</h2>
+          <p>조회 기간 {escape(str(summary.get("recent_years", DEFAULT_RECENT_YEARS)))}년 · 기준 연도 {escape(str(summary.get("end_year", default_end_year())))} · 재무제표 {escape(str(summary.get("fs_div", "")))}</p>
+        </div>
+        <div class="company-actions company-actions-compare">
+          {render_compare_company_meta(primary_company, primary_market_profile, valuation_profile=primary_valuation_profile, accent_class="inline-pill-accent", unavailable_status=str(primary_summary.get("market_profile_status", "")))}
+          {render_compare_company_meta(secondary_company, secondary_market_profile, valuation_profile=secondary_valuation_profile, accent_class="inline-pill-contrast", unavailable_status=str(secondary_summary.get("market_profile_status", "")))}
+        </div>
+      </section>
+      {render_dashboard_toolbar()}
+      <section class="overview-layout compare-overview">
+        <section class="panel">
+          <div class="panel-heading">
+            <h3>최근 값 비교</h3>
+            <p>선택한 기간의 최신 구간을 기준으로 두 회사를 비교합니다.</p>
+          </div>
+          {"".join(render_compare_latest_cards(_dict(group), primary_company, secondary_company) for group in period_groups)}
+        </section>
+        <section class="panel">
+          <div class="panel-heading panel-heading-split">
+            <div>
+              <h3>대표 비교 차트</h3>
+              <p>같은 구간, 같은 지표를 한 축에서 비교합니다.</p>
+            </div>
+            {render_metric_switches(period_groups, initial_metric=initial_metric)}
+          </div>
+          {"".join(render_compare_focus_panel(group, primary_company, secondary_company, initial_metric=initial_metric) for group in period_groups)}
+        </section>
+      </section>
+      <section class="dashboard-grid">
+        {"".join(render_compare_grid(group, primary_company, secondary_company) for group in period_groups)}
+      </section>
+    </section>
+    """
+
+
+def render_compare_latest_cards(
+    group: dict[str, object],
+    primary_company: dict[str, object],
+    secondary_company: dict[str, object],
+) -> str:
+    latest_left = _dict(_list(group.get("primary_rows"))[:1][0]) if _list(group.get("primary_rows")) else {}
+    latest_right = _dict(_list(group.get("secondary_rows"))[:1][0]) if _list(group.get("secondary_rows")) else {}
+    cards = []
+    for metric in _metrics_for_group(group):
+        left_cell = _dict(_dict(latest_left.get("values")).get(metric))
+        right_cell = _dict(_dict(latest_right.get("values")).get(metric))
+        delta = _subtract_decimal(left_cell.get("amount"), right_cell.get("amount"))
+        cards.append(
+            '<article class="compare-stat-card">'
+            f'<div class="compare-stat-title">{escape(METRIC_LABELS.get(metric, metric))}</div>'
+            f'<div class="compare-stat-period">{escape(str(latest_left.get("period") or latest_right.get("period") or "-"))}</div>'
+            f'<div class="compare-stat-row"><span>{escape(_company_name(primary_company))}</span><strong>{escape(_format_chart_amount(left_cell.get("amount")))}</strong><em>{escape(_format_percent(left_cell.get("growth_rate")))}</em></div>'
+            f'<div class="compare-stat-row"><span>{escape(_company_name(secondary_company))}</span><strong>{escape(_format_chart_amount(right_cell.get("amount")))}</strong><em>{escape(_format_percent(right_cell.get("growth_rate")))}</em></div>'
+            f'<div class="compare-stat-delta">차이 {escape(_format_chart_amount(delta))}</div>'
+            "</article>"
+        )
+    return (
+        f'<div class="period-panel compare-stat-grid" data-panel data-period="{escape(str(group.get("key", "")))}"'
+        f' {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
+        f"{''.join(cards)}"
+        "</div>"
+    )
+
+
+def render_compare_focus_panel(
+    group: dict[str, object],
+    primary_company: dict[str, object],
+    secondary_company: dict[str, object],
+    *,
+    initial_metric: str,
+) -> str:
+    panels = []
+    for metric in _metrics_for_group(group):
+        chart_title = f"{group.get('label')} · {METRIC_LABELS.get(metric, metric)} 비교"
+        panels.append(
+            f'<div class="chart-focus-panel" data-panel data-period="{escape(str(group.get("key", "")))}" data-metric="{escape(metric)}" '
+            f'{"hidden" if not (group.get("key") == DEFAULT_PERIOD_KEY and metric == initial_metric) else ""}>'
+            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), period_key=str(group.get("key", "")), primary_name=_company_name(primary_company), secondary_name=_company_name(secondary_company), title=chart_title)}'
+            "</div>"
+        )
+    return "".join(panels)
+
+
+def render_compare_grid(
+    group: dict[str, object],
+    primary_company: dict[str, object],
+    secondary_company: dict[str, object],
+) -> str:
+    cards = []
+    for metric in _metrics_for_group(group):
+        chart_title = f"{group.get('label')} · {METRIC_LABELS.get(metric, metric)}"
+        cards.append(
+            f'<article class="panel grid-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
+            f'{render_compare_metric_chart(metric, _list(group.get("primary_rows")), _list(group.get("secondary_rows")), period_key=str(group.get("key", "")), primary_name=_company_name(primary_company), secondary_name=_company_name(secondary_company), title=chart_title)}'
+            "</article>"
+        )
+    cards.append(
+        f'<article class="panel info-card" data-panel data-period="{escape(str(group.get("key", "")))}" {"hidden" if str(group.get("key")) != DEFAULT_PERIOD_KEY else ""}>'
+        f'<div class="panel-heading"><h3>{escape(str(group.get("label", "")))} 최근 비교 표</h3></div>'
+        f'{render_compare_table(_list(group.get("primary_rows")), _list(group.get("secondary_rows")), _company_name(primary_company), _company_name(secondary_company), period_key=str(group.get("key", "")))}'
+        "</article>"
+    )
+    return "".join(cards)
+
+
+def render_filter_results_for_group(results: list[object]) -> str:
+    if not results:
+        return '<p class="empty">표시할 필터 결과가 없습니다.</p>'
+
+    rows = []
+    for item in results:
+        result = _dict(item)
+        rows.append(
+            '<div class="filter-row">'
+            f'<span>{escape(METRIC_LABELS.get(str(result.get("metric", "")), str(result.get("metric", ""))))}</span>'
+            f'<strong>{escape(_format_percent(result.get("minimum_growth_rate")))}</strong>'
+            f'<em class="{_pass_class(result.get("passed"))}">{escape("통과" if result.get("passed") is True else "미통과")}</em>'
+            "</div>"
+        )
+    return f'<div class="filter-list">{"".join(rows)}</div>'
+
+
+def render_growth_sections(sections: list[object]) -> str:
+    if not sections:
+        return '<p class="empty">표시할 성장률 데이터가 없습니다.</p>'
+
+    rendered = []
+    for item in sections:
+        section = _dict(item)
+        points = [_dict(point) for point in _list(section.get("points"))]
+        metric_label = str(section.get("metric_label", ""))
+        series_label = str(section.get("series_label", ""))
+        rendered.append(
+            f"""
+            <section class="growth-series">
+              <div class="panel-heading">
+                <h3>{escape(metric_label)} · {escape(series_label)}</h3>
+                <p>성장률 흐름과 기간별 원본 값을 함께 확인할 수 있습니다.</p>
+              </div>
+              {render_growth_detail_chart(points, metric_label=metric_label, series_label=series_label)}
+              <div class="growth-table-wrap">
+                {render_growth_table(points)}
+              </div>
+            </section>
+            """
+        )
+    return "\n".join(rendered)
+
+
+def render_growth_table(points: list[dict[str, object]]) -> str:
+    rows = []
+    for point in reversed(points):
+        growth_rate = point.get("growth_rate")
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(point.get('period_label', '')))}</td>"
+            f"<td>{_format_amount(point.get('amount'))}</td>"
+            f"<td>{_format_amount(point.get('base_amount'))}</td>"
+            f'<td><span class="growth-value {_growth_class(growth_rate)}">{escape(_format_percent(growth_rate))}</span></td>'
+            "</tr>"
+        )
+    return (
+        '<table class="growth-table">'
+        "<thead><tr><th>기간</th><th>금액</th><th>비교 기준 금액</th><th>성장률</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+    )
+
+
+def render_growth_detail_chart(
+    points: list[dict[str, object]],
+    *,
+    metric_label: str,
+    series_label: str,
+    width: int = 920,
+    height: int = 340,
+) -> str:
+    chart_points = [
+        (index, _to_decimal(point.get("growth_rate")))
+        for index, point in enumerate(points)
+    ]
+    numeric_points = [(index, value) for index, value in chart_points if value is not None]
+    if not numeric_points:
+        return '<p class="empty">표시할 성장률 차트 데이터가 없습니다.</p>'
+
+    left = 64
+    right = 28
+    top = 24
+    bottom = 52
+    values = [value for _, value in numeric_points]
+    min_value = min(values + [Decimal("0")])
+    max_value = max(values + [Decimal("0")])
+    if min_value == max_value:
+        min_value -= Decimal("1")
+        max_value += Decimal("1")
+
+    padding = (max_value - min_value) * Decimal("0.10")
+    if padding == 0:
+        padding = Decimal("1")
+    min_value -= padding
+    max_value += padding
+
+    def x_for(index: int) -> Decimal:
+        if len(points) == 1:
+            return Decimal(left + (width - left - right) / 2)
+        return Decimal(left) + (
+            Decimal(index)
+            / Decimal(len(points) - 1)
+            * Decimal(width - left - right)
+        )
+
+    def y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + (
+            (max_value - value)
+            / (max_value - min_value)
+            * Decimal(height - top - bottom)
+        )
+
+    tick_count = 5
+    tick_values = [
+        min_value + (max_value - min_value) * Decimal(step) / Decimal(tick_count - 1)
+        for step in range(tick_count)
+    ]
+    tick_values = list(reversed(tick_values))
+
+    grid_lines = []
+    axis_labels = []
+    for tick in tick_values:
+        y = y_for(tick)
+        grid_lines.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#eceff8" />'
+        )
+        axis_labels.append(
+            f'<line x1="{left - 6}" y1="{_svg_number(y)}" x2="{left}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#64748b" text-anchor="end">{escape(_format_percent(tick))}</text>'
+        )
+
+    coordinates: list[str] = []
+    markers: list[str] = []
+    for index, value in numeric_points:
+        x = x_for(index)
+        y = y_for(value)
+        coordinates.append(f"{_svg_number(x)},{_svg_number(y)}")
+        tooltip = (
+            f"{metric_label} · {series_label} · {points[index].get('period_label', '')} · "
+            f"금액 {_format_amount(points[index].get('amount'))} · "
+            f"비교 기준 금액 {_format_amount(points[index].get('base_amount'))} · "
+            f"성장률 {_format_percent(value)}"
+        )
+        markers.append(
+            "<g>"
+            f"<title>{escape(tooltip)}</title>"
+            f'<circle cx="{_svg_number(x)}" cy="{_svg_number(y)}" r="2.75" fill="#c4b5fd" stroke="#ffffff" stroke-width="1.0" />'
+            "</g>"
+        )
+
+    line_markup = ""
+    if len(coordinates) >= 2:
+        line_markup = (
+            f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="#c4b5fd" '
+            'stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" />'
+        )
+
+    zero_y = y_for(Decimal("0"))
+    axis_bottom = height - bottom
+    x_label_stride = max(1, len(points) // 8)
+    x_labels = []
+    for index, point in enumerate(points):
+        if not _should_render_x_label(index, len(points), x_label_stride):
+            continue
+        x = x_for(index)
+        x_labels.append(
+            f'<line x1="{_svg_number(x)}" y1="{axis_bottom}" x2="{_svg_number(x)}" y2="{axis_bottom + 6}" stroke="#94a3b8" />'
+            f'<text x="{_svg_number(x)}" y="{axis_bottom + 22}" font-size="12" fill="#64748b" text-anchor="middle">{escape(_truncate_label(str(point.get("period_label", "")), 12))}</text>'
+        )
+
+    return f"""
+    <svg class="growth-detail-chart amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(metric_label)} {escape(series_label)} 성장률 차트">
+      {''.join(grid_lines)}
+      <line x1="{left}" y1="{_svg_number(zero_y)}" x2="{width - right}" y2="{_svg_number(zero_y)}" stroke="#ddd6fe" stroke-dasharray="4 4" />
+      <line x1="{left}" y1="{top}" x2="{left}" y2="{axis_bottom}" stroke="#94a3b8" />
+      <line x1="{left}" y1="{axis_bottom}" x2="{width - right}" y2="{axis_bottom}" stroke="#cbd5e1" />
+      {''.join(axis_labels)}
+      {line_markup}
+      {''.join(markers)}
+      {''.join(x_labels)}
+    </svg>
+    """
+
+
+def render_collection_errors(errors: list[object]) -> str:
+    if not errors:
+        return ""
+
+    rows = []
+    for item in errors:
+        error = _dict(item)
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(error.get('business_year', '')))}</td>"
+            f"<td>{escape(str(error.get('report_code', '')))}</td>"
+            f"<td>{escape(str(error.get('error_type', '')))}</td>"
+            f"<td>{escape(str(error.get('message', '')))}</td>"
+            "</tr>"
+        )
+
+    return (
+        '<section class="notice error">'
+        "<h3>수집 오류</h3>"
+        "<table>"
+        "<thead><tr><th>연도</th><th>보고서</th><th>유형</th><th>메시지</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+        "</section>"
+    )
+
+
+def render_metric_amount_chart(
+    metric: str,
+    rows: list[object],
+    *,
+    period_key: str,
+    growth_label: str,
+    include_qoq: bool,
+    width: int = 920,
+    height: int = 360,
+) -> str:
+    chart_rows = _build_metric_chart_rows(rows, metric, include_qoq=include_qoq)
+    if not chart_rows:
+        return '<p class="empty">차트로 표시할 금액 데이터가 없습니다.</p>'
+
+    if period_key == "quarterly":
+        return _render_quarterly_metric_amount_chart(
+            metric,
+            chart_rows,
+            growth_label=growth_label,
+            include_qoq=include_qoq,
+            width=width,
+            height=height,
+        )
+
+    return _render_series_metric_amount_chart(
+        metric,
+        chart_rows,
+        growth_label=growth_label,
+        include_qoq=include_qoq,
+        width=width,
+        height=height,
+    )
+
+    chart_rows: list[dict[str, object]] = []
+    for item in reversed(rows[:12]):
+        row = _dict(item)
+        values = _dict(row.get("values"))
+        cell = _dict(values.get(metric))
+        amount = _to_decimal(cell.get("amount"))
+        if amount is None:
+            continue
+        chart_rows.append(
+            {
+                "period": str(row.get("period", "")),
+                "amount": amount,
+                "growth_rate": cell.get("growth_rate"),
+                "qoq_growth_rate": None,
+            }
+        )
+
+    if not chart_rows:
+        return '<p class="empty">차트로 표시할 금액 데이터가 없습니다.</p>'
+
+    if include_qoq:
+        previous_amount: Decimal | None = None
+        for row in chart_rows:
+            row["qoq_growth_rate"] = _calculate_growth_rate(
+                row["amount"],
+                previous_amount,
+            )
+            previous_amount = row["amount"]
+
+    top = 36
+    left = 86
+    right = 96
+    bottom = 84
+    chart_width = Decimal(width - left - right)
+    chart_height = Decimal(height - top - bottom)
+    values = [row["amount"] for row in chart_rows]
+    min_value = min(values + [Decimal("0")])
+    max_value = max(values + [Decimal("0")])
+    if min_value == max_value:
+        min_value -= Decimal("1")
+        max_value += Decimal("1")
+    padding = (max_value - min_value) * Decimal("0.08")
+    min_value -= padding
+    max_value += padding
+
+    def y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + chart_height - (
+            (value - min_value)
+            / (max_value - min_value)
+            * chart_height
+        )
+
+    zero_y = y_for(Decimal("0"))
+    slot_width = chart_width / Decimal(len(chart_rows))
+    bar_width = min(Decimal("54"), slot_width * Decimal("0.62"))
+
+    growth_series = [
+        {
+            "key": "growth_rate",
+            "label": growth_label,
+            "color": "#2563eb",
+        }
+    ]
+    if include_qoq:
+        growth_series.append(
+            {
+                "key": "qoq_growth_rate",
+                "label": "QoQ 성장률",
+                "color": "#f59e0b",
+            }
+        )
+
+    growth_values = [
+        rate
+        for row in chart_rows
+        for series in growth_series
+        for rate in [_to_decimal(row.get(series["key"]))]
+        if rate is not None
+    ]
+    growth_min: Decimal | None = None
+    growth_max: Decimal | None = None
+    growth_zero_y: Decimal | None = None
+    growth_y_for = None
+    if growth_values:
+        growth_min = min(growth_values + [Decimal("0")])
+        growth_max = max(growth_values + [Decimal("0")])
+        if growth_min == growth_max:
+            growth_min -= Decimal("1")
+            growth_max += Decimal("1")
+        growth_padding = (growth_max - growth_min) * Decimal("0.12")
+        growth_min -= growth_padding
+        growth_max += growth_padding
+
+        def growth_y_for(value: Decimal) -> Decimal:
+            return Decimal(top) + chart_height - (
+                (value - growth_min)
+                / (growth_max - growth_min)
+                * chart_height
+            )
+
+        growth_zero_y = growth_y_for(Decimal("0"))
+
+    amount_ticks = _build_amount_axis_ticks(min_value, max_value)
+    amount_grid = []
+    amount_labels = []
+    for tick in amount_ticks:
+        y = y_for(tick)
+        amount_grid.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#eef2f5" />'
+        )
+        amount_labels.append(
+            f'<line x1="{left - 6}" y1="{_svg_number(y)}" x2="{left}" y2="{_svg_number(y)}" stroke="#b7c0c8" />'
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#5d6972" text-anchor="end">{escape(_format_chart_amount(tick))}</text>'
+        )
+
+    bars = []
+    for index, row in enumerate(chart_rows):
+        amount = row["amount"]
+        value_y = y_for(amount)
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        bar_x = center_x - (bar_width / Decimal("2"))
+        bar_y = min(value_y, zero_y)
+        bar_height = max(abs(zero_y - value_y), Decimal("1"))
+        label_y = (
+            max(Decimal("16"), bar_y - Decimal("8"))
+            if amount >= 0
+            else min(Decimal(height - 18), bar_y + bar_height + Decimal("16"))
+        )
+        tick_bottom = Decimal(height - bottom)
+        bars.append(
+            "<g>"
+            f"<title>{escape(_build_amount_chart_tooltip(row, growth_label=growth_label, include_qoq=include_qoq))}</title>"
+            f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(bar_y)}" width="{_svg_number(bar_width)}" height="{_svg_number(bar_height)}" fill="{_amount_chart_fill(row.get("growth_rate"))}" rx="4" />'
+            f'<text x="{_svg_number(center_x)}" y="{_svg_number(label_y)}" font-size="12" fill="#5d6972" text-anchor="middle">{escape(_format_chart_amount(amount))}</text>'
+            f'<line x1="{_svg_number(center_x)}" y1="{_svg_number(tick_bottom)}" x2="{_svg_number(center_x)}" y2="{_svg_number(tick_bottom + Decimal("6"))}" stroke="#b7c0c8" />'
+            f'<text x="{_svg_number(center_x)}" y="{_svg_number(tick_bottom + Decimal("22"))}" font-size="12" fill="#5d6972" text-anchor="middle">{escape(_truncate_label(str(row["period"]), 12))}</text>'
+            "</g>"
+        )
+
+    growth_ticks = []
+    growth_lines = []
+    if growth_values and growth_y_for is not None and growth_min is not None and growth_max is not None:
+        for tick in _build_growth_axis_ticks(growth_min, growth_max):
+            y = growth_y_for(tick)
+            growth_ticks.append(
+                f'<line x1="{width - right}" y1="{_svg_number(y)}" x2="{width - right + 6}" y2="{_svg_number(y)}" stroke="#b7c0c8" />'
+                f'<text x="{width - right + 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#5d6972">{escape(_format_percent(tick))}</text>'
+            )
+        for series in growth_series:
+            growth_lines.append(
+                _render_amount_growth_series(
+                    chart_rows,
+                    value_key=str(series["key"]),
+                    color=str(series["color"]),
+                    left=left,
+                    slot_width=slot_width,
+                    growth_y_for=growth_y_for,
+                )
+            )
+
+    legend_items = [
+        '<span class="legend-item"><span class="legend-swatch"></span><span>금액 막대</span></span>'
+    ]
+    for series in growth_series:
+        legend_items.append(
+            f'<span class="legend-item"><span class="legend-line" style="border-top-color: {escape(str(series["color"]))};"></span><span>{escape(str(series["label"]))}</span></span>'
+        )
+
+    return f"""
+    <div class="chart-shell">
+      <div class="legend">{"".join(legend_items)}</div>
+      <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(METRIC_LABELS.get(metric, metric))} 금액 차트">
+        {''.join(amount_grid)}
+        {(
+            f'<line x1="{left}" y1="{_svg_number(growth_zero_y)}" x2="{width - right}" y2="{_svg_number(growth_zero_y)}" stroke="#dbe7ff" stroke-dasharray="3 4" />'
+            if growth_zero_y is not None
+            else ""
+        )}
+        <line x1="{left}" y1="{_svg_number(zero_y)}" x2="{width - right}" y2="{_svg_number(zero_y)}" stroke="#b7c0c8" stroke-dasharray="4 4" />
+        <line data-axis="amount-left" x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#b7c0c8" />
+        <line data-axis="growth-right" x1="{width - right}" y1="{top}" x2="{width - right}" y2="{height - bottom}" stroke="#b7c0c8" />
+        <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#d7dde2" />
+        {''.join(amount_labels)}
+        {''.join(bars)}
+        {''.join(growth_ticks)}
+        {''.join(growth_lines)}
+      </svg>
+    </div>
+    """
+
+
+def render_compare_metric_chart(
+    metric: str,
+    primary_rows: list[object],
+    secondary_rows: list[object],
+    *,
+    period_key: str,
+    primary_name: str,
+    secondary_name: str,
+    title: str,
+    width: int = 540,
+    height: int = 320,
+) -> str:
+    if period_key == "quarterly":
+        return _render_compare_quarterly_metric_chart(
+            metric,
+            primary_rows,
+            secondary_rows,
+            primary_name=primary_name,
+            secondary_name=secondary_name,
+            title=title,
+            width=width,
+            height=height,
+        )
+
+    return _render_compare_series_metric_chart(
+        metric,
+        primary_rows,
+        secondary_rows,
+        primary_name=primary_name,
+        secondary_name=secondary_name,
+        title=title,
+        width=width,
+        height=height,
+    )
+
+    primary_points = _compare_chart_points(primary_rows, metric)
+    secondary_points = _compare_chart_points(secondary_rows, metric)
+    labels = [point["period"] for point in primary_points or secondary_points]
+    if not labels:
+        return '<p class="empty">비교 차트로 표시할 데이터가 없습니다.</p>'
+
+    values = [point["amount"] for point in primary_points + secondary_points]
+    min_value = min(values + [Decimal("0")])
+    max_value = max(values + [Decimal("0")])
+    if min_value == max_value:
+        min_value -= Decimal("1")
+        max_value += Decimal("1")
+    padding = (max_value - min_value) * Decimal("0.08")
+    min_value -= padding
+    max_value += padding
+
+    top = 28
+    left = 70
+    right = 24
+    bottom = 68
+    chart_width = Decimal(width - left - right)
+    chart_height = Decimal(height - top - bottom)
+
+    def y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + chart_height - (
+            (value - min_value)
+            / (max_value - min_value)
+            * chart_height
+        )
+
+    slot_width = chart_width / Decimal(max(len(labels), 1))
+    ticks = _build_amount_axis_ticks(min_value, max_value)
+    grid = []
+    labels_left = []
+    for tick in ticks:
+        y = y_for(tick)
+        grid.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#eef2f5" />'
+        )
+        labels_left.append(
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#5d6972" text-anchor="end">{escape(_format_chart_amount(tick))}</text>'
+        )
+
+    primary_line = _render_compare_line(
+        primary_points,
+        color="#0ea5a8",
+        left=left,
+        slot_width=slot_width,
+        y_for=y_for,
+        title_prefix=primary_name,
+    )
+    secondary_line = _render_compare_line(
+        secondary_points,
+        color="#f43f5e",
+        left=left,
+        slot_width=slot_width,
+        y_for=y_for,
+        title_prefix=secondary_name,
+    )
+
+    x_labels = []
+    for index, label in enumerate(labels):
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        x_labels.append(
+            f'<line x1="{_svg_number(center_x)}" y1="{height - bottom}" x2="{_svg_number(center_x)}" y2="{height - bottom + 6}" stroke="#b7c0c8" />'
+            f'<text x="{_svg_number(center_x)}" y="{height - bottom + 20}" font-size="11" fill="#5d6972" text-anchor="middle">{escape(_truncate_label(label, 12))}</text>'
+        )
+
+    return f"""
+    <div class="panel-heading">
+      <h3>{escape(title)}</h3>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-line" style="border-top-color:#0ea5a8;"></span><span>{escape(primary_name)}</span></span>
+      <span class="legend-item"><span class="legend-line" style="border-top-color:#f43f5e;"></span><span>{escape(secondary_name)}</span></span>
+    </div>
+    <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(title)}">
+      {''.join(grid)}
+      <line x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#b7c0c8" />
+      <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#d7dde2" />
+      {''.join(labels_left)}
+      {primary_line}
+      {secondary_line}
+      {''.join(x_labels)}
+    </svg>
+    """
+
+
+def render_compare_table(
+    primary_rows: list[object],
+    secondary_rows: list[object],
+    primary_name: str,
+    secondary_name: str,
+    *,
+    period_key: str,
+) -> str:
+    paired = []
+    metrics = _metrics_for_group(
+        {
+            "key": period_key,
+            "primary_rows": primary_rows,
+            "secondary_rows": secondary_rows,
+        }
+    )
+    left_index = {str(_dict(row).get("period", "")): _dict(row) for row in primary_rows[:5]}
+    right_index = {str(_dict(row).get("period", "")): _dict(row) for row in secondary_rows[:5]}
+    periods = []
+    for row in primary_rows[:5]:
+        periods.append(str(_dict(row).get("period", "")))
+    for row in secondary_rows[:5]:
+        period = str(_dict(row).get("period", ""))
+        if period not in periods:
+            periods.append(period)
+
+    for period in periods:
+        left_row = left_index.get(period, {})
+        right_row = right_index.get(period, {})
+        for metric in metrics:
+            left_cell = _dict(_dict(left_row.get("values")).get(metric))
+            right_cell = _dict(_dict(right_row.get("values")).get(metric))
+            paired.append(
+                "<tr>"
+                f"<td>{escape(period)}</td>"
+                f"<td>{escape(METRIC_LABELS.get(metric, metric))}</td>"
+                f"<td>{escape(_format_chart_amount(left_cell.get('amount')))}</td>"
+                f"<td>{escape(_format_chart_amount(right_cell.get('amount')))}</td>"
+                f"<td>{escape(_format_percent(left_cell.get('growth_rate')))}</td>"
+                f"<td>{escape(_format_percent(right_cell.get('growth_rate')))}</td>"
+                "</tr>"
+            )
+
+    return (
+        "<table>"
+        f"<thead><tr><th>기간</th><th>지표</th><th>{escape(primary_name)} 금액</th><th>{escape(secondary_name)} 금액</th><th>{escape(primary_name)} YoY</th><th>{escape(secondary_name)} YoY</th></tr></thead>"
+        f"<tbody>{''.join(paired)}</tbody>"
+        "</table>"
+    )
+
+    return (
+        "<table>"
+        f"<thead><tr><th>기간</th><th>{escape(primary_name)} 매출</th><th>{escape(secondary_name)} 매출</th><th>{escape(primary_name)} YoY</th><th>{escape(secondary_name)} YoY</th></tr></thead>"
+        f"<tbody>{''.join(paired)}</tbody>"
+        "</table>"
+    )
+
+
+def _build_period_groups(payload: dict[str, object]) -> list[dict[str, object]]:
+    groups = []
+    filter_results = [_dict(result) for result in _list(payload.get("filter_results"))]
+    for definition in PERIOD_DEFS:
+        groups.append(
+            {
+                "key": definition["key"],
+                "label": definition["label"],
+                "rows": _list(payload.get(str(definition["rows_key"]))),
+                "growth_label": definition["growth_label"],
+                "include_qoq": definition["include_qoq"],
+                "filter_results": [
+                    result
+                    for result in filter_results
+                    if str(result.get("series_type", "")) == str(definition["filter_series_type"])
+                ],
+            }
+        )
+    return groups
+
+
+def _build_compare_period_groups(
+    primary: dict[str, object],
+    secondary: dict[str, object],
+) -> list[dict[str, object]]:
+    groups = []
+    for definition in PERIOD_DEFS:
+        groups.append(
+            {
+                "key": definition["key"],
+                "label": definition["label"],
+                "primary_rows": _list(primary.get(str(definition["rows_key"]))),
+                "secondary_rows": _list(secondary.get(str(definition["rows_key"]))),
+            }
+        )
+    return groups
+
+
+def _compare_chart_points(rows: list[object], metric: str) -> list[dict[str, object]]:
+    points: list[dict[str, object]] = []
+    for item in reversed(rows[:12]):
+        row = _dict(item)
+        cell = _dict(_dict(row.get("values")).get(metric))
+        amount = _to_decimal(cell.get("amount"))
+        if amount is None:
+            continue
+        points.append(
+            {
+                "period": str(row.get("period", "")),
+                "amount": amount,
+                "growth_rate": cell.get("growth_rate"),
+            }
+        )
+    return points
+
+
+def _render_compare_line(
+    points: list[dict[str, object]],
+    *,
+    color: str,
+    left: int,
+    slot_width: Decimal,
+    y_for: Callable[[Decimal], Decimal],
+    title_prefix: str,
+) -> str:
+    if not points:
+        return ""
+
+    coordinates = []
+    markers = []
+    for index, point in enumerate(points):
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        y = y_for(point["amount"])
+        coordinates.append(f"{_svg_number(center_x)},{_svg_number(y)}")
+        markers.append(
+            "<g>"
+            f"<title>{escape(title_prefix)} · {point['period']} · 금액 {_format_amount(point['amount'])} · YoY {_format_percent(point.get('growth_rate'))}</title>"
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="{GROWTH_LINE_MARKER_RADIUS}" fill="{color}" stroke="#ffffff" stroke-width="{GROWTH_LINE_MARKER_STROKE_WIDTH}" />'
+            "</g>"
+        )
+
+    return (
+        f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="{color}" stroke-width="{GROWTH_LINE_STROKE_WIDTH}" stroke-linejoin="round" stroke-linecap="round" />'
+        f'{"".join(markers)}'
+    )
+
+
+def _build_metric_chart_rows(
+    rows: list[object],
+    metric: str,
+    *,
+    include_qoq: bool,
+) -> list[dict[str, object]]:
+    chart_rows: list[dict[str, object]] = []
+    for item in reversed(rows):
+        row = _dict(item)
+        cell = _dict(_dict(row.get("values")).get(metric))
+        amount = _to_decimal(cell.get("amount"))
+        if amount is None:
+            continue
+        chart_rows.append(
+            {
+                "period": str(row.get("period", "")),
+                "amount": amount,
+                "growth_rate": cell.get("growth_rate"),
+                "qoq_growth_rate": None,
+                "fiscal_year": _row_fiscal_year(row),
+                "fiscal_quarter": _row_fiscal_quarter(row),
+            }
+        )
+
+    if include_qoq:
+        previous_amount: Decimal | None = None
+        for row in chart_rows:
+            row["qoq_growth_rate"] = _calculate_growth_rate(
+                row["amount"],
+                previous_amount,
+            )
+            previous_amount = row["amount"]
+
+    return chart_rows
+
+
+def _render_series_metric_amount_chart(
+    metric: str,
+    chart_rows: list[dict[str, object]],
+    *,
+    growth_label: str,
+    include_qoq: bool,
+    width: int,
+    height: int,
+) -> str:
+    top = 36
+    left = 86
+    right = 96
+    bottom = 84
+    chart_width = Decimal(width - left - right)
+    chart_height = Decimal(height - top - bottom)
+    amount_range = _build_numeric_range(
+        [row["amount"] for row in chart_rows],
+        padding_ratio=Decimal("0.08"),
+    )
+    if amount_range is None:
+        return '<p class="empty">차트로 표시할 금액 데이터가 없습니다.</p>'
+    min_value, max_value = amount_range
+
+    def y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + chart_height - (
+            (value - min_value)
+            / (max_value - min_value)
+            * chart_height
+        )
+
+    zero_y = y_for(Decimal("0"))
+    slot_width = chart_width / Decimal(max(len(chart_rows), 1))
+    bar_width = min(Decimal("54"), slot_width * Decimal("0.62"))
+    show_value_labels = len(chart_rows) <= 16
+    x_label_stride = _x_label_stride(len(chart_rows))
+
+    growth_series = [
+        {
+            "key": "growth_rate",
+            "label": growth_label,
+            "color": GROWTH_LINE_COLORS["growth_rate"],
+        }
+    ]
+    if include_qoq:
+        growth_series.append(
+            {
+                "key": "qoq_growth_rate",
+                "label": "QoQ 성장률",
+                "color": GROWTH_LINE_COLORS["qoq_growth_rate"],
+            }
+        )
+
+    growth_values = [
+        rate
+        for row in chart_rows
+        for series in growth_series
+        for rate in [_to_decimal(row.get(series["key"]))]
+        if rate is not None
+    ]
+    growth_range = _build_numeric_range(
+        growth_values,
+        padding_ratio=Decimal("0.12"),
+    )
+    growth_zero_y: Decimal | None = None
+    growth_y_for = None
+    if growth_range is not None:
+        growth_min, growth_max = growth_range
+
+        def growth_y_for(value: Decimal) -> Decimal:
+            return Decimal(top) + chart_height - (
+                (value - growth_min)
+                / (growth_max - growth_min)
+                * chart_height
+            )
+
+        growth_zero_y = growth_y_for(Decimal("0"))
+
+    amount_ticks = _build_amount_axis_ticks(min_value, max_value)
+    amount_grid = []
+    amount_labels = []
+    for tick in amount_ticks:
+        y = y_for(tick)
+        amount_grid.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#e6edf5" />'
+        )
+        amount_labels.append(
+            f'<line x1="{left - 6}" y1="{_svg_number(y)}" x2="{left}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569" text-anchor="end">{escape(_format_chart_amount(tick))}</text>'
+        )
+
+    bars = []
+    for index, row in enumerate(chart_rows):
+        amount = row["amount"]
+        value_y = y_for(amount)
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        bar_x = center_x - (bar_width / Decimal("2"))
+        bar_y = min(value_y, zero_y)
+        bar_height = max(abs(zero_y - value_y), Decimal("1"))
+        tick_bottom = Decimal(height - bottom)
+        label_y = (
+            max(Decimal("16"), bar_y - Decimal("8"))
+            if amount >= 0
+            else min(Decimal(height - 18), bar_y + bar_height + Decimal("16"))
+        )
+        label_markup = ""
+        if show_value_labels:
+            label_markup = (
+                f'<text x="{_svg_number(center_x)}" y="{_svg_number(label_y)}" font-size="12" fill="#475569" text-anchor="middle">{escape(_format_chart_amount(amount))}</text>'
+            )
+        tick_markup = ""
+        if _should_render_x_label(index, len(chart_rows), x_label_stride):
+            tick_markup = (
+                f'<line x1="{_svg_number(center_x)}" y1="{_svg_number(tick_bottom)}" x2="{_svg_number(center_x)}" y2="{_svg_number(tick_bottom + Decimal("6"))}" stroke="#94a3b8" />'
+                f'<text x="{_svg_number(center_x)}" y="{_svg_number(tick_bottom + Decimal("22"))}" font-size="12" fill="#475569" text-anchor="middle">{escape(_truncate_label(str(row["period"]), 12))}</text>'
+            )
+        bars.append(
+            "<g>"
+            f"<title>{escape(_build_amount_chart_tooltip(row, growth_label=growth_label, include_qoq=include_qoq))}</title>"
+            f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(bar_y)}" width="{_svg_number(bar_width)}" height="{_svg_number(bar_height)}" fill="{AMOUNT_BAR_COLOR}" stroke="{AMOUNT_BAR_STROKE}" stroke-width="1" rx="4" />'
+            f"{label_markup}"
+            f"{tick_markup}"
+            "</g>"
+        )
+
+    growth_ticks = []
+    growth_lines = []
+    if growth_range is not None and growth_y_for is not None and growth_zero_y is not None:
+        growth_min, growth_max = growth_range
+        for tick in _build_growth_axis_ticks(growth_min, growth_max):
+            y = growth_y_for(tick)
+            growth_ticks.append(
+                f'<line x1="{width - right}" y1="{_svg_number(y)}" x2="{width - right + 6}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+                f'<text x="{width - right + 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569">{escape(_format_percent(tick))}</text>'
+            )
+        for series in growth_series:
+            growth_lines.append(
+                _render_amount_growth_series(
+                    chart_rows,
+                    value_key=str(series["key"]),
+                    color=str(series["color"]),
+                    left=left,
+                    slot_width=slot_width,
+                    growth_y_for=growth_y_for,
+                )
+            )
+
+    legend_items = [
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{AMOUNT_BAR_COLOR};"></span><span>금액</span></span>'
+    ]
+    for series in growth_series:
+        legend_items.append(
+            f'<span class="legend-item"><span class="legend-line" style="border-top-color: {escape(str(series["color"]))};"></span><span>{escape(str(series["label"]))}</span></span>'
+        )
+
+    return f"""
+    <div class="chart-shell">
+      <div class="legend">{"".join(legend_items)}</div>
+      <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(METRIC_LABELS.get(metric, metric))} 금액 차트">
+        {''.join(amount_grid)}
+        {(
+            f'<line x1="{left}" y1="{_svg_number(growth_zero_y)}" x2="{width - right}" y2="{_svg_number(growth_zero_y)}" stroke="#e9d5ff" stroke-dasharray="3 4" />'
+            if growth_zero_y is not None
+            else ""
+        )}
+        <line x1="{left}" y1="{_svg_number(zero_y)}" x2="{width - right}" y2="{_svg_number(zero_y)}" stroke="#94a3b8" stroke-dasharray="4 4" />
+        <line data-axis="amount-left" x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#94a3b8" />
+        <line data-axis="growth-right" x1="{width - right}" y1="{top}" x2="{width - right}" y2="{height - bottom}" stroke="#94a3b8" />
+        <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#cbd5e1" />
+        {''.join(amount_labels)}
+        {''.join(bars)}
+        {''.join(growth_ticks)}
+        {''.join(growth_lines)}
+      </svg>
+    </div>
+    """
+
+
+def _render_quarterly_metric_amount_chart(
+    metric: str,
+    chart_rows: list[dict[str, object]],
+    *,
+    growth_label: str,
+    include_qoq: bool,
+    width: int,
+    height: int,
+    amount_range: tuple[Decimal, Decimal] | None = None,
+    growth_range: tuple[Decimal, Decimal] | None = None,
+    show_legend: bool = True,
+    show_x_axis_labels: bool = True,
+    title_prefix: str | None = None,
+) -> str:
+    top = 36
+    left = 72
+    right = 96
+    bottom = 74 if show_x_axis_labels else 30
+    chart_width = Decimal(width - left - right)
+    chart_height = Decimal(height - top - bottom)
+    amount_range = amount_range or _build_numeric_range(
+        [row["amount"] for row in chart_rows],
+        padding_ratio=Decimal("0.08"),
+    )
+    if amount_range is None:
+        return '<p class="empty">차트로 표시할 금액 데이터가 없습니다.</p>'
+    amount_min, amount_max = amount_range
+
+    def amount_y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + chart_height - (
+            (value - amount_min)
+            / (amount_max - amount_min)
+            * chart_height
+        )
+
+    amount_zero_y = amount_y_for(Decimal("0"))
+    growth_values = [
+        rate
+        for row in chart_rows
+        for key in ("growth_rate", "qoq_growth_rate")
+        for rate in [_to_decimal(row.get(key))]
+        if rate is not None and (key != "qoq_growth_rate" or include_qoq)
+    ]
+    growth_range = growth_range or _build_numeric_range(
+        growth_values,
+        padding_ratio=Decimal("0.12"),
+    )
+    growth_zero_y: Decimal | None = None
+    growth_y_for = None
+    if growth_range is not None:
+        growth_min, growth_max = growth_range
+
+        def growth_y_for(value: Decimal) -> Decimal:
+            return Decimal(top) + chart_height - (
+                (value - growth_min)
+                / (growth_max - growth_min)
+                * chart_height
+            )
+
+        growth_zero_y = growth_y_for(Decimal("0"))
+
+    years = []
+    for row in chart_rows:
+        year = int(row.get("fiscal_year") or 0)
+        if year and year not in years:
+            years.append(year)
+    if not years:
+        return '<p class="empty">차트로 표시할 분기 데이터가 없습니다.</p>'
+
+    group_width = chart_width / Decimal(len(years))
+    quarter_gap = min(Decimal("6"), max(Decimal("2"), group_width * Decimal("0.05")))
+    bar_width = (group_width * Decimal("0.76") - (quarter_gap * Decimal("3"))) / Decimal("4")
+    bar_width = min(Decimal("16"), max(Decimal("6"), bar_width))
+    group_inner_width = bar_width * Decimal("4") + quarter_gap * Decimal("3")
+    group_offset = (group_width - group_inner_width) / Decimal("2")
+    year_index = {year: index for index, year in enumerate(years)}
+
+    positioned_rows: list[dict[str, object]] = []
+    for row in chart_rows:
+        year = int(row.get("fiscal_year") or 0)
+        quarter = int(row.get("fiscal_quarter") or 0)
+        if year not in year_index or quarter not in QUARTER_COLORS:
+            continue
+        center_x = (
+            Decimal(left)
+            + group_width * Decimal(year_index[year])
+            + group_offset
+            + Decimal(quarter - 1) * (bar_width + quarter_gap)
+            + (bar_width / Decimal("2"))
+        )
+        positioned_rows.append({**row, "center_x": center_x})
+
+    amount_ticks = _build_amount_axis_ticks(amount_min, amount_max)
+    amount_grid = []
+    amount_labels = []
+    for tick in amount_ticks:
+        y = amount_y_for(tick)
+        amount_grid.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#e5e7eb" />'
+        )
+        amount_labels.append(
+            f'<line x1="{left - 6}" y1="{_svg_number(y)}" x2="{left}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569" text-anchor="end">{escape(_format_chart_amount(tick))}</text>'
+        )
+
+    year_guides = []
+    year_labels = []
+    axis_bottom = Decimal(height - bottom)
+    for index, year in enumerate(years):
+        boundary_x = Decimal(left) + group_width * Decimal(index)
+        year_guides.append(
+            f'<line x1="{_svg_number(boundary_x)}" y1="{top}" x2="{_svg_number(boundary_x)}" y2="{_svg_number(axis_bottom)}" stroke="#eef2f7" />'
+        )
+        if show_x_axis_labels:
+            center_x = Decimal(left) + group_width * Decimal(index) + (group_width / Decimal("2"))
+            year_labels.append(
+                f'<text x="{_svg_number(center_x)}" y="{_svg_number(axis_bottom + Decimal("20"))}" font-size="11" fill="#475569" text-anchor="middle">{year}</text>'
+            )
+    year_guides.append(
+        f'<line x1="{_svg_number(Decimal(left) + group_width * Decimal(len(years)))}" y1="{top}" x2="{_svg_number(Decimal(left) + group_width * Decimal(len(years)))}" y2="{_svg_number(axis_bottom)}" stroke="#eef2f7" />'
+    )
+
+    bars = []
+    for row in positioned_rows:
+        amount = row["amount"]
+        value_y = amount_y_for(amount)
+        center_x = row["center_x"]
+        bar_x = center_x - (bar_width / Decimal("2"))
+        bar_y = min(value_y, amount_zero_y)
+        bar_height = max(abs(amount_zero_y - value_y), Decimal("1"))
+        quarter = int(row.get("fiscal_quarter") or 4)
+        bars.append(
+            "<g>"
+            f"<title>{escape(_build_amount_chart_tooltip(row, growth_label=growth_label, include_qoq=include_qoq, title_prefix=title_prefix))}</title>"
+            f'<rect x="{_svg_number(bar_x)}" y="{_svg_number(bar_y)}" width="{_svg_number(bar_width)}" height="{_svg_number(bar_height)}" fill="{QUARTER_COLORS.get(quarter, AMOUNT_BAR_COLOR)}" stroke="#1f2937" stroke-opacity="0.18" stroke-width="1" rx="2" />'
+            "</g>"
+        )
+
+    growth_ticks = []
+    growth_lines = []
+    if growth_range is not None and growth_y_for is not None and growth_zero_y is not None:
+        growth_min, growth_max = growth_range
+        for tick in _build_growth_axis_ticks(growth_min, growth_max):
+            y = growth_y_for(tick)
+            growth_ticks.append(
+                f'<line x1="{width - right}" y1="{_svg_number(y)}" x2="{width - right + 6}" y2="{_svg_number(y)}" stroke="#94a3b8" />'
+                f'<text x="{width - right + 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569">{escape(_format_percent(tick))}</text>'
+            )
+        growth_lines.append(
+            _render_centered_growth_series(
+                positioned_rows,
+                value_key="growth_rate",
+                color=GROWTH_LINE_COLORS["growth_rate"],
+                growth_y_for=growth_y_for,
+            )
+        )
+        if include_qoq:
+            growth_lines.append(
+                _render_centered_growth_series(
+                    positioned_rows,
+                    value_key="qoq_growth_rate",
+                    color=GROWTH_LINE_COLORS["qoq_growth_rate"],
+                    growth_y_for=growth_y_for,
+                )
+            )
+
+    legend_html = ""
+    if show_legend:
+        legend_html = f'<div class="legend">{"".join(_quarterly_legend_items(include_qoq=include_qoq, growth_label=growth_label))}</div>'
+
+    return f"""
+    <div class="chart-shell">
+      {legend_html}
+      <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(METRIC_LABELS.get(metric, metric))} 분기 차트">
+        {''.join(amount_grid)}
+        {''.join(year_guides)}
+        {(
+            f'<line x1="{left}" y1="{_svg_number(growth_zero_y)}" x2="{width - right}" y2="{_svg_number(growth_zero_y)}" stroke="#f3e8ff" stroke-dasharray="3 4" />'
+            if growth_zero_y is not None
+            else ""
+        )}
+        <line x1="{left}" y1="{_svg_number(amount_zero_y)}" x2="{width - right}" y2="{_svg_number(amount_zero_y)}" stroke="#94a3b8" stroke-dasharray="4 4" />
+        <line data-axis="amount-left" x1="{left}" y1="{top}" x2="{left}" y2="{_svg_number(axis_bottom)}" stroke="#94a3b8" />
+        <line data-axis="growth-right" x1="{width - right}" y1="{top}" x2="{width - right}" y2="{_svg_number(axis_bottom)}" stroke="#94a3b8" />
+        <line x1="{left}" y1="{_svg_number(axis_bottom)}" x2="{width - right}" y2="{_svg_number(axis_bottom)}" stroke="#cbd5e1" />
+        {''.join(amount_labels)}
+        {''.join(bars)}
+        {''.join(growth_ticks)}
+        {''.join(growth_lines)}
+        {''.join(year_labels)}
+      </svg>
+    </div>
+    """
+
+
+def _render_compare_series_metric_chart(
+    metric: str,
+    primary_rows: list[object],
+    secondary_rows: list[object],
+    *,
+    primary_name: str,
+    secondary_name: str,
+    title: str,
+    width: int,
+    height: int,
+) -> str:
+    primary_points = _build_metric_chart_rows(primary_rows, metric, include_qoq=False)
+    secondary_points = _build_metric_chart_rows(secondary_rows, metric, include_qoq=False)
+    labels = _merge_period_labels(primary_points, secondary_points)
+    if not labels:
+        return '<p class="empty">비교 차트로 표시할 데이터가 없습니다.</p>'
+
+    values = [point["amount"] for point in primary_points + secondary_points]
+    amount_range = _build_numeric_range(values, padding_ratio=Decimal("0.08"))
+    if amount_range is None:
+        return '<p class="empty">비교 차트로 표시할 데이터가 없습니다.</p>'
+    min_value, max_value = amount_range
+
+    top = 28
+    left = 70
+    right = 24
+    bottom = 68
+    chart_width = Decimal(width - left - right)
+    chart_height = Decimal(height - top - bottom)
+
+    def y_for(value: Decimal) -> Decimal:
+        return Decimal(top) + chart_height - (
+            (value - min_value)
+            / (max_value - min_value)
+            * chart_height
+        )
+
+    period_index = {label: index for index, label in enumerate(labels)}
+    slot_width = chart_width / Decimal(max(len(labels), 1))
+    x_label_stride = _x_label_stride(len(labels))
+
+    ticks = _build_amount_axis_ticks(min_value, max_value)
+    grid = []
+    labels_left = []
+    for tick in ticks:
+        y = y_for(tick)
+        grid.append(
+            f'<line x1="{left}" y1="{_svg_number(y)}" x2="{width - right}" y2="{_svg_number(y)}" stroke="#e6edf5" />'
+        )
+        labels_left.append(
+            f'<text x="{left - 10}" y="{_svg_number(y + Decimal("4"))}" font-size="11" fill="#475569" text-anchor="end">{escape(_format_chart_amount(tick))}</text>'
+        )
+
+    primary_line = _render_compare_metric_line(
+        primary_points,
+        period_index=period_index,
+        color=COMPARE_LINE_COLORS["primary"],
+        left=left,
+        slot_width=slot_width,
+        y_for=y_for,
+        title_prefix=primary_name,
+    )
+    secondary_line = _render_compare_metric_line(
+        secondary_points,
+        period_index=period_index,
+        color=COMPARE_LINE_COLORS["secondary"],
+        left=left,
+        slot_width=slot_width,
+        y_for=y_for,
+        title_prefix=secondary_name,
+    )
+
+    x_labels = []
+    axis_bottom = Decimal(height - bottom)
+    for index, label in enumerate(labels):
+        if not _should_render_x_label(index, len(labels), x_label_stride):
+            continue
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        x_labels.append(
+            f'<line x1="{_svg_number(center_x)}" y1="{_svg_number(axis_bottom)}" x2="{_svg_number(center_x)}" y2="{_svg_number(axis_bottom + Decimal("6"))}" stroke="#94a3b8" />'
+            f'<text x="{_svg_number(center_x)}" y="{_svg_number(axis_bottom + Decimal("20"))}" font-size="11" fill="#475569" text-anchor="middle">{escape(_truncate_label(label, 12))}</text>'
+        )
+
+    return f"""
+    <div class="panel-heading">
+      <h3>{escape(title)}</h3>
+    </div>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-line" style="border-top-color:{COMPARE_LINE_COLORS["primary"]};"></span><span>{escape(primary_name)}</span></span>
+      <span class="legend-item"><span class="legend-line" style="border-top-color:{COMPARE_LINE_COLORS["secondary"]};"></span><span>{escape(secondary_name)}</span></span>
+    </div>
+    <svg class="amount-chart" viewBox="0 0 {width} {height}" role="img" aria-label="{escape(title)}">
+      {''.join(grid)}
+      <line x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}" stroke="#94a3b8" />
+      <line x1="{left}" y1="{height - bottom}" x2="{width - right}" y2="{height - bottom}" stroke="#cbd5e1" />
+      {''.join(labels_left)}
+      {primary_line}
+      {secondary_line}
+      {''.join(x_labels)}
+    </svg>
+    """
+
+
+def _render_compare_quarterly_metric_chart(
+    metric: str,
+    primary_rows: list[object],
+    secondary_rows: list[object],
+    *,
+    primary_name: str,
+    secondary_name: str,
+    title: str,
+    width: int,
+    height: int,
+) -> str:
+    primary_points = _build_metric_chart_rows(primary_rows, metric, include_qoq=True)
+    secondary_points = _build_metric_chart_rows(secondary_rows, metric, include_qoq=True)
+    if not primary_points and not secondary_points:
+        return '<p class="empty">비교 차트로 표시할 데이터가 없습니다.</p>'
+
+    amount_range = _build_numeric_range(
+        [point["amount"] for point in primary_points + secondary_points],
+        padding_ratio=Decimal("0.08"),
+    )
+    growth_range = _build_numeric_range(
+        [
+            rate
+            for point in primary_points + secondary_points
+            for key in ("growth_rate", "qoq_growth_rate")
+            for rate in [_to_decimal(point.get(key))]
+            if rate is not None
+        ],
+        padding_ratio=Decimal("0.12"),
+    )
+    panel_height = max(220, (height - 36) // 2)
+
+    return f"""
+    <div class="panel-heading">
+      <h3>{escape(title)}</h3>
+    </div>
+    <div class="legend">{"".join(_quarterly_legend_items(include_qoq=True, growth_label="YoY 성장률"))}</div>
+    <div class="compare-chart-stack">
+      <section class="compare-chart-panel">
+        <div class="compare-panel-title">{escape(primary_name)}</div>
+        {_render_quarterly_metric_amount_chart(metric, primary_points, growth_label="YoY 성장률", include_qoq=True, width=width, height=panel_height, amount_range=amount_range, growth_range=growth_range, show_legend=False, show_x_axis_labels=False, title_prefix=primary_name)}
+      </section>
+      <section class="compare-chart-panel">
+        <div class="compare-panel-title">{escape(secondary_name)}</div>
+        {_render_quarterly_metric_amount_chart(metric, secondary_points, growth_label="YoY 성장률", include_qoq=True, width=width, height=panel_height, amount_range=amount_range, growth_range=growth_range, show_legend=False, show_x_axis_labels=True, title_prefix=secondary_name)}
+      </section>
+    </div>
+    """
+
+
+def _render_centered_growth_series(
+    chart_rows: list[dict[str, object]],
+    *,
+    value_key: str,
+    color: str,
+    growth_y_for: Callable[[Decimal], Decimal],
+) -> str:
+    segments: list[str] = []
+    markers: list[str] = []
+    points: list[str] = []
+
+    def flush_points() -> None:
+        nonlocal points
+        if len(points) >= 2:
+            segments.append(
+                f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="{GROWTH_LINE_STROKE_WIDTH}" stroke-linejoin="round" stroke-linecap="round" />'
+            )
+        points = []
+
+    for row in chart_rows:
+        rate = _to_decimal(row.get(value_key))
+        center_x = row.get("center_x")
+        if rate is None or not isinstance(center_x, Decimal):
+            flush_points()
+            continue
+        y = growth_y_for(rate)
+        points.append(f"{_svg_number(center_x)},{_svg_number(y)}")
+        markers.append(
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="{GROWTH_LINE_COMPACT_MARKER_RADIUS}" fill="{color}" stroke="#ffffff" stroke-width="{GROWTH_LINE_MARKER_STROKE_WIDTH}" />'
+        )
+
+    flush_points()
+    return "".join(segments + markers)
+
+
+def _render_compare_metric_line(
+    points: list[dict[str, object]],
+    *,
+    period_index: dict[str, int],
+    color: str,
+    left: int,
+    slot_width: Decimal,
+    y_for: Callable[[Decimal], Decimal],
+    title_prefix: str,
+) -> str:
+    if not points:
+        return ""
+
+    coordinates = []
+    markers = []
+    for point in points:
+        index = period_index.get(str(point.get("period", "")))
+        if index is None:
+            continue
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        y = y_for(point["amount"])
+        coordinates.append(f"{_svg_number(center_x)},{_svg_number(y)}")
+        markers.append(
+            "<g>"
+            f"<title>{escape(title_prefix)} · {point['period']} · 금액 {_format_amount(point['amount'])} · YoY {_format_percent(point.get('growth_rate'))}</title>"
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="{GROWTH_LINE_MARKER_RADIUS}" fill="{color}" stroke="#ffffff" stroke-width="{GROWTH_LINE_MARKER_STROKE_WIDTH}" />'
+            "</g>"
+        )
+
+    return (
+        f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="{color}" stroke-width="{GROWTH_LINE_STROKE_WIDTH}" stroke-linejoin="round" stroke-linecap="round" />'
+        f'{"".join(markers)}'
+    )
+
+
+def _quarterly_legend_items(
+    *,
+    include_qoq: bool,
+    growth_label: str,
+) -> list[str]:
+    items = [
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{QUARTER_COLORS[1]};"></span><span>Q1</span></span>',
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{QUARTER_COLORS[2]};"></span><span>Q2</span></span>',
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{QUARTER_COLORS[3]};"></span><span>Q3</span></span>',
+        f'<span class="legend-item"><span class="legend-swatch" style="background:{QUARTER_COLORS[4]};"></span><span>Q4</span></span>',
+        f'<span class="legend-item"><span class="legend-line" style="border-top-color:{GROWTH_LINE_COLORS["growth_rate"]};"></span><span>{escape(growth_label)}</span></span>',
+    ]
+    if include_qoq:
+        items.append(
+            f'<span class="legend-item"><span class="legend-line" style="border-top-color:{GROWTH_LINE_COLORS["qoq_growth_rate"]};"></span><span>QoQ 성장률</span></span>'
+        )
+    return items
+
+
+def _build_numeric_range(
+    values: list[Decimal],
+    *,
+    padding_ratio: Decimal,
+) -> tuple[Decimal, Decimal] | None:
+    if not values:
+        return None
+    min_value = min(values + [Decimal("0")])
+    max_value = max(values + [Decimal("0")])
+    if min_value == max_value:
+        min_value -= Decimal("1")
+        max_value += Decimal("1")
+    padding = (max_value - min_value) * padding_ratio
+    return (min_value - padding, max_value + padding)
+
+
+def _merge_period_labels(
+    primary_points: list[dict[str, object]],
+    secondary_points: list[dict[str, object]],
+) -> list[str]:
+    labels: list[str] = []
+    for point in primary_points + secondary_points:
+        period = str(point.get("period", ""))
+        if period and period not in labels:
+            labels.append(period)
+    return labels
+
+
+def _x_label_stride(total_points: int) -> int:
+    if total_points <= 12:
+        return 1
+    if total_points <= 24:
+        return 2
+    return 4
+
+
+def _should_render_x_label(index: int, total_points: int, stride: int) -> bool:
+    return index == 0 or index == total_points - 1 or index % max(stride, 1) == 0
+
+
+def _row_fiscal_year(row: dict[str, object]) -> int | None:
+    value = row.get("fiscal_year")
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    period = str(row.get("period", ""))
+    if "Q" in period:
+        period = period.split("Q", maxsplit=1)[0]
+    try:
+        return int(period)
+    except ValueError:
+        return None
+
+
+def _row_fiscal_quarter(row: dict[str, object]) -> int | None:
+    value = row.get("fiscal_quarter")
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    period = str(row.get("period", ""))
+    if "Q" not in period:
+        return None
+    try:
+        return int(period.split("Q", maxsplit=1)[1])
+    except ValueError:
+        return None
+
+
+def _build_growth_axis_ticks(growth_min: Decimal, growth_max: Decimal) -> list[Decimal]:
+    ticks: list[Decimal] = []
+    seen: set[str] = set()
+    for value in (growth_max, Decimal("0"), growth_min):
+        key = str(value.quantize(Decimal("0.1")))
+        if key in seen:
+            continue
+        seen.add(key)
+        ticks.append(value)
+    return ticks
+
+
+def _build_amount_axis_ticks(min_value: Decimal, max_value: Decimal) -> list[Decimal]:
+    candidates = [max_value]
+    if min_value < 0 < max_value:
+        candidates.append(Decimal("0"))
+    else:
+        candidates.append((max_value + min_value) / Decimal("2"))
+    candidates.append(min_value)
+
+    ticks: list[Decimal] = []
+    seen: set[str] = set()
+    for value in candidates:
+        key = str(value.quantize(Decimal("0.1")))
+        if key in seen:
+            continue
+        seen.add(key)
+        ticks.append(value)
+    return ticks
+
+
+def _render_amount_growth_series(
+    chart_rows: list[dict[str, object]],
+    *,
+    value_key: str,
+    color: str,
+    left: int,
+    slot_width: Decimal,
+    growth_y_for: Callable[[Decimal], Decimal],
+) -> str:
+    segments: list[str] = []
+    markers: list[str] = []
+    points: list[str] = []
+
+    def flush_points() -> None:
+        nonlocal points
+        if len(points) >= 2:
+            segments.append(
+                f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="{GROWTH_LINE_STROKE_WIDTH}" stroke-linejoin="round" stroke-linecap="round" />'
+            )
+        points = []
+
+    for index, row in enumerate(chart_rows):
+        rate = _to_decimal(row.get(value_key))
+        if rate is None:
+            flush_points()
+            continue
+        center_x = Decimal(left) + slot_width * Decimal(index) + (slot_width / Decimal("2"))
+        y = growth_y_for(rate)
+        points.append(f"{_svg_number(center_x)},{_svg_number(y)}")
+        markers.append(
+            f'<circle cx="{_svg_number(center_x)}" cy="{_svg_number(y)}" r="{GROWTH_LINE_MARKER_RADIUS}" fill="{color}" stroke="#ffffff" stroke-width="{GROWTH_LINE_MARKER_STROKE_WIDTH}" />'
+        )
+
+    flush_points()
+    return "".join(segments + markers)
+
+
+def _calculate_growth_rate(
+    current_amount: Decimal,
+    previous_amount: Decimal | None,
+) -> Decimal | None:
+    if previous_amount is None or previous_amount <= 0:
+        return None
+    return (current_amount - previous_amount) / previous_amount * Decimal("100")
+
+
+def _format_chart_amount(value: object) -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+
+    absolute = abs(parsed)
+    units = [
+        (Decimal("1000000000000"), "T"),
+        (Decimal("1000000000"), "B"),
+        (Decimal("1000000"), "M"),
+        (Decimal("1000"), "K"),
+    ]
+    for factor, suffix in units:
+        if absolute >= factor:
+            scaled = parsed / factor
+            text = format(
+                scaled.quantize(Decimal("0.1")),
+                "f",
+            ).rstrip("0").rstrip(".")
+            return f"{text}{suffix}"
+    return _format_amount(parsed)
+
+
+def _format_won(value: object) -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+    normalized = parsed.quantize(Decimal("1")) if parsed == parsed.to_integral() else parsed
+    return f"{format(normalized, ',f').rstrip('0').rstrip('.')}원"
+
+
+def _format_market_cap(value: object) -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+    absolute = abs(parsed)
+    if absolute >= Decimal("1000000000000"):
+        scaled = (parsed / Decimal("1000000000000")).quantize(Decimal("0.01"))
+        return f"{format(scaled, 'f').rstrip('0').rstrip('.')}조원"
+    if absolute >= Decimal("100000000"):
+        scaled = (parsed / Decimal("100000000")).quantize(Decimal("0.01"))
+        return f"{format(scaled, 'f').rstrip('0').rstrip('.')}억원"
+    return _format_won(parsed)
+
+
+def _format_ratio(value: object, *, suffix: str = "") -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+    text = format(parsed, "f").rstrip("0").rstrip(".")
+    return f"{text}{suffix}"
+
+
+def _format_display_won(value: object) -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "-"
+    if parsed == parsed.to_integral():
+        normalized = parsed.quantize(Decimal("1"))
+        return f"{format(normalized, ',f')}\uc6d0"
+
+    text = format(parsed, ",f").rstrip("0").rstrip(".")
+    return f"{text}\uc6d0"
+
+
+_format_won = _format_display_won
+
+
+def _format_base_date(value: object) -> str:
+    text = str(value or "").strip()
+    if len(text) != 8 or not text.isdigit():
+        return text
+    return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+
+
+def _build_amount_chart_tooltip(
+    row: dict[str, object],
+    *,
+    growth_label: str,
+    include_qoq: bool,
+    title_prefix: str | None = None,
+) -> str:
+    lines = []
+    if title_prefix:
+        lines.append(title_prefix)
+    lines.extend(
+        [
+            str(row.get("period", "")),
+            f"금액: {_format_amount(row.get('amount'))}",
+            f"{growth_label}: {_format_percent(row.get('growth_rate'))}",
+        ]
+    )
+    if include_qoq:
+        lines.append(f"QoQ 성장률: {_format_percent(row.get('qoq_growth_rate'))}")
+    return "\n".join(lines)
+
+
+def _pivot_period_values(
+    values: Iterable[FinancialPeriodValue],
+    *,
+    growth_points: list[dict[str, object]],
+    series_type: str,
+) -> list[dict[str, object]]:
+    growth_index = _index_growth_rates(growth_points, series_type=series_type)
+    rows: dict[str, dict[str, object]] = {}
+    for value in values:
+        period = value.period_label
+        row = rows.setdefault(
+            period,
+            {
+                "period": period,
+                "sort": _period_sort_key(value),
+                "fiscal_year": value.fiscal_year,
+                "fiscal_quarter": value.fiscal_quarter,
+                "values": {},
+            },
+        )
+        _dict(row["values"])[value.metric] = {
+            "amount": str(value.amount),
+            "growth_rate": growth_index.get((value.metric, period)),
+        }
+
+    return [
+        {key: value for key, value in row.items() if key != "sort"}
+        for row in sorted(rows.values(), key=lambda item: int(item["sort"]), reverse=True)
+    ]
+
+
+def _pivot_growth_amount_rows(
+    growth_points: list[dict[str, object]],
+    *,
+    series_type: str,
+) -> list[dict[str, object]]:
+    rows: dict[str, dict[str, object]] = {}
+    for point in growth_points:
+        if str(point.get("series_type", "")) != series_type:
+            continue
+        period = str(point.get("period_label", ""))
+        fiscal_year = int(point.get("fiscal_year", 0) or 0)
+        fiscal_quarter = int(point.get("fiscal_quarter", 0) or 0)
+        row = rows.setdefault(
+            period,
+            {
+                "period": period,
+                "sort": fiscal_year * 4 + fiscal_quarter,
+                "fiscal_year": fiscal_year,
+                "fiscal_quarter": fiscal_quarter,
+                "values": {},
+            },
+        )
+        _dict(row["values"])[str(point.get("metric", ""))] = {
+            "amount": point.get("amount"),
+            "growth_rate": point.get("growth_rate"),
+        }
+
+    return [
+        {key: value for key, value in row.items() if key != "sort"}
+        for row in sorted(rows.values(), key=lambda item: int(item["sort"]), reverse=True)
+    ]
+
+
+def _group_growth_points(points: list[dict[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for point in points:
+        key = (str(point.get("metric", "")), str(point.get("series_type", "")))
+        grouped.setdefault(key, []).append(point)
+
+    sections = []
+    for (metric, series_type), section_points in grouped.items():
+        section_points.sort(
+            key=lambda point: (
+                int(point.get("fiscal_year", 0) or 0),
+                int(point.get("fiscal_quarter", 0) or 0),
+            )
+        )
+        sections.append(
+            {
+                "metric": metric,
+                "metric_label": METRIC_LABELS.get(metric, metric),
+                "series_type": series_type,
+                "series_label": SERIES_LABELS.get(series_type, series_type),
+                "points": section_points,
+            }
+        )
+
+    sections.sort(
+        key=lambda section: (
+            METRIC_ORDER.get(str(section["metric"]), 999),
+            SERIES_ORDER.get(str(section["series_type"]), 999),
+        )
+    )
+    return sections
+
+
+def _growth_points_from_payload(payload: dict[str, object]) -> list[dict[str, object]]:
+    raw_points = payload.get("growth_points", [])
+    if not isinstance(raw_points, list):
+        return []
+    points = []
+    for item in raw_points:
+        if not isinstance(item, dict):
+            continue
+        fiscal_quarter = item.get("fiscal_quarter")
+        points.append(
+            {
+                **item,
+                "period_label": (
+                    f"{item.get('fiscal_year')}Q{fiscal_quarter}"
+                    if fiscal_quarter is not None
+                    else str(item.get("fiscal_year", ""))
+                ),
+            }
+        )
+    return points
+
+
+def _filter_results_from_payload(payload: dict[str, object]) -> list[dict[str, object]]:
+    filter_payload = payload.get("filter")
+    if not isinstance(filter_payload, dict):
+        return []
+    raw_results = filter_payload.get("results", [])
+    if not isinstance(raw_results, list):
+        return []
+    return [item for item in raw_results if isinstance(item, dict)]
+
+
+def _company_from_rows(
+    company: DartCompany,
+    rows: list[FinancialStatementRow],
+) -> dict[str, str]:
+    for row in rows:
+        if row.corp_code == company.corp_code:
+            return {
+                "corp_code": row.corp_code,
+                "corp_name": row.corp_name,
+                "stock_code": row.stock_code,
+            }
+    return {
+        "corp_code": company.corp_code,
+        "corp_name": company.corp_name,
+        "stock_code": company.stock_code,
+    }
+
+
+def _company_title(company: dict[str, object]) -> str:
+    name = str(company.get("corp_name") or "").strip()
+    stock_code = str(company.get("stock_code") or "").strip()
+    corp_code = str(company.get("corp_code") or "").strip()
+    if name and stock_code:
+        return f"{name} ({stock_code})"
+    return name or stock_code or corp_code
+
+
+def _company_name(company: dict[str, object]) -> str:
+    name = str(company.get("corp_name") or "").strip()
+    stock_code = str(company.get("stock_code") or "").strip()
+    corp_code = str(company.get("corp_code") or "").strip()
+    return name or stock_code or corp_code
+
+
+def _period_sort_key(value: FinancialPeriodValue) -> int:
+    quarter = value.fiscal_quarter if value.fiscal_quarter is not None else 4
+    return value.fiscal_year * 4 + quarter
+
+
+def _index_growth_rates(
+    growth_points: list[dict[str, object]],
+    *,
+    series_type: str,
+) -> dict[tuple[str, str], object]:
+    index: dict[tuple[str, str], object] = {}
+    for point in growth_points:
+        if str(point.get("series_type", "")) != series_type:
+            continue
+        key = (str(point.get("metric", "")), str(point.get("period_label", "")))
+        index[key] = point.get("growth_rate")
+    return index
+
+
+def _format_amount_cell(cell: dict[str, object]) -> str:
+    amount = cell.get("amount")
+    if amount is None:
+        return "-"
+    return _format_amount_with_growth(amount, cell.get("growth_rate"))
+
+
+def _format_amount_with_growth(amount: object, growth_rate: object) -> str:
+    return f"{_format_amount(amount)} ({_format_percent(growth_rate)})"
+
+
+def _amount_chart_fill(growth_rate: object) -> str:
+    growth = _to_decimal(growth_rate)
+    if growth is None:
+        return "#b7c0c8"
+    if growth > 0:
+        return "rgb(62, 230, 165)"
+    if growth < 0:
+        return "rgb(240, 81, 81)"
+    return "#b7c0c8"
+
+
+def _growth_class(value: object) -> str:
+    parsed = _to_decimal(value)
+    if parsed is None:
+        return "is-neutral"
+    if parsed > 0:
+        return "is-positive"
+    if parsed < 0:
+        return "is-negative"
+    return "is-neutral"
+
+
+def _pass_class(value: object) -> str:
+    return "is-pass" if value is True else "is-fail"
+
+
+def _subtract_decimal(left: object, right: object) -> Decimal | None:
+    left_value = _to_decimal(left)
+    right_value = _to_decimal(right)
+    if left_value is None or right_value is None:
+        return None
+    return left_value - right_value
+
+
+def _to_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except InvalidOperation:
+        return None
+
+
+def _svg_number(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.01")))
+
+
+def _truncate_label(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 1] + "…"
+
+
+def _parse_int(value: str, *, field_name: str) -> int:
+    try:
+        return int(value)
+    except ValueError as error:
+        raise ValueError(f"{field_name}은 숫자로 입력해 주세요.") from error
+
+
+def _parse_decimal(value: str, *, field_name: str) -> Decimal:
+    try:
+        return Decimal(value)
+    except InvalidOperation as error:
+        raise ValueError(f"{field_name}은 숫자로 입력해 주세요.") from error
+
+
+def _parse_optional_decimal(value: str, *, field_name: str) -> Decimal | None:
+    text = value.strip()
+    if not text:
+        return None
+    return _parse_decimal(text, field_name=field_name)
+
+
+def _parse_fs_div(value: str) -> str | None:
+    normalized = value.strip().upper()
+    if normalized in {"", "ALL"}:
+        return None
+    if normalized not in {"CFS", "OFS"}:
+        raise ValueError("재무제표는 연결, 별도, 전체 중 하나를 선택해 주세요.")
+    return normalized
+
+
+def _parse_market(value: str) -> str | None:
+    normalized = value.strip().upper()
+    if normalized in {"", "ALL"}:
+        return None
+    if normalized not in {"KOSPI", "KOSDAQ"}:
+        raise ValueError("시장은 KOSPI, KOSDAQ, 전체 중 하나를 선택해 주세요.")
+    return normalized
+
+
+def _normalize_ranking_sort(*, sort_by: str) -> str:
+    normalized = sort_by.strip().lower()
+    if normalized in {"market_cap", "per", "pbr", "roe"}:
+        return normalized
+    return DEFAULT_RANKING_SORT_BY
+
+
+def _normalize_company_name(value: str) -> str:
+    return "".join(value.casefold().split())
+
+
+def _ambiguous_company_message(
+    query: str,
+    companies: list[DartCompany],
+) -> str:
+    candidates = ", ".join(
+        f"{company.corp_name}({company.stock_code or company.corp_code})"
+        for company in companies[:5]
+    )
+    return f"'{query}'에 해당하는 기업이 여러 개입니다: {candidates}"
+
+
+def _format_request_error(prefix: str, error: Exception) -> str:
+    message = str(error).strip()
+    if not message:
+        return prefix
+    return f"{prefix} {message}"
+
+
+def _option(value: str, label: str, selected: str) -> str:
+    is_selected = value == selected.upper()
+    return (
+        f'<option value="{escape(value)}" selected>{escape(label)}</option>'
+        if is_selected
+        else f'<option value="{escape(value)}">{escape(label)}</option>'
+    )
+
+
+def _normalize_return_href(value: object) -> str:
+    text = str(value or "").strip()
+    if not text.startswith("/"):
+        return ""
+    return text
+
+
+def _append_tab_return_params(
+    href: str,
+    *,
+    return_analysis: str = "",
+    return_compare: str = "",
+    return_ranking: str = "",
+    return_db_update: str = "",
+) -> str:
+    normalized_href = str(href or "").strip()
+    if not normalized_href:
+        return ""
+    split = urlsplit(normalized_href)
+    params = [
+        (key, value)
+        for key, value in parse_qsl(split.query, keep_blank_values=True)
+        if key not in TAB_RETURN_PARAM_KEYS
+    ]
+    for key, value in (
+        ("return_analysis", _normalize_return_href(return_analysis)),
+        ("return_compare", _normalize_return_href(return_compare)),
+        ("return_ranking", _normalize_return_href(return_ranking)),
+        ("return_db_update", _normalize_return_href(return_db_update)),
+    ):
+        if value:
+            params.append((key, value))
+    query = urlencode(params)
+    return urlunsplit(("", "", split.path, query, split.fragment))
+
+
+def _build_analysis_href(
+    *,
+    company_query: str,
+    recent_years: str,
+    end_year: str,
+    fs_div: str,
+    threshold_percent: str,
+    top_tab: str = "",
+    fragment: str = "",
+    refresh: bool = False,
+) -> str:
+    params = {
+        "company_query": company_query,
+        "recent_years": recent_years,
+        "end_year": end_year,
+        "fs_div": fs_div,
+        "threshold_percent": threshold_percent,
+        "tab": _normalize_analysis_tab(top_tab) if top_tab else "",
+        "refresh": "1" if refresh else "",
+    }
+    filtered = {key: value for key, value in params.items() if str(value).strip()}
+    query = urlencode(filtered)
+    href = f"/analysis?{query}" if query else "/analysis"
+    return f"{href}#{fragment}" if fragment else href
+
+
+def _build_compare_href(
+    *,
+    primary_company_query: str,
+    secondary_company_query: str = "",
+    recent_years: str,
+    end_year: str,
+    fs_div: str,
+    threshold_percent: str,
+) -> str:
+    params = {
+        "primary_company_query": primary_company_query,
+        "secondary_company_query": secondary_company_query,
+        "recent_years": recent_years,
+        "end_year": end_year,
+        "fs_div": fs_div,
+        "threshold_percent": threshold_percent,
+    }
+    filtered = {key: value for key, value in params.items() if str(value).strip()}
+    query = urlencode(filtered)
+    return f"/compare?{query}" if query else "/compare"
+
+
+def _analysis_tab_fragment(top_tab: str) -> str:
+    normalized = _normalize_analysis_tab(top_tab)
+    if normalized == "overview":
+        return "overview-summary"
+    if normalized == "growth":
+        return "growth-details"
+    return "financials-details"
+
+
+def _build_ranking_href(
+    *,
+    market: str = DEFAULT_MARKET_FILTER,
+    recent_years: str,
+    end_year: str,
+    fs_div: str,
+    threshold_percent: str,
+) -> str:
+    params = {
+        "market": market,
+        "recent_years": recent_years,
+        "end_year": end_year,
+        "fs_div": fs_div,
+        "threshold_percent": threshold_percent,
+    }
+    filtered = {
+        key: value
+        for key, value in params.items()
+        if str(value).strip() and not (key == "market" and str(value).strip().upper() == "ALL")
+    }
+    query = urlencode(filtered)
+    return f"/ranking?{query}" if query else "/ranking"
+
+
+def _normalize_analysis_tab(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"overview", "growth"}:
+        return "financials"
+    if normalized in ANALYSIS_TABS:
+        return normalized
+    return DEFAULT_ANALYSIS_TAB
+
+
+def _analysis_form_fs_div(
+    form: AnalysisForm,
+    summary: dict[str, object],
+) -> str:
+    summary_fs_div = str(summary.get("fs_div", "")).strip()
+    if summary_fs_div == "연결":
+        return "CFS"
+    if summary_fs_div == "별도":
+        return "OFS"
+    if summary_fs_div == "전체":
+        return "ALL"
+    return form.fs_div
+
+
+def _dict(value: object) -> dict[str, object]:
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value: object) -> list[object]:
+    return value if isinstance(value, list) else []
+
+
+def _page_styles() -> str:
+    return """
+    :root {
+      color-scheme: light;
+      --ink: #18212a;
+      --muted: #607080;
+      --line: #d7dee6;
+      --surface: #f4f7fb;
+      --surface-alt: #eef3f8;
+      --panel: #ffffff;
+      --accent: #2563eb;
+      --accent-soft: #e8f0ff;
+      --accent-strong: #0f4bcf;
+      --teal: rgb(62, 230, 165);
+      --red: rgb(240, 81, 81);
+      --warning: #f59e0b;
+      --shadow: 0 10px 24px rgba(22, 34, 51, 0.06);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, "Malgun Gothic", sans-serif;
+      color: var(--ink);
+      background: #f1f4f8;
+      line-height: 1.45;
+    }
+    a { color: inherit; text-decoration: none; }
+    button, input, select {
+      font: inherit;
+    }
+    .shell-header {
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #f7f9fc 0%, #eef3f8 100%);
+    }
+    .context-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-height: 48px;
+      padding: 0 20px;
+      border-bottom: 1px solid var(--line);
+    }
+    .context-chip {
+      padding: 8px 12px;
+      border: 1px solid #c7d3df;
+      border-radius: 6px;
+      background: #ffffff;
+      color: var(--accent-strong);
+      font-weight: 700;
+      font-size: 14px;
+    }
+    .context-meta {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .top-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 2px;
+      padding: 0 14px;
+      background: #ffffff;
+    }
+    .top-tab {
+      padding: 13px 12px 12px;
+      color: #415264;
+      font-size: 14px;
+      font-weight: 700;
+      border-bottom: 2px solid transparent;
+    }
+    .top-tab.is-active {
+      color: var(--ink);
+      border-bottom-color: var(--accent);
+    }
+    .shell-main {
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 18px 16px 40px;
+    }
+    .toolbar-surface,
+    .panel,
+    .notice {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .toolbar-surface {
+      padding: 12px 14px;
+      margin-bottom: 14px;
+    }
+    .toolbar-surface-tight {
+      padding: 10px 14px;
+    }
+    .section-tabs {
+      display: flex;
+      gap: 10px;
+      padding-bottom: 12px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--line);
+      overflow-x: auto;
+    }
+    .section-tab {
+      color: #516273;
+      font-size: 14px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .section-tab.is-active {
+      color: var(--ink);
+    }
+    .query-form {
+      display: grid;
+      grid-template-columns: minmax(280px, 1.5fr) repeat(3, minmax(120px, 0.7fr)) auto;
+      gap: 12px;
+      align-items: end;
+    }
+    .query-form-compare {
+      grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) repeat(3, minmax(120px, 0.7fr)) auto;
+    }
+    .query-form-ranking {
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: 8px 10px;
+    }
+    .query-form-ranking .field {
+      gap: 4px;
+    }
+    .query-form-ranking input,
+    .query-form-ranking select {
+      min-height: 36px;
+      padding: 6px 10px;
+    }
+    .query-form-ranking .primary-button {
+      min-height: 36px;
+      padding: 8px 18px;
+      min-width: 180px;
+    }
+    .ranking-action-row {
+      grid-column: 1 / -1;
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 8px;
+    }
+    .field {
+      display: grid;
+      gap: 6px;
+      color: #3b4b5b;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .field-grow {
+      min-width: 0;
+    }
+    input,
+    select {
+      min-height: 40px;
+      border: 1px solid #cbd5df;
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: var(--ink);
+      background: #ffffff;
+    }
+    input:focus,
+    select:focus {
+      outline: 2px solid #dbe7ff;
+      border-color: #9db8f8;
+    }
+    .primary-button,
+    .ghost-link,
+    .segmented-button,
+    .metric-switch {
+      border-radius: 6px;
+    }
+    .primary-button {
+      min-height: 40px;
+      padding: 10px 16px;
+      border: 0;
+      color: #ffffff;
+      background: linear-gradient(180deg, #3b7cff 0%, #1f63ea 100%);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .primary-button[disabled] {
+      opacity: 0.75;
+      cursor: wait;
+    }
+    .ghost-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      padding: 0 12px;
+      border: 1px solid #bfd0e6;
+      background: #ffffff;
+      color: #33547d;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .toolbar-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .toolbar-row-dense {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }
+    .toolbar-note {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .toolbar-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .inline-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 0 10px;
+      border: 1px solid #d3dce5;
+      border-radius: 999px;
+      background: #ffffff;
+      color: #536273;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .inline-pill-accent {
+      background: #ebfbf7;
+      border-color: #b6f1df;
+      color: #0f766e;
+    }
+    .inline-pill-contrast {
+      background: #fff0f4;
+      border-color: #ffccd7;
+      color: #be123c;
+    }
+    .inline-pill-muted {
+      background: #f6f7fb;
+      border-color: #d6dbe7;
+      color: #66758a;
+    }
+    .segmented {
+      display: inline-flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .segmented-button,
+    .metric-switch {
+      border: 1px solid #ccd8e4;
+      background: #f8fafc;
+      color: #4a5b6c;
+      min-height: 34px;
+      padding: 0 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .segmented-button.is-active,
+    .metric-switch.is-active {
+      border-color: #8fb0ff;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+    }
+    .segmented-button-danger {
+      border-color: #f4b7b7;
+      background: #fff5f5;
+      color: #b3261e;
+    }
+    .diagnostic-card {
+      margin-top: 12px;
+      padding: 14px 16px;
+      border: 1px solid #cfe0ff;
+      border-radius: 8px;
+      background: #f4f8ff;
+      display: grid;
+      gap: 10px;
+    }
+    .diagnostic-heading {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .diagnostic-title {
+      font-size: 15px;
+      font-weight: 800;
+      color: #204b9b;
+    }
+    .diagnostic-copy {
+      font-size: 13px;
+      color: #4d617a;
+    }
+    .diagnostic-button {
+      min-height: 42px;
+      padding: 0 16px;
+      border: 1px solid #8fb0ff;
+      border-radius: 8px;
+      background: #dfeaff;
+      color: #204b9b;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .diagnostic-result {
+      min-height: 20px;
+      font-size: 13px;
+      color: #2f4259;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+    .refresh-status-card {
+      margin-top: 12px;
+      padding: 14px 16px;
+      border: 1px solid #d6dbe7;
+      border-radius: 8px;
+      background: #f8fafc;
+      display: grid;
+      gap: 8px;
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+    .refresh-status-card[data-state="running"] {
+      border-color: #b7d9d0;
+      background: #f2fbf8;
+    }
+    .refresh-status-card[data-state="success"] {
+      border-color: #b6f1df;
+      background: #ebfbf7;
+    }
+    .refresh-status-card[data-state="warning"] {
+      border-color: #ffe2a8;
+      background: #fff8e8;
+    }
+    .refresh-status-card[data-state="error"],
+    .refresh-status-card[data-state="blocked"] {
+      border-color: #ffccd7;
+      background: #fff0f4;
+    }
+    .refresh-status-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .refresh-status-title {
+      font-size: 15px;
+      font-weight: 800;
+      color: #2f4259;
+    }
+    .refresh-status-card[data-state="running"] .refresh-status-title {
+      color: #16423b;
+    }
+    .refresh-status-card[data-state="success"] .refresh-status-title {
+      color: #0f766e;
+    }
+    .refresh-status-card[data-state="warning"] .refresh-status-title {
+      color: #9a6700;
+    }
+    .refresh-status-card[data-state="error"] .refresh-status-title,
+    .refresh-status-card[data-state="blocked"] .refresh-status-title {
+      color: #be123c;
+    }
+    .refresh-status-spinner {
+      display: none;
+      width: 16px;
+      height: 16px;
+      border-width: 2px;
+    }
+    .refresh-status-card[data-state="running"] .refresh-status-spinner {
+      display: inline-block;
+    }
+    .refresh-status-copy {
+      font-size: 14px;
+      color: #334155;
+      line-height: 1.5;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+    .notice {
+      padding: 12px 14px;
+      margin-bottom: 14px;
+    }
+    .notice.error {
+      border-color: #f2c5c5;
+      background: #fff6f6;
+      color: #b3261e;
+    }
+    .notice.info {
+      border-color: #cfe0ff;
+      background: #f4f8ff;
+      color: #30558c;
+    }
+    .loading-indicator {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      border-color: #b7d9d0;
+      background: #f2fbf8;
+      color: #16423b;
+    }
+    body.is-loading .loading-indicator {
+      display: flex;
+    }
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 2px solid #c5ddd6;
+      border-top-color: #0f766e;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+      flex: 0 0 auto;
+    }
+    .loading-copy {
+      margin: 4px 0 0;
+      color: #16423b;
+      font-size: 13px;
+    }
+    .report-shell {
+      display: grid;
+      gap: 14px;
+    }
+    .company-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 18px;
+    }
+    .company-header h2 {
+      margin: 0 0 4px;
+      font-size: 24px;
+    }
+    .company-header p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .company-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .company-actions-compare {
+      align-items: stretch;
+      gap: 12px;
+    }
+    .compare-company-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+      align-items: center;
+    }
+    .overview-layout {
+      display: grid;
+      grid-template-columns: minmax(340px, 1fr) minmax(420px, 1.1fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .compare-overview {
+      grid-template-columns: minmax(320px, 0.9fr) minmax(420px, 1.1fr);
+    }
+    .panel {
+      padding: 16px;
+    }
+    .panel-heading {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-bottom: 12px;
+    }
+    .panel-heading h3 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .panel-heading p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .panel-heading-split {
+      flex-direction: row;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .metric-switches {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .period-panel[hidden],
+    .chart-focus-panel[hidden],
+    .grid-card[hidden],
+    .info-card[hidden],
+    .compare-stat-grid[hidden] {
+      display: none !important;
+    }
+    .matrix-heading {
+      margin-bottom: 6px;
+      color: #415264;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .matrix-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      table-layout: fixed;
+    }
+    .matrix-table th,
+    .matrix-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #ebeff4;
+      text-align: left;
+      vertical-align: top;
+    }
+    .matrix-table th:first-child,
+    .matrix-table td:first-child {
+      text-align: left;
+      white-space: nowrap;
+    }
+    .matrix-table thead th {
+      color: var(--muted);
+      font-weight: 700;
+      background: #fafbfd;
+      vertical-align: bottom;
+    }
+    .matrix-table thead th:not(:first-child),
+    .matrix-table td:not(:first-child) {
+      padding-left: 12px;
+    }
+    .matrix-cell {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: nowrap;
+      min-height: 28px;
+    }
+    .matrix-check-label,
+    .matrix-period-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      margin: 0;
+      white-space: nowrap;
+      line-height: 1.1;
+    }
+    .matrix-check-label {
+      font-weight: 600;
+    }
+    .matrix-threshold-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+    }
+    .matrix-period-input {
+      width: 60px;
+      min-height: 30px;
+      height: 30px;
+      padding: 3px 6px;
+      font-size: 13px;
+      line-height: 1.2;
+    }
+    .matrix-threshold-input {
+      width: 58px;
+      min-height: 30px;
+      height: 30px;
+      padding: 3px 6px;
+      font-size: 13px;
+      line-height: 1.2;
+    }
+    .matrix-period-unit {
+      color: #475569;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .matrix-amount {
+      font-weight: 700;
+      color: var(--ink);
+    }
+    .matrix-growth {
+      margin-top: 4px;
+      font-size: 12px;
+    }
+    .matrix-growth.is-positive {
+      color: #0f766e;
+    }
+    .matrix-growth.is-negative {
+      color: #d14343;
+    }
+    .matrix-growth.is-neutral {
+      color: var(--muted);
+    }
+    .chart-shell {
+      display: grid;
+      gap: 8px;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .legend-swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 4px;
+      background: #b7c0c8;
+    }
+    .legend-line {
+      width: 18px;
+      height: 0;
+      border-top: 3px solid #2563eb;
+      border-radius: 999px;
+    }
+    .amount-chart {
+      width: 100%;
+      min-height: 220px;
+      border: 1px solid #dbe3ec;
+      border-radius: 8px;
+      background: linear-gradient(180deg, #fbfcfd 0%, #ffffff 100%);
+    }
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .grid-card,
+    .info-card {
+      display: grid;
+      gap: 8px;
+    }
+    .filter-list {
+      display: grid;
+      gap: 10px;
+    }
+    .filter-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      align-items: center;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #ebeff4;
+      font-size: 13px;
+    }
+    .filter-row strong {
+      font-size: 13px;
+    }
+    .filter-row em {
+      font-style: normal;
+      font-weight: 700;
+    }
+    .filter-row em.is-pass {
+      color: #0f766e;
+    }
+    .filter-row em.is-fail {
+      color: #d14343;
+    }
+    .info-card-footer {
+      margin-top: auto;
+      padding-top: 10px;
+      border-top: 1px solid #ebeff4;
+    }
+    .growth-section details,
+    details.panel {
+      padding: 14px 16px;
+    }
+    details summary {
+      cursor: pointer;
+      font-weight: 700;
+      color: #314150;
+    }
+    .settings-surface {
+      margin-bottom: 14px;
+      padding: 12px 16px;
+    }
+    .settings-summary {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      list-style: none;
+    }
+    .settings-summary::-webkit-details-marker {
+      display: none;
+    }
+    details[open] summary {
+      margin-bottom: 12px;
+    }
+    .growth-series {
+      display: grid;
+      gap: 12px;
+      padding-top: 12px;
+      margin-top: 12px;
+      border-top: 1px solid #ebeff4;
+    }
+    .growth-series h3 {
+      margin: 0;
+      font-size: 16px;
+    }
+    .growth-detail-chart {
+      min-height: 300px;
+      background: linear-gradient(180deg, #fcfbff 0%, #ffffff 100%);
+    }
+    .growth-table-wrap {
+      overflow-x: auto;
+      border: 1px solid #e8eaf6;
+      border-radius: 8px;
+      background: #fcfcff;
+    }
+    .growth-table {
+      margin: 0;
+    }
+    .growth-table thead th {
+      background: #f6f3ff;
+      color: #5b5f88;
+    }
+    .growth-table tbody tr:nth-child(even) {
+      background: #fafaff;
+    }
+    .growth-value {
+      font-weight: 700;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th,
+    td {
+      padding: 8px 10px;
+      border-bottom: 1px solid #ebeff4;
+      text-align: right;
+      white-space: nowrap;
+    }
+    th:first-child,
+    td:first-child {
+      text-align: left;
+    }
+    .table-scroll {
+      overflow-x: auto;
+    }
+    .screening-table thead th {
+      background: #fafbfd;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .table-link {
+      color: var(--accent-strong);
+      font-weight: 700;
+    }
+    .table-link:hover {
+      text-decoration: underline;
+    }
+    th {
+      background: #fafbfd;
+      color: #415264;
+      font-weight: 700;
+    }
+    .compare-stat-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .compare-chart-stack {
+      display: grid;
+      gap: 12px;
+    }
+    .compare-chart-panel {
+      display: grid;
+      gap: 8px;
+    }
+    .compare-panel-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #334155;
+    }
+    .compare-stat-card {
+      border: 1px solid #e5ebf2;
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcfe;
+    }
+    .compare-stat-title {
+      font-weight: 700;
+      color: var(--ink);
+      margin-bottom: 2px;
+    }
+    .compare-stat-period {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
+    .compare-stat-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 8px;
+      align-items: center;
+      padding: 6px 0;
+      font-size: 13px;
+    }
+    .compare-stat-row strong {
+      font-size: 14px;
+    }
+    .compare-stat-row em {
+      color: var(--muted);
+      font-style: normal;
+      font-size: 12px;
+    }
+    .compare-stat-delta {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid #e7edf4;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .empty-state {
+      padding: 18px;
+    }
+    .empty-state h2 {
+      margin: 0 0 8px;
+      font-size: 22px;
+    }
+    .empty-state p {
+      margin: 0 0 14px;
+      color: var(--muted);
+    }
+    .empty-list {
+      margin: 0;
+      padding-left: 18px;
+      color: #445667;
+    }
+    .empty-list li + li {
+      margin-top: 6px;
+    }
+    .empty {
+      color: var(--muted);
+    }
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    @media (max-width: 1180px) {
+      .query-form,
+      .query-form-compare,
+      .query-form-ranking {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .overview-layout,
+      .compare-overview {
+        grid-template-columns: 1fr;
+      }
+    }
+    @media (max-width: 840px) {
+      .shell-main {
+        padding: 14px 12px 32px;
+      }
+      .query-form,
+      .query-form-compare,
+      .query-form-ranking,
+      .dashboard-grid,
+      .compare-stat-grid {
+        grid-template-columns: 1fr;
+      }
+      .company-header {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .panel-heading-split {
+        flex-direction: column;
+      }
+      .top-tabs {
+        overflow-x: auto;
+        white-space: nowrap;
+      }
+      .matrix-cell {
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+    }
+    """
+
+
+def _page_script() -> str:
+    return """
+    (() => {
+      const loadingForms = document.querySelectorAll("[data-loading-form]");
+      const loadingStatus = document.getElementById("loading-status");
+      const sharedSettingsMessage = document.getElementById("shared-settings-message");
+      const saveOpenDartKeyButton = document.getElementById("save-opendart-key-button");
+      const openDartKeyLabelInput = document.getElementById("opendart-key-label");
+      const openDartKeyValueInput = document.getElementById("opendart-key-value");
+      const loadingMessages = [
+        "OpenDART에서 기업 목록을 확인하고 있습니다.",
+        "연도별 재무제표 데이터를 가져오고 있습니다.",
+        "성장률을 계산하고 차트를 준비하고 있습니다.",
+      ];
+      let loadingTimer = null;
+
+      const requestJson = async (url, method = "GET", body = null) => {
+        const response = await fetch(url, {
+          method,
+          headers: body ? { "Content-Type": "application/json" } : {},
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.message || "요청 처리 중 오류가 발생했습니다.");
+        }
+        return payload;
+      };
+
+      const setSharedSettingsMessage = (value) => {
+        if (sharedSettingsMessage) {
+          sharedSettingsMessage.textContent = value;
+        }
+      };
+
+      const resetLoading = () => {
+        document.body.classList.remove("is-loading");
+        document.querySelectorAll("[data-submit-label]").forEach((node) => {
+          node.hidden = false;
+        });
+        document.querySelectorAll("[data-submit-loading]").forEach((node) => {
+          node.hidden = true;
+        });
+        document.querySelectorAll(".primary-button").forEach((node) => {
+          node.disabled = false;
+        });
+        if (loadingStatus) {
+          loadingStatus.textContent = loadingMessages[0];
+        }
+        if (loadingTimer !== null) {
+          window.clearInterval(loadingTimer);
+          loadingTimer = null;
+        }
+      };
+
+      loadingForms.forEach((form) => {
+        form.addEventListener("submit", () => {
+          document.body.classList.add("is-loading");
+          const button = form.querySelector(".primary-button");
+          if (button) {
+            button.disabled = true;
+          }
+          const label = form.querySelector("[data-submit-label]");
+          const loading = form.querySelector("[data-submit-loading]");
+          if (label) {
+            label.hidden = true;
+          }
+          if (loading) {
+            loading.hidden = false;
+          }
+          let messageIndex = 0;
+          if (loadingStatus) {
+            loadingStatus.textContent = loadingMessages[messageIndex];
+          }
+          if (loadingTimer !== null) {
+            window.clearInterval(loadingTimer);
+          }
+          loadingTimer = window.setInterval(() => {
+            if (messageIndex < loadingMessages.length - 1) {
+              messageIndex += 1;
+              if (loadingStatus) {
+                loadingStatus.textContent = loadingMessages[messageIndex];
+              }
+            }
+          }, 2200);
+        });
+      });
+
+      window.addEventListener("pageshow", resetLoading);
+
+      document.querySelectorAll("[data-year-preset]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const formId = button.getAttribute("data-year-form");
+          const inputId = button.getAttribute("data-year-input");
+          const years = button.getAttribute("data-year-preset");
+          const form = formId ? document.getElementById(formId) : null;
+          const input = inputId ? document.getElementById(inputId) : null;
+          if (!form || !input || !years) {
+            return;
+          }
+          input.value = years;
+          if (typeof form.requestSubmit === "function") {
+            form.requestSubmit();
+          } else {
+            form.submit();
+          }
+        });
+      });
+
+      if (saveOpenDartKeyButton) {
+        saveOpenDartKeyButton.addEventListener("click", async () => {
+          try {
+            const payload = await requestJson("/ranking/opendart-keys", "POST", {
+              label: openDartKeyLabelInput ? openDartKeyLabelInput.value : "",
+              api_key: openDartKeyValueInput ? openDartKeyValueInput.value : "",
+            });
+            setSharedSettingsMessage(payload.message || "OpenDART 키를 저장했습니다.");
+            window.location.reload();
+          } catch (error) {
+            setSharedSettingsMessage(String(error.message || error));
+          }
+        });
+      }
+
+      document.addEventListener("click", async (event) => {
+        const target = event.target instanceof HTMLElement ? event.target : null;
+        if (!target) {
+          return;
+        }
+        const activateButton = target.closest("[data-opendart-activate]");
+        if (activateButton) {
+          try {
+            const keyId = activateButton.getAttribute("data-opendart-activate");
+            const payload = await requestJson(
+              `/ranking/opendart-keys/${encodeURIComponent(keyId)}/activate`,
+              "POST",
+              {}
+            );
+            setSharedSettingsMessage(
+              payload.message || "활성 OpenDART 키를 변경했습니다."
+            );
+            window.location.reload();
+          } catch (error) {
+            setSharedSettingsMessage(String(error.message || error));
+          }
+          return;
+        }
+        const deleteButton = target.closest("[data-opendart-delete]");
+        if (deleteButton) {
+          const confirmed = window.confirm("이 OpenDART 키를 삭제할까요?");
+          if (!confirmed) {
+            return;
+          }
+          try {
+            const keyId = deleteButton.getAttribute("data-opendart-delete");
+            const payload = await requestJson(
+              `/ranking/opendart-keys/${encodeURIComponent(keyId)}`,
+              "DELETE"
+            );
+            setSharedSettingsMessage(payload.message || "OpenDART 키를 삭제했습니다.");
+            window.location.reload();
+          } catch (error) {
+            setSharedSettingsMessage(String(error.message || error));
+          }
+        }
+      });
+
+      document.querySelectorAll("[data-dashboard]").forEach((dashboard) => {
+        const periodButtons = Array.from(
+          dashboard.querySelectorAll("[data-period-toggle]")
+        );
+        const metricButtons = Array.from(
+          dashboard.querySelectorAll("[data-metric-toggle]")
+        );
+        const panels = Array.from(dashboard.querySelectorAll("[data-panel]"));
+        let activePeriod =
+          dashboard.getAttribute("data-initial-period") ||
+          (periodButtons[0] && periodButtons[0].getAttribute("data-period-toggle")) ||
+          "";
+        let activeMetric =
+          dashboard.getAttribute("data-initial-metric") ||
+          (metricButtons[0] && metricButtons[0].getAttribute("data-metric-toggle")) ||
+          "";
+
+        const applyState = () => {
+          const allowedMetricButtons = metricButtons.filter((button) => {
+            const periods = (
+              button.getAttribute("data-metric-periods") || ""
+            )
+              .split(",")
+              .map((value) => value.trim())
+              .filter(Boolean);
+            return periods.length === 0 || periods.includes(activePeriod);
+          });
+          if (
+            !allowedMetricButtons.some(
+              (button) => button.getAttribute("data-metric-toggle") === activeMetric
+            )
+          ) {
+            activeMetric =
+              (allowedMetricButtons[0] &&
+                allowedMetricButtons[0].getAttribute("data-metric-toggle")) ||
+              "";
+          }
+          periodButtons.forEach((button) => {
+            const selected =
+              button.getAttribute("data-period-toggle") === activePeriod;
+            button.classList.toggle("is-active", selected);
+          });
+          metricButtons.forEach((button) => {
+            const periods = (
+              button.getAttribute("data-metric-periods") || ""
+            )
+              .split(",")
+              .map((value) => value.trim())
+              .filter(Boolean);
+            const allowed =
+              periods.length === 0 || periods.includes(activePeriod);
+            const selected =
+              allowed && button.getAttribute("data-metric-toggle") === activeMetric;
+            button.hidden = !allowed;
+            button.classList.toggle("is-active", selected);
+          });
+          panels.forEach((panel) => {
+            const period = panel.getAttribute("data-period");
+            const metric = panel.getAttribute("data-metric");
+            const periodMatch = !period || period === activePeriod;
+            const metricMatch = !metric || metric === activeMetric;
+            panel.hidden = !(periodMatch && metricMatch);
+          });
+        };
+
+        periodButtons.forEach((button) => {
+          button.addEventListener("click", () => {
+            const nextPeriod = button.getAttribute("data-period-toggle");
+            if (!nextPeriod) {
+              return;
+            }
+            activePeriod = nextPeriod;
+            applyState();
+          });
+        });
+
+        metricButtons.forEach((button) => {
+          button.addEventListener("click", () => {
+            const nextMetric = button.getAttribute("data-metric-toggle");
+            if (!nextMetric) {
+              return;
+            }
+            activeMetric = nextMetric;
+            applyState();
+          });
+        });
+
+        applyState();
+      });
+    })();
+    """
+
+
+def _growth_period_input_name(*, series_type: str, metric: str) -> str:
+    return f"growth_period__{series_type}__{metric}"
+
+
+def _growth_threshold_input_name(
+    *,
+    series_type: str,
+    metric: str | None = None,
+) -> str:
+    if metric:
+        return f"growth_threshold__{series_type}__{metric}"
+    return f"growth_threshold__{series_type}"
+
+
+def _read_growth_period_inputs(request: Request) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for series_type in GROWTH_CONDITION_SERIES:
+        for metric in GROWTH_CONDITION_METRICS:
+            key = _growth_period_input_name(series_type=series_type, metric=metric)
+            raw_value = request.query_params.get(key)
+            if raw_value is not None:
+                values[key] = str(raw_value).strip()
+    return values
+
+
+def _read_growth_threshold_inputs(request: Request) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for series_type in GROWTH_CONDITION_SERIES:
+        legacy_key = _growth_threshold_input_name(series_type=series_type)
+        legacy_value = request.query_params.get(legacy_key)
+        if legacy_value is not None:
+            values[legacy_key] = str(legacy_value).strip()
+        for metric in GROWTH_CONDITION_METRICS:
+            key = _growth_threshold_input_name(series_type=series_type, metric=metric)
+            raw_value = request.query_params.get(key)
+            if raw_value is not None:
+                values[key] = str(raw_value).strip()
+    return values
+
+
+def _growth_period_input_map(form: RankingForm) -> dict[str, str]:
+    return {
+        str(key): str(value)
+        for key, value in form.growth_period_inputs
+        if str(key).strip()
+    }
+
+
+def _growth_threshold_input_map(form: RankingForm) -> dict[str, str]:
+    return {
+        str(key): str(value)
+        for key, value in form.growth_threshold_inputs
+        if str(key).strip()
+    }
+
+
+def _ranking_selected_conditions(form: RankingForm) -> list[dict[str, object]]:
+    period_inputs = _growth_period_input_map(form)
+    threshold_inputs = _growth_threshold_input_map(form)
+    raw_conditions = list(form.growth_conditions or DEFAULT_RANKING_GROWTH_CONDITIONS)
+    normalized_conditions: list[dict[str, object] | str] = []
+    for raw_condition in raw_conditions:
+        text = str(raw_condition or "").strip()
+        if not text:
+            continue
+        parts = [part.strip() for part in text.split(":")]
+        if len(parts) == 2:
+            series_type, metric = parts
+            normalized_conditions.append(
+                {
+                    "series_type": series_type,
+                    "metric": metric,
+                    "recent_periods": period_inputs.get(
+                        _growth_period_input_name(
+                            series_type=series_type,
+                            metric=metric,
+                        ),
+                        str(default_recent_periods_for_series(series_type)),
+                    ),
+                }
+            )
+            continue
+        normalized_conditions.append(text)
+    selected_conditions = normalize_growth_conditions(normalized_conditions)
+    default_threshold = str(form.threshold_percent or DEFAULT_THRESHOLD_PERCENT)
+    enriched_conditions: list[dict[str, object]] = []
+    for condition in selected_conditions:
+        series_type = str(condition["series_type"])
+        metric = str(condition["metric"])
+        enriched_conditions.append(
+            {
+                **condition,
+                "threshold_percent": threshold_inputs.get(
+                    _growth_threshold_input_name(
+                        series_type=series_type,
+                        metric=metric,
+                    ),
+                    threshold_inputs.get(
+                        _growth_threshold_input_name(series_type=series_type),
+                        default_threshold,
+                    ),
+                ),
+            }
+        )
+    return enriched_conditions
+
+
+def _ranking_condition_period_value(
+    form: RankingForm,
+    *,
+    series_type: str,
+    metric: str,
+) -> str:
+    key = _growth_period_input_name(series_type=series_type, metric=metric)
+    period_inputs = _growth_period_input_map(form)
+    if key in period_inputs and str(period_inputs[key]).strip():
+        return str(period_inputs[key]).strip()
+    for condition in _ranking_selected_conditions(form):
+        if (
+            str(condition["series_type"]) == series_type
+            and str(condition["metric"]) == metric
+        ):
+            return str(condition["recent_periods"])
+    return str(default_recent_periods_for_series(series_type))
+
+
+def _ranking_condition_threshold_value(
+    form: RankingForm,
+    *,
+    series_type: str,
+    metric: str,
+) -> str:
+    key = _growth_threshold_input_name(series_type=series_type, metric=metric)
+    threshold_inputs = _growth_threshold_input_map(form)
+    if key in threshold_inputs and str(threshold_inputs[key]).strip():
+        return str(threshold_inputs[key]).strip()
+    legacy_key = _growth_threshold_input_name(series_type=series_type)
+    if legacy_key in threshold_inputs and str(threshold_inputs[legacy_key]).strip():
+        return str(threshold_inputs[legacy_key]).strip()
+    return str(form.threshold_percent or DEFAULT_THRESHOLD_PERCENT)
+
+
+def _ranking_recent_years_from_conditions(
+    growth_conditions: Iterable[dict[str, object]],
+) -> int:
+    years = []
+    for condition in growth_conditions:
+        series_type = str(condition.get("series_type", "") or "")
+        recent_periods = int(condition.get("recent_periods", 0) or 0)
+        if series_type in {ANNUAL_YOY, TRAILING_FOUR_QUARTER_YOY}:
+            years.append(recent_periods)
+        else:
+            years.append(max(1, (recent_periods + 3) // 4))
+    return max(years or [DEFAULT_RECENT_YEARS])
+
+
+def _ranking_request_requires_redirect(
+    *,
+    request: Request,
+    growth_condition_key: Iterable[str],
+) -> bool:
+    if list(growth_condition_key):
+        return True
+    if any(key.startswith("growth_period__") for key in request.query_params.keys()):
+        return True
+    return any(
+        str(value or "").strip().count(":") == 1
+        for value in request.query_params.getlist("growth_condition")
+    )
+
+
+def _analysis_recent_years_from_ranking_filters(filters: dict[str, object]) -> int:
+    selected_conditions = [_dict(item) for item in _list(filters.get("growth_conditions"))]
+    return _ranking_recent_years_from_conditions(selected_conditions)
+
+
+def parse_ranking_request(form: RankingForm) -> dict[str, object]:
+    raw_growth_conditions = _ranking_selected_conditions(form)
+    growth_conditions: list[dict[str, object]] = []
+    for condition in raw_growth_conditions:
+        series_type = str(condition.get("series_type", "") or "")
+        threshold_percent = _parse_decimal(
+            condition.get("threshold_percent"),
+            field_name=f"{GROWTH_SERIES_LABELS.get(series_type, series_type)} 성장률 기준",
+        )
+        growth_conditions.append(
+            {
+                **condition,
+                "threshold_percent": str(threshold_percent),
+            }
+        )
+    end_year = _parse_int(
+        form.end_year or str(default_end_year()),
+        field_name="기준 연도",
+    )
+    recent_years = _ranking_recent_years_from_conditions(growth_conditions)
+    start_year = max(MIN_OPENDART_YEAR, end_year - recent_years + 1)
+    threshold_percent = _parse_decimal(
+        form.threshold_percent,
+        field_name="성장률 기준",
+    )
+    fs_div = _parse_fs_div(form.fs_div)
+    display_limit = _parse_int(form.display_limit, field_name="표시 개수")
+    if display_limit <= 0:
+        raise ValueError("표시 개수는 1 이상이어야 합니다.")
+    display_limit = min(display_limit, MAX_RANKING_DISPLAY_LIMIT)
+
+    return {
+        "growth_conditions": growth_conditions,
+        "market": _parse_market(form.market),
+        "recent_years": recent_years,
+        "display_limit": display_limit,
+        "start_year": start_year,
+        "end_year": end_year,
+        "fs_div": fs_div,
+        "threshold_percent": threshold_percent,
+        "sort_by": _normalize_ranking_sort(sort_by=form.sort_by),
+    }
+
+
+def render_ranking_page(
+    *,
+    form: RankingForm,
+    payload: dict[str, object] | None = None,
+    update_job: dict[str, object] | None = None,
+    error: str | None = None,
+) -> str:
+    content_html = (
+        render_ranking_results(_dict(payload))
+        if payload is not None
+        else render_ranking_empty_state()
+    )
+    content_html += render_background_refresh_job_script(
+        _dict(_dict(payload or {}).get("update_job")) or _dict(update_job),
+        fs_div=form.fs_div,
+    )
+    return render_shell(
+        company_title="기업필터",
+        top_tabs_html=render_ranking_top_tabs(form),
+        settings_html="",
+        toolbar_html=render_ranking_header(form, payload=_dict(payload)),
+        content_html=content_html,
+        message_html=render_message(error=error),
+    )
+
+
+def render_ranking_top_tabs(form: RankingForm) -> str:
+    current_ranking_href = _build_ranking_href(
+        growth_conditions=form.growth_conditions,
+        growth_threshold_inputs=_growth_threshold_input_map(form),
+        market=form.market,
+        recent_years=form.recent_years,
+        display_limit=form.display_limit,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        sort_by=form.sort_by,
+        submitted=_parse_submitted(form.submitted),
+    )
+    analysis_href = form.return_analysis or "/"
+    compare_href = form.return_compare or _build_compare_href(
+        primary_company_query="",
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+    )
+    db_update_href = form.return_db_update or _build_db_update_href(
+        growth_conditions=form.growth_conditions,
+        growth_threshold_inputs=_growth_threshold_input_map(form),
+        market=form.market,
+        recent_years=form.recent_years,
+        display_limit=form.display_limit,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        sort_by=form.sort_by,
+    )
+    analysis_href = _append_tab_return_params(
+        analysis_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=current_ranking_href,
+        return_db_update=db_update_href,
+    )
+    compare_href = _append_tab_return_params(
+        compare_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=current_ranking_href,
+        return_db_update=db_update_href,
+    )
+    current_ranking_href = _append_tab_return_params(
+        current_ranking_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=current_ranking_href,
+        return_db_update=db_update_href,
+    )
+    db_update_href = _append_tab_return_params(
+        db_update_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=current_ranking_href,
+        return_db_update=db_update_href,
+    )
+    tabs = (
+        ("재무정보", analysis_href, "financials"),
+        ("VS 기업비교", compare_href, "compare"),
+        ("기업필터", current_ranking_href, "ranking"),
+        ("DB 업데이트", db_update_href, "db-update"),
+    )
+    return render_top_tabs("ranking", tabs)
+
+
+def render_ranking_header(
+    form: RankingForm,
+    payload: dict[str, object] | None = None,
+) -> str:
+    return f"""
+    <section class="toolbar-surface">
+      <div class="section-tabs">
+        <span class="section-tab is-active">기업필터</span>
+        <span class="section-tab">성장률 조건</span>
+        <span class="section-tab">결과</span>
+      </div>
+      <form id="ranking-form" class="query-form query-form-ranking" data-loading-form method="get" action="/ranking">
+        <input type="hidden" name="submitted" value="1">
+        <label class="field">
+          <span>시장</span>
+          <select name="market">
+            {_option("ALL", "전체", form.market)}
+            {_option("KOSPI", "KOSPI", form.market)}
+            {_option("KOSDAQ", "KOSDAQ", form.market)}
+          </select>
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input name="end_year" value="{escape(form.end_year or str(default_end_year()))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select name="fs_div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>정렬</span>
+          <select name="sort_by">
+            {"".join(_option(value, label, form.sort_by) for value, label in RANKING_SORT_OPTIONS)}
+          </select>
+        </label>
+        <label class="field">
+          <span>표시 개수</span>
+          <select name="display_limit">
+            {"".join(_option(str(value), f"{value}개", form.display_limit) for value in RANKING_DISPLAY_LIMIT_OPTIONS)}
+          </select>
+        </label>
+        <div style="grid-column: 1 / -1;">
+          {render_ranking_growth_condition_matrix(form)}
+        </div>
+        <div class="ranking-action-row">
+          <button id="ranking-submit-button" type="submit" class="primary-button">
+            <span data-submit-label>조회</span>
+            <span data-submit-loading hidden>조회 중...</span>
+          </button>
+        </div>
+      </form>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="toolbar-note">선택한 성장률 조건은 모두 충족해야 통과로 계산합니다. 각 조건마다 최근 몇 년 또는 몇 분기와 성장률 기준 %를 따로 지정할 수 있습니다.</div>
+      </div>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="toolbar-note">DB 업데이트는 별도 페이지에서 관리합니다.</div>
+      </div>
+    </section>
+    """
+
+
+def render_db_update_page(
+    *,
+    form: RankingForm,
+    payload: dict[str, object] | None = None,
+    error: str | None = None,
+) -> str:
+    return render_shell(
+        company_title="DB 업데이트",
+        top_tabs_html=render_db_update_top_tabs(form),
+        settings_html=render_shared_settings_panel(payload),
+        toolbar_html=render_db_update_header(form, payload=_dict(payload)),
+        content_html=render_ranking_job_script(form),
+        message_html=render_message(error=error),
+    )
+
+
+def render_db_update_top_tabs(form: RankingForm) -> str:
+    current_db_update_href = _build_db_update_href(
+        growth_conditions=form.growth_conditions,
+        growth_threshold_inputs=_growth_threshold_input_map(form),
+        market=form.market,
+        recent_years=form.recent_years,
+        display_limit=form.display_limit,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        sort_by=form.sort_by,
+    )
+    analysis_href = form.return_analysis or "/"
+    compare_href = form.return_compare or _build_compare_href(
+        primary_company_query="",
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+    )
+    ranking_href = form.return_ranking or _build_ranking_href(
+        growth_conditions=form.growth_conditions,
+        growth_threshold_inputs=_growth_threshold_input_map(form),
+        market=form.market,
+        recent_years=form.recent_years,
+        display_limit=form.display_limit,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        sort_by=form.sort_by,
+        submitted=_parse_submitted(form.submitted),
+    )
+    analysis_href = _append_tab_return_params(
+        analysis_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=current_db_update_href,
+    )
+    compare_href = _append_tab_return_params(
+        compare_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=current_db_update_href,
+    )
+    ranking_href = _append_tab_return_params(
+        ranking_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=current_db_update_href,
+    )
+    current_db_update_href = _append_tab_return_params(
+        current_db_update_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=current_db_update_href,
+    )
+    tabs = (
+        ("재무정보", analysis_href, "financials"),
+        ("VS 기업비교", compare_href, "compare"),
+        ("기업필터", ranking_href, "ranking"),
+        ("DB 업데이트", current_db_update_href, "db-update"),
+    )
+    return render_top_tabs("db-update", tabs)
+
+
+def render_db_update_header(
+    form: RankingForm,
+    payload: dict[str, object] | None = None,
+) -> str:
+    company_master_status = _dict((payload or {}).get("company_master_status"))
+    update_job = _dict((payload or {}).get("update_job"))
+    return f"""
+    <section class="toolbar-surface">
+      <div class="section-tabs">
+        <span class="section-tab is-active">DB 업데이트</span>
+        <span class="section-tab">회사 목록 동기화</span>
+        <span class="section-tab">배치 진행 관리</span>
+      </div>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="toolbar-note">회사 목록 동기화, 배치 시작/재개, KRX 진단, 전체 DB 초기화는 이 페이지에서 관리합니다.</div>
+      </div>
+    </section>
+    {render_ranking_update_panel(form, company_master_status, update_job)}
+    """
+
+
+def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
+    selected_conditions = _ranking_selected_conditions(form)
+    selected_keys = {
+        (str(condition["series_type"]), str(condition["metric"]))
+        for condition in selected_conditions
+    }
+    header_cells = "".join(
+        f"<th>{escape(GROWTH_METRIC_LABELS.get(metric, metric))}</th>"
+        for metric in GROWTH_CONDITION_METRICS
+    )
+    body_rows = []
+    for series_type in GROWTH_CONDITION_SERIES:
+        cells = []
+        unit = growth_condition_period_unit(series_type)
+        for metric in GROWTH_CONDITION_METRICS:
+            value = _growth_condition_value(series_type=series_type, metric=metric)
+            checked = " checked" if (series_type, metric) in selected_keys else ""
+            period_input_name = _growth_period_input_name(
+                series_type=series_type,
+                metric=metric,
+            )
+            period_value = _ranking_condition_period_value(
+                form,
+                series_type=series_type,
+                metric=metric,
+            )
+            threshold_input_name = _growth_threshold_input_name(
+                series_type=series_type,
+                metric=metric,
+            )
+            threshold_value = _ranking_condition_threshold_value(
+                form,
+                series_type=series_type,
+                metric=metric,
+            )
+            cells.append(
+                "<td>"
+                '<div class="matrix-cell">'
+                f'<label class="matrix-check-label">'
+                f'<input type="checkbox" name="growth_condition_key" value="{escape(value)}"{checked}>'
+                "<span>적용</span>"
+                "</label>"
+                '<label class="matrix-period-label">'
+                f'<input class="matrix-period-input" type="number" min="1" name="{escape(period_input_name)}" value="{escape(period_value)}" inputmode="numeric">'
+                f'<span class="matrix-period-unit">{escape(unit)}</span>'
+                "</label>"
+                '<label class="matrix-threshold-label">'
+                f'<input class="matrix-threshold-input" type="number" min="0" step="0.1" name="{escape(threshold_input_name)}" value="{escape(threshold_value)}" inputmode="decimal">'
+                '<span class="matrix-period-unit">%</span>'
+                "</label>"
+                "</div>"
+                "</td>"
+            )
+        body_rows.append(
+            "<tr>"
+            f"<th>{escape(GROWTH_SERIES_LABELS.get(series_type, series_type))}</th>"
+            f"{''.join(cells)}"
+            "</tr>"
+        )
+    return (
+        '<div class="panel" style="margin-top:10px;padding:10px 12px;">'
+        '<div class="matrix-heading">성장률 조건 선택</div>'
+        '<table class="matrix-table">'
+        f"<thead><tr><th>구분</th>{header_cells}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
+def render_refresh_reason_summary(job: dict[str, object]) -> str:
+    reason_summary = _dict(job.get("reason_summary"))
+    failed = [_dict(item) for item in _list(reason_summary.get("failed"))]
+    skipped = [_dict(item) for item in _list(reason_summary.get("skipped"))]
+    if not failed and not skipped:
+        return (
+            '<div class="diagnostic-result">'
+            "실패/건너뜀 원인이 누적되면 여기에서 원인별 개수와 최근 회사를 바로 볼 수 있습니다."
+            "</div>"
+        )
+
+    sections: list[str] = []
+    for status, label, items in (
+        ("failed", "실패 원인", failed),
+        ("skipped", "건너뜀 원인", skipped),
+    ):
+        if not items:
+            continue
+        rows = []
+        for item in items[:5]:
+            samples = ", ".join(str(sample) for sample in _list(item.get("samples")) if str(sample).strip())
+            sample_text = f" · 예시 {escape(samples)}" if samples else ""
+            rows.append(
+                '<div class="filter-row" style="grid-template-columns: 1.3fr auto; gap: 10px;">'
+                f"<span>{escape(str(item.get('reason', '-') or '-'))}{sample_text}</span>"
+                f"<strong>{escape(str(item.get('count', 0) or 0))}건</strong>"
+                "</div>"
+            )
+        sections.append(
+            '<div class="diagnostic-card" style="margin-top: 10px;">'
+            f'<div class="diagnostic-title">{escape(label)}</div>'
+            f'<div class="filter-list">{"".join(rows)}</div>'
+            "</div>"
+        )
+    return "".join(sections)
+
+
+def render_opendart_key_management_card(
+    keys: list[dict[str, object]],
+    *,
+    key_source: str,
+) -> str:
+    source_label = "로컬 저장 키 우선" if key_source == "local" else "환경변수 키 사용 중"
+    if not keys:
+        key_rows = (
+            '<div class="diagnostic-result" id="opendart-key-list">'
+            "저장된 OpenDART 키가 없습니다. 요청 제한 초과나 키 오류가 나면 여기에서 다른 키를 추가하고 활성화할 수 있습니다."
+            "</div>"
+        )
+    else:
+        items = []
+        for item in keys:
+            key_id = int(item.get("id", 0) or 0)
+            active_badge = (
+                '<span class="inline-pill inline-pill-accent">활성</span>'
+                if item.get("is_active")
+                else ""
+            )
+            items.append(
+                '<div class="filter-row" style="grid-template-columns: 1.3fr auto auto; gap: 10px; align-items: center;">'
+                '<div>'
+                f"<strong>{escape(str(item.get('label', '') or 'OpenDART 키'))}</strong> "
+                f"<span class=\"toolbar-note\">{escape(str(item.get('masked_key', '-') or '-'))}</span> "
+                f"{active_badge}"
+                "</div>"
+                f'<button type="button" class="segmented-button" data-opendart-activate="{key_id}">활성화</button>'
+                f'<button type="button" class="segmented-button segmented-button-danger" data-opendart-delete="{key_id}">삭제</button>'
+                "</div>"
+            )
+        key_rows = f'<div class="filter-list" id="opendart-key-list">{"".join(items)}</div>'
+    return f"""
+      <div style="margin-top: 10px;">
+        <div class="diagnostic-heading">
+          <div>
+            <div class="diagnostic-title">OpenDART 키 관리</div>
+            <div class="diagnostic-copy">현재 소스: {escape(source_label)}. 배치가 차단되면 다른 키를 저장하거나 활성화한 뒤 이어받기를 누르면 됩니다.</div>
+          </div>
+        </div>
+        <div class="query-form" style="grid-template-columns: 1fr 1.3fr auto; margin-top: 8px;">
+          <label class="field">
+            <span>라벨</span>
+            <input id="opendart-key-label" placeholder="예: 개인키 2">
+          </label>
+          <label class="field">
+            <span>새 OpenDART 키</span>
+            <input id="opendart-key-value" placeholder="OpenDART API 키">
+          </label>
+          <button type="button" class="primary-button" id="save-opendart-key-button">키 저장</button>
+        </div>
+        {key_rows}
+      </div>
+    """
+
+
+def render_ranking_update_panel(
+    form: RankingForm,
+    company_master_status: dict[str, object],
+    update_job: dict[str, object],
+) -> str:
+    selected_conditions = _ranking_selected_conditions(form)
+    ranking_recent_years = _ranking_recent_years_from_conditions(selected_conditions)
+    last_synced = _format_datetime_text(company_master_status.get("last_synced_at"))
+    count = company_master_status.get("count", 0)
+    stale = company_master_status.get("is_stale") is True
+    job_status = str(update_job.get("status", "") or "")
+    sync_note = (
+        f"오늘 이미 동기화됨 · 마지막 동기화 {escape(last_synced or '-')}"
+        if count and not stale
+        else "회사 목록 동기화는 서울 기준 하루 한 번만 실제 API를 호출합니다."
+    )
+    return f"""
+    <section class="panel" id="ranking-update-panel" data-refresh-panel data-refresh-fs-div="{escape(form.fs_div)}" data-job-id="{escape(str(update_job.get('id', '')))}" data-job-status="{escape(job_status)}">
+      <div class="panel-heading panel-heading-split">
+        <div>
+          <h3>DB 업데이트</h3>
+          <p>전체 상장사를 한 번에 끝까지 돌리지 않고, 배치 단위로 끊어서 진행합니다. 중간 정지와 이어받기가 가능합니다.</p>
+        </div>
+        <div class="toolbar-meta">
+          <span class="inline-pill{ ' inline-pill-contrast' if stale else ' inline-pill-accent' }">회사 목록 {escape(str(count))}개</span>
+          <span class="inline-pill">마지막 동기화 {escape(last_synced or '-')}</span>
+          <span class="inline-pill">작업 상태 {escape(job_status or '-')}</span>
+        </div>
+      </div>
+      <div class="toolbar-note" style="margin-top: 6px;">
+        <strong>회사 목록 동기화</strong>: 상장사 대상 목록 생성 |
+        <strong>새 작업 시작</strong>: 목록 기준으로 배치 job 생성 |
+        <strong>전체 DB 초기화</strong>: 전체 캐시 삭제
+      </div>
+      <div class="toolbar-note" style="margin-top: 4px;">{sync_note}</div>
+      <div class="toolbar-note" style="margin-top: 4px;">OpenDART 키 변경은 데이터/API 설정에서 관리합니다.</div>
+      <div
+        id="refresh-status-panel"
+        class="refresh-status-card"
+        data-state="idle"
+        aria-live="polite"
+      >
+        <div class="refresh-status-header">
+          <div class="spinner refresh-status-spinner" aria-hidden="true"></div>
+          <strong id="refresh-status-title" class="refresh-status-title">DB 업데이트 대기 중</strong>
+        </div>
+        <div id="refresh-job-message" class="refresh-status-copy">회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.</div>
+      </div>
+      <div class="diagnostic-card">
+        <div class="diagnostic-heading">
+          <div>
+            <div class="diagnostic-title">KRX 연결 문제 진단</div>
+            <div class="diagnostic-copy">회사 목록 API와 시세 API를 지금 서버 환경 그대로 점검합니다. 버튼을 누르면 상태 코드와 응답 요약을 바로 확인할 수 있습니다.</div>
+          </div>
+          <button type="button" class="diagnostic-button" id="diagnose-krx-button">KRX 연결 점검 실행</button>
+        </div>
+        <div class="diagnostic-result" id="krx-diagnostic-result">여기에서 회사목록 API와 시세 API의 현재 응답 상태를 바로 보여줍니다.</div>
+      </div>
+      <div class="query-form" style="grid-template-columns: repeat(5, minmax(120px, 1fr)); margin-top: 6px;">
+        <label class="field">
+          <span>대상 범위</span>
+          <select id="refresh-scope">
+            <option value="ALL">전체</option>
+            <option value="KOSPI">KOSPI</option>
+            <option value="KOSDAQ">KOSDAQ</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select id="refresh-fs-div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>시작 연도</span>
+          <input id="refresh-year-from" value="{escape(str(max(MIN_OPENDART_YEAR, (int(form.end_year or default_end_year()) - ranking_recent_years + 1))))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input id="refresh-year-to" value="{escape(form.end_year or str(default_end_year()))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>배치 크기</span>
+          <select id="refresh-batch-size">
+            <option value="10">10</option>
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
+      </div>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="segmented">
+          <button type="button" class="segmented-button" id="sync-company-master-button">회사 목록 동기화</button>
+          <button type="button" class="segmented-button" id="create-refresh-job-button">새 작업 시작</button>
+          <button type="button" class="segmented-button" id="pause-refresh-job-button">일시정지</button>
+          <button type="button" class="segmented-button" id="resume-refresh-job-button">이어받기</button>
+          <button type="button" class="segmented-button" id="retry-refresh-job-button">실패만 재시도</button>
+          <button type="button" class="segmented-button segmented-button-danger" id="reset-databases-button">전체 DB 초기화</button>
+        </div>
+      </div>
+      <div class="toolbar-row toolbar-row-dense" id="refresh-job-summary">
+        {render_refresh_job_status_summary(update_job)}
+      </div>
+      <div id="refresh-reason-summary">{render_refresh_reason_summary(update_job)}</div>
+    </section>
+    """
+
+
+def render_refresh_job_status_summary(job: dict[str, object]) -> str:
+    if not job:
+        return (
+            '<span class="inline-pill inline-pill-muted">진행 중인 작업 없음</span>'
+        )
+    recent_item = _dict(job.get("recent_item"))
+    recent_status = str(recent_item.get("status", "") or "")
+    job_status = str(job.get("status", "") or "")
+    recent_status_label = {
+        "success": "최근 성공",
+        "failed": "최근 실패",
+        "skipped": "최근 건너뜀",
+        "pending": "최근 대기",
+    }.get(recent_status, "최근 상태")
+    return "".join(
+        [
+            f'<span class="inline-pill">전체 {escape(str(job.get("total_companies", 0)))}개</span>',
+            f'<span class="inline-pill inline-pill-accent">완료 {escape(str(job.get("completed_companies", 0)))}개</span>',
+            f'<span class="inline-pill inline-pill-contrast">실패 {escape(str(job.get("failed_companies", 0)))}개</span>',
+            f'<span class="inline-pill">건너뜀 {escape(str(job.get("skipped_companies", 0)))}개</span>',
+            f'<span class="inline-pill">남음 {escape(str(job.get("remaining_companies", 0)))}개</span>',
+            f'<span class="inline-pill">예상 남은 배치 {escape(str(job.get("estimated_remaining_batches", 0)))}개</span>',
+            f'<span class="inline-pill">다음 회사 {escape(str(job.get("next_pending_corp_name", "") or "-"))}</span>',
+            f'<span class="inline-pill">최근 회사 {escape(str(job.get("last_processed_corp_name", "") or "-"))}</span>',
+            f'<span class="inline-pill">{escape(recent_status_label)} {escape(str(recent_item.get("corp_name", "") or "-"))}</span>',
+            f'<span class="inline-pill{ " inline-pill-contrast" if job_status == "blocked" else "" }">작업 상태 {escape(job_status or "-")}</span>',
+            f'<span class="inline-pill">최근 오류 {escape(str(job.get("last_error", "") or "-"))}</span>',
+        ]
+    )
+
+
+def render_ranking_results(payload: dict[str, object]) -> str:
+    summary = _dict(payload.get("summary"))
+    filters = _dict(payload.get("filters"))
+    rows = [_dict(row) for row in _list(payload.get("screening_rows"))]
+    company_master_status = _dict(payload.get("company_master_status"))
+    selected_conditions = [
+        _dict(item) for item in _list(filters.get("growth_conditions"))
+    ]
+    total_rows = int(summary.get("screening_rows", 0) or 0)
+    rendered_rows = int(summary.get("rendered_rows", len(rows)) or 0)
+    result_limit = int(
+        summary.get("result_limit", rendered_rows or DEFAULT_RANKING_DISPLAY_LIMIT)
+        or DEFAULT_RANKING_DISPLAY_LIMIT
+    )
+    if total_rows > rendered_rows:
+        info_text = (
+            f"DB {summary.get('database', '')} 기준, 통과한 기업 {total_rows}개 중 "
+            f"상위 {rendered_rows}개만 표시합니다. "
+            f"(현재 표시 개수 {result_limit}개) "
+            f"회사 목록 {company_master_status.get('count', 0)}개 동기화됨"
+        )
+    else:
+        info_text = (
+            f"DB {summary.get('database', '')} 기준, "
+            f"통과한 기업 {total_rows}개를 표시합니다. "
+            f"회사 목록 {company_master_status.get('count', 0)}개 동기화됨"
+        )
+    info_html = f'<div class="toolbar-note">{escape(info_text)}</div>'
+    if not rows:
+        return f"""
+        <section class="panel">
+          <div class="panel-heading">
+            <h3>현재 조건을 통과한 기업이 없습니다</h3>
+            <p>성장률 조건이나 기준치를 조금 완화하거나, DB 업데이트를 더 진행한 뒤 다시 확인해 주세요.</p>
+          </div>
+          {info_html}
+        </section>
+        """
+
+    analysis_recent_years = _analysis_recent_years_from_ranking_filters(filters)
+    table_rows = []
+    for row in rows:
+        analysis_href = _build_analysis_href(
+            company_query=str(row.get("corp_name", "") or row.get("stock_code", "")),
+            recent_years=str(analysis_recent_years),
+            end_year=str(summary.get("end_year", default_end_year())),
+            fs_div=str(filters.get("fs_div", "CFS") or "ALL"),
+            threshold_percent=str(filters.get("threshold_percent", DEFAULT_THRESHOLD_PERCENT)),
+            top_tab="financials",
+            fragment="financials-details",
+        )
+        total_checks = int(row.get("total_growth_condition_count", 0) or 0)
+        matched_checks = int(row.get("matched_growth_condition_count", 0) or 0)
+        details_html = render_ranking_growth_checks(_list(row.get("growth_checks")))
+        table_rows.append(
+            "<tr>"
+            f'<td><a class="table-link" href="{escape(analysis_href)}">{escape(str(row.get("corp_name", "")))}</a></td>'
+            f'<td>{escape(str(row.get("market", "") or "-"))}</td>'
+            f'<td>{escape(_format_won(row.get("close_price")))}</td>'
+            f'<td>{escape(_format_market_cap(row.get("market_cap")))}</td>'
+            f'<td>{escape(_format_ratio(row.get("eps"), suffix="원"))}</td>'
+            f'<td>{matched_checks}/{total_checks}</td>'
+            f'<td>{escape(_format_percent(row.get("overall_minimum_growth_rate")))}</td>'
+            f'<td>{details_html}</td>'
+            "</tr>"
+        )
+
+    condition_labels = ", ".join(
+        f"{GROWTH_SERIES_LABELS.get(str(item.get('series_type', '')), str(item.get('series_type', '')))} "
+        f"{GROWTH_METRIC_LABELS.get(str(item.get('metric', '')), str(item.get('metric', '')))} "
+        f"({format_growth_condition_period_label(str(item.get('series_type', '')), item.get('recent_periods'))})"
+        for item in selected_conditions
+    )
+
+    return f"""
+    <section class="panel">
+      <div class="panel-heading panel-heading-split">
+        <div>
+          <h3>조건에 맞는 기업</h3>
+          <p>선택 조건: {escape(condition_labels or "연간 YoY 매출")}. 선택 조건을 모두 충족한 기업만 표시합니다.</p>
+        </div>
+        {info_html}
+      </div>
+      <div class="table-scroll">
+        <table class="screening-table">
+          <thead>
+            <tr>
+              <th>기업명</th>
+              <th>시장</th>
+              <th>전일 종가</th>
+              <th>시가총액</th>
+              <th>EPS</th>
+              <th>조건 충족 수</th>
+              <th>전체 최소 성장률</th>
+              <th>상세</th>
+            </tr>
+          </thead>
+          <tbody>{''.join(table_rows)}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def render_ranking_growth_checks(checks: list[object]) -> str:
+    if not checks:
+        return '<span class="empty">-</span>'
+    items = []
+    for item in checks:
+        check = _dict(item)
+        items.append(
+            '<div class="filter-row" style="grid-template-columns: 1.2fr auto auto auto; padding: 6px 0; gap: 10px;">'
+            f"<span>{escape(str(check.get('series_label', '')))} {escape(str(check.get('metric_label', '')))}</span>"
+            f"<span>{escape(str(check.get('recent_period_label', '-') or '-'))}</span>"
+            f"<strong>{escape(_format_percent(check.get('minimum_growth_rate')))}</strong>"
+            f'<em class="{_pass_class(check.get("passed"))}">{escape("통과" if check.get("passed") else "실패")}</em>'
+            "</div>"
+        )
+    return (
+        "<details>"
+        "<summary>조건별 확인</summary>"
+        f'<div class="filter-list">{"".join(items)}</div>'
+        "</details>"
+    )
+
+
+def render_ranking_job_script(form: RankingForm) -> str:
+    fs_div = escape(form.fs_div or "CFS")
+    return f"""
+    <script>
+    (() => {{
+      const panel = document.querySelector("[data-refresh-panel]");
+      if (!panel) {{
+        return;
+      }}
+      const statusPanel = document.getElementById("refresh-status-panel");
+      const statusTitleNode = document.getElementById("refresh-status-title");
+      const summaryNode = document.getElementById("refresh-job-summary");
+      const reasonSummaryNode = document.getElementById("refresh-reason-summary");
+      const messageNode = document.getElementById("refresh-job-message");
+      const diagnoseButton = document.getElementById("diagnose-krx-button");
+      const diagnosticResultNode = document.getElementById("krx-diagnostic-result");
+      const syncButton = document.getElementById("sync-company-master-button");
+      const createButton = document.getElementById("create-refresh-job-button");
+      const pauseButton = document.getElementById("pause-refresh-job-button");
+      const resumeButton = document.getElementById("resume-refresh-job-button");
+      const retryButton = document.getElementById("retry-refresh-job-button");
+      const resetButton = document.getElementById("reset-databases-button");
+      const scopeInput = document.getElementById("refresh-scope");
+      const fsDivInput = document.getElementById("refresh-fs-div");
+      const yearFromInput = document.getElementById("refresh-year-from");
+      const yearToInput = document.getElementById("refresh-year-to");
+      const batchSizeInput = document.getElementById("refresh-batch-size");
+      let activeJobId = panel.getAttribute("data-job-id") || "";
+      let initialJobStatus = panel.getAttribute("data-job-status") || "";
+      let pumpTimer = null;
+      let pumpBusy = false;
+      let syncProgressTimer = null;
+      let syncStartedAt = 0;
+
+      const escapeHtml = (value) =>
+        String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+
+      const renderReasonSummary = (reasonSummary) => {{
+        if (!reasonSummaryNode) {{
+          return;
+        }}
+        const failed = Array.isArray(reasonSummary?.failed) ? reasonSummary.failed : [];
+        const skipped = Array.isArray(reasonSummary?.skipped) ? reasonSummary.skipped : [];
+        if (!failed.length && !skipped.length) {{
+          reasonSummaryNode.innerHTML = '<div class="diagnostic-result">실패/건너뜀 원인이 누적되면 여기에서 원인별 개수와 최근 회사를 바로 볼 수 있습니다.</div>';
+          return;
+        }}
+        const renderSection = (label, items) => {{
+          if (!items.length) {{
+            return "";
+          }}
+          const rows = items.slice(0, 5).map((item) => {{
+            const samples = Array.isArray(item.samples) ? item.samples.filter(Boolean).join(", ") : "";
+            const sampleText = samples ? ` · 예시 ${{escapeHtml(samples)}}` : "";
+            return (
+              '<div class="filter-row" style="grid-template-columns: 1.3fr auto; gap: 10px;">' +
+              `<span>${{escapeHtml(item.reason || "-")}}${{sampleText}}</span>` +
+              `<strong>${{escapeHtml(item.count || 0)}}건</strong>` +
+              "</div>"
+            );
+          }}).join("");
+          return (
+            '<div class="diagnostic-card" style="margin-top: 10px;">' +
+            `<div class="diagnostic-title">${{escapeHtml(label)}}</div>` +
+            `<div class="filter-list">${{rows}}</div>` +
+            "</div>"
+          );
+        }};
+        reasonSummaryNode.innerHTML = [
+          renderSection("실패 원인", failed),
+          renderSection("건너뜀 원인", skipped),
+        ].join("");
+      }};
+
+      const renderSummary = (job) => {{
+        if (!summaryNode) {{
+          return;
+        }}
+        if (!job) {{
+          summaryNode.innerHTML = '<span class="inline-pill inline-pill-muted">진행 중인 작업 없음</span>';
+          renderReasonSummary(null);
+          return;
+        }}
+        const recentItem = job.recent_item || {{}};
+        const recentStatus = recentItem.status || "";
+        const jobStatus = job.status || "";
+        const recentStatusLabel = {{
+          success: "최근 성공",
+          failed: "최근 실패",
+          skipped: "최근 건너뜀",
+          pending: "최근 대기",
+        }}[recentStatus] || "최근 상태";
+        summaryNode.innerHTML = [
+          `<span class="inline-pill">전체 ${{escapeHtml(job.total_companies || 0)}}개</span>`,
+          `<span class="inline-pill inline-pill-accent">완료 ${{escapeHtml(job.completed_companies || 0)}}개</span>`,
+          `<span class="inline-pill inline-pill-contrast">실패 ${{escapeHtml(job.failed_companies || 0)}}개</span>`,
+          `<span class="inline-pill">건너뜀 ${{escapeHtml(job.skipped_companies || 0)}}개</span>`,
+          `<span class="inline-pill">남음 ${{escapeHtml(job.remaining_companies || 0)}}개</span>`,
+          `<span class="inline-pill">예상 남은 배치 ${{escapeHtml(job.estimated_remaining_batches || 0)}}개</span>`,
+          `<span class="inline-pill">다음 회사 ${{escapeHtml(job.next_pending_corp_name || "-")}}</span>`,
+          `<span class="inline-pill">최근 회사 ${{escapeHtml(job.last_processed_corp_name || "-")}}</span>`,
+          `<span class="inline-pill">${{escapeHtml(recentStatusLabel)}} ${{escapeHtml(recentItem.corp_name || "-")}}</span>`,
+          `<span class="inline-pill${{jobStatus === "blocked" ? " inline-pill-contrast" : ""}}">작업 상태 ${{escapeHtml(jobStatus || "-")}}</span>`,
+          `<span class="inline-pill">최근 오류 ${{escapeHtml(job.last_error || "-")}}</span>`
+        ].join("");
+        renderReasonSummary(job.reason_summary || null);
+      }};
+
+      const setStatus = (state, title) => {{
+        if (statusPanel) {{
+          statusPanel.setAttribute("data-state", state || "idle");
+        }}
+        if (statusTitleNode) {{
+          statusTitleNode.textContent = title || "DB 업데이트 대기 중";
+        }}
+      }};
+
+      const setMessage = (value, state = "idle", title = "DB 업데이트 안내") => {{
+        setStatus(state, title);
+        if (messageNode) {{
+          messageNode.textContent = value;
+        }}
+      }};
+
+      const setDiagnosticResult = (value) => {{
+        if (diagnosticResultNode) {{
+          diagnosticResultNode.textContent = value;
+        }}
+      }};
+
+      const stopSyncProgress = () => {{
+        if (syncProgressTimer !== null) {{
+          window.clearInterval(syncProgressTimer);
+          syncProgressTimer = null;
+        }}
+      }};
+
+      const startSyncProgress = () => {{
+        stopSyncProgress();
+        syncStartedAt = Date.now();
+        const updateSyncMessage = () => {{
+          const elapsedSeconds = Math.max(1, Math.floor((Date.now() - syncStartedAt) / 1000));
+          let phase = "1/3 KRX 상장사 목록을 가져오는 중";
+          if (elapsedSeconds >= 4) {{
+            phase = "2/3 OpenDART 기업 목록을 가져오는 중";
+          }}
+          if (elapsedSeconds >= 8) {{
+            phase = "3/3 종목을 매칭하고 DB에 저장하는 중";
+          }}
+          setMessage(
+            `회사 목록 동기화 진행 중... ${{phase}} (${{elapsedSeconds}}초 경과)`,
+            "running",
+            "회사 목록 동기화 진행 중"
+          );
+        }};
+        updateSyncMessage();
+        syncProgressTimer = window.setInterval(updateSyncMessage, 1000);
+      }};
+
+      const currentFsDiv = () => (fsDivInput && fsDivInput.value) || "{fs_div}";
+
+      const callJson = async (url, method = "GET", body = null) => {{
+        const response = await fetch(url, {{
+          method,
+          headers: body ? {{ "Content-Type": "application/json" }} : {{}},
+          body: body ? JSON.stringify(body) : undefined,
+        }});
+        const payload = await response.json();
+        if (!response.ok) {{
+          throw new Error(payload.message || "요청 처리 중 오류가 발생했습니다.");
+        }}
+        return payload;
+      }};
+
+      const loadStatus = async () => {{
+        if (!activeJobId) {{
+          renderSummary(null);
+          return null;
+        }}
+        const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}?fs_div=${{encodeURIComponent(currentFsDiv())}}`);
+        renderSummary(payload.job);
+        if (payload.job && payload.job.status === "blocked") {{
+          setMessage(
+            payload.job.last_error || "OpenDART 차단 상태입니다. 키를 바꾸거나 내일 다시 이어받아 주세요.",
+            "blocked",
+            "작업 차단됨"
+          );
+        }}
+        return payload.job;
+      }};
+
+      const stopPump = () => {{
+        if (pumpTimer !== null) {{
+          window.clearTimeout(pumpTimer);
+          pumpTimer = null;
+        }}
+      }};
+
+      const schedulePump = () => {{
+        stopPump();
+        pumpTimer = window.setTimeout(runPump, 350);
+      }};
+
+      const runPump = async () => {{
+        if (!activeJobId || pumpBusy) {{
+          return;
+        }}
+        pumpBusy = true;
+        try {{
+          const statusPayload = await callJson(`/ranking/update-jobs/${{activeJobId}}?fs_div=${{encodeURIComponent(currentFsDiv())}}`);
+          const job = statusPayload.job;
+          renderSummary(job);
+          if (!job || job.status !== "running") {{
+            if (job && job.status === "blocked") {{
+              setMessage(
+                job.last_error || "OpenDART 차단 상태입니다. 키를 바꾸거나 이어받기를 준비해 주세요.",
+                "blocked",
+                "작업 차단됨"
+              );
+            }} else if (job && job.status === "paused") {{
+              setMessage(
+                "작업이 일시정지 상태입니다. 이어받기를 누르면 다시 진행합니다.",
+                "warning",
+                "작업 일시정지"
+              );
+            }}
+            pumpBusy = false;
+            return;
+          }}
+          setMessage(
+            `배치 업데이트 진행 중... 다음 회사 ${{job.next_pending_corp_name || "-"}} / 예상 남은 배치 ${{job.estimated_remaining_batches || 0}}개`,
+            "running",
+            "배치 업데이트 진행 중"
+          );
+          const nextPayload = await callJson(`/ranking/update-jobs/${{activeJobId}}/run-next-batch?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
+          renderSummary(nextPayload.job);
+          if (nextPayload.job && nextPayload.job.status === "blocked") {{
+            setMessage(
+              nextPayload.job.last_error || "OpenDART 차단으로 작업이 멈췄습니다.",
+              "blocked",
+              "작업 차단됨"
+            );
+            return;
+          }}
+          setMessage(
+            `배치 업데이트 진행 중: 완료 ${{nextPayload.job.completed_companies || 0}}개, 실패 ${{nextPayload.job.failed_companies || 0}}개, 건너뜀 ${{nextPayload.job.skipped_companies || 0}}개, 최근 회사 ${{nextPayload.job.last_processed_corp_name || "-"}}, 예상 남은 배치 ${{nextPayload.job.estimated_remaining_batches || 0}}개`,
+            "running",
+            "배치 업데이트 진행 중"
+          );
+          if (nextPayload.job && nextPayload.job.status === "running") {{
+            schedulePump();
+          }} else if (nextPayload.job && nextPayload.job.status === "completed") {{
+            setMessage("배치 업데이트가 완료되었습니다.", "success", "업데이트 완료");
+          }}
+        }} catch (error) {{
+          setMessage(String(error.message || error), "error", "업데이트 오류");
+        }} finally {{
+          pumpBusy = false;
+        }}
+      }};
+
+      if (syncButton) {{
+        syncButton.addEventListener("click", async () => {{
+          startSyncProgress();
+          try {{
+            const payload = await callJson(`/ranking/company-master/sync?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST", {{}});
+            const summary = payload.company_master_status || {{}};
+            stopSyncProgress();
+            if (payload.skipped_today) {{
+              setMessage(
+                payload.message || `오늘 이미 동기화됨 · 마지막 동기화 ${{summary.last_synced_at || "-"}}`,
+                "success",
+                "회사 목록 동기화 생략"
+              );
+            }} else {{
+              setMessage(
+                `회사 목록 동기화 완료: ${{summary.count || 0}}개 저장, KRX ${{payload.krx_listing_count || 0}}개 / OpenDART ${{payload.dart_company_count || 0}}개 / 기준일 ${{payload.krx_base_date || "-"}}`,
+                "success",
+                "회사 목록 동기화 완료"
+              );
+            }}
+            activeJobId = "";
+            renderSummary(null);
+          }} catch (error) {{
+            stopSyncProgress();
+            setMessage(String(error.message || error), "error", "동기화 오류");
+          }}
+        }});
+      }}
+
+      if (diagnoseButton) {{
+        diagnoseButton.addEventListener("click", async () => {{
+          setMessage("KRX 연결을 점검하고 있습니다...", "running", "KRX 연결 점검 중");
+          setDiagnosticResult("KRX 연결을 점검하고 있습니다...");
+          try {{
+            const payload = await callJson("/ranking/krx-diagnostics", "POST", {{}});
+            setMessage(payload.message || "KRX 연결 점검 완료", "success", "KRX 연결 점검 완료");
+            setDiagnosticResult(payload.message || "KRX 연결 점검 완료");
+          }} catch (error) {{
+            setMessage(String(error.message || error), "error", "KRX 연결 점검 오류");
+            setDiagnosticResult(String(error.message || error));
+          }}
+        }});
+      }}
+
+      if (createButton) {{
+        createButton.addEventListener("click", async () => {{
+          setMessage("새 DB 업데이트 작업을 만들고 있습니다...", "running", "새 작업 생성 중");
+          try {{
+            const payload = await callJson(`/ranking/update-jobs?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST", {{
+              scope: scopeInput ? scopeInput.value : "ALL",
+              fs_div: currentFsDiv(),
+              year_from: yearFromInput ? Number(yearFromInput.value) : {default_end_year() - DEFAULT_RECENT_YEARS + 1},
+              year_to: yearToInput ? Number(yearToInput.value) : {default_end_year()},
+              batch_size: batchSizeInput ? Number(batchSizeInput.value) : 25
+            }});
+            activeJobId = String((payload.job && payload.job.id) || "");
+            panel.setAttribute("data-job-id", activeJobId);
+            renderSummary(payload.job);
+            if (payload.job && payload.job.status === "blocked") {{
+              setMessage(payload.job.last_error || "OpenDART 차단 상태입니다.", "blocked", "작업 차단됨");
+            }} else {{
+              setMessage("새 작업을 시작했습니다.", "running", "배치 업데이트 진행 중");
+              schedulePump();
+            }}
+          }} catch (error) {{
+            setMessage(String(error.message || error), "error", "작업 생성 오류");
+          }}
+        }});
+      }}
+
+      if (pauseButton) {{
+        pauseButton.addEventListener("click", async () => {{
+          if (!activeJobId) {{
+            return;
+          }}
+          stopPump();
+          try {{
+            const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}/pause?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
+            renderSummary(payload.job);
+            setMessage("작업을 일시정지했습니다.", "warning", "작업 일시정지");
+          }} catch (error) {{
+            setMessage(String(error.message || error), "error", "일시정지 오류");
+          }}
+        }});
+      }}
+
+      if (resumeButton) {{
+        resumeButton.addEventListener("click", async () => {{
+          if (!activeJobId) {{
+            return;
+          }}
+          try {{
+            const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}/resume?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
+            renderSummary(payload.job);
+            setMessage("작업을 이어받습니다.", "running", "배치 업데이트 진행 중");
+            schedulePump();
+          }} catch (error) {{
+            setMessage(String(error.message || error), "error", "이어받기 오류");
+          }}
+        }});
+      }}
+
+      if (retryButton) {{
+        retryButton.addEventListener("click", async () => {{
+          if (!activeJobId) {{
+            return;
+          }}
+          try {{
+            const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}/retry-failed?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
+            renderSummary(payload.job);
+            setMessage("실패 항목만 다시 대기열에 넣었습니다.", "running", "실패 항목 재시도 준비");
+            schedulePump();
+          }} catch (error) {{
+            setMessage(String(error.message || error), "error", "재시도 오류");
+          }}
+        }});
+      }}
+
+      if (resetButton) {{
+        resetButton.addEventListener("click", async () => {{
+          const firstConfirm = window.confirm("전체 DB의 모든 캐시를 삭제합니다. 계속할까요?");
+          if (!firstConfirm) {{
+            return;
+          }}
+          const secondConfirm = window.confirm("회사목록, 재무, 시세, 작업 상태가 모두 삭제됩니다. 정말 초기화할까요?");
+          if (!secondConfirm) {{
+            return;
+          }}
+          stopPump();
+          setMessage("전체 DB 캐시를 초기화하고 있습니다...", "running", "DB 초기화 진행 중");
+          try {{
+            const payload = await callJson("/ranking/reset-databases", "POST", {{}});
+            activeJobId = "";
+            panel.setAttribute("data-job-id", "");
+            renderSummary(null);
+            setMessage(payload.message || "전체 DB 캐시 초기화 완료", "success", "DB 초기화 완료");
+            window.location.reload();
+          }} catch (error) {{
+            setMessage(String(error.message || error), "error", "DB 초기화 오류");
+          }}
+        }});
+      }}
+
+      if (activeJobId && initialJobStatus === "running") {{
+        setMessage("진행 중인 작업 상태를 확인하고 있습니다...", "running", "배치 업데이트 진행 중");
+        schedulePump();
+      }} else if (activeJobId && initialJobStatus === "blocked") {{
+        setMessage("가장 최근 작업이 차단 상태입니다. OpenDART 키를 바꾸거나 내일 다시 이어받아 주세요.", "blocked", "작업 차단됨");
+        loadStatus().catch((error) => {{
+          setMessage(String(error.message || error), "error", "작업 상태 확인 오류");
+        }});
+      }} else if (activeJobId && initialJobStatus === "paused") {{
+        setMessage("가장 최근 작업이 일시정지 상태입니다. 이어받기를 누르면 다시 진행합니다.", "warning", "작업 일시정지");
+        loadStatus().catch((error) => {{
+          setMessage(String(error.message || error), "error", "작업 상태 확인 오류");
+        }});
+      }} else if (activeJobId && initialJobStatus === "completed") {{
+        setMessage("가장 최근 작업이 완료된 상태입니다. 새 작업을 시작하거나 필요하면 실패만 재시도를 진행해 주세요.", "success", "업데이트 완료");
+      }} else {{
+        setMessage("회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.", "idle", "DB 업데이트 대기 중");
+        renderSummary(null);
+      }}
+    }})();
+    </script>
+    """
+
+
+def _growth_condition_value(
+    *,
+    series_type: str,
+    metric: str,
+    recent_periods: int | None = None,
+) -> str:
+    if recent_periods is None:
+        return f"{series_type}:{metric}"
+    return f"{series_type}:{metric}:{int(recent_periods)}"
+
+
+async def _read_request_json(request: Request) -> dict[str, object]:
+    try:
+        payload = await request.json()
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _sync_company_master_for_database(
+    *,
+    database_path: Path,
+    opendart_client: MajorAccountClient,
+    listing_client: ListingClient,
+) -> dict[str, object]:
+    selected_base_date = ""
+    listings: list[object] = []
+    for candidate_date in _candidate_market_dates(date.today()):
+        listings = listing_client.fetch_listings(base_date=candidate_date)
+        if listings:
+            selected_base_date = candidate_date
+            break
+    if not listings:
+        raise RuntimeError("최근 거래일 기준 KRX 상장사 목록을 가져오지 못했습니다.")
+    dart_companies = opendart_client.fetch_companies()
+    match_result = match_listings_to_dart(listings, dart_companies)
+    dart_index = {company.corp_code: company for company in dart_companies}
+    entries = [
+        {
+            "corp_code": company.corp_code,
+            "corp_name": company.corp_name,
+            "stock_code": company.stock_code,
+            "market": company.market,
+            "item_name": company.item_name,
+            "modify_date": dart_index.get(company.corp_code, DartCompany("", "", "", "")).modify_date,
+        }
+        for company in match_result.matched
+    ]
+    company_master_status = store_company_master_entries(database_path, entries)
+    return {
+        "company_master_status": company_master_status,
+        "krx_base_date": selected_base_date,
+        "krx_listing_count": len(listings),
+        "dart_company_count": len(dart_companies),
+        "matched": len(match_result.matched),
+        "unmatched": len(match_result.unmatched_listings),
+        "ambiguous": len(match_result.ambiguous_matches),
+    }
+
+
+def _run_refresh_job_batch(
+    *,
+    database_path: Path,
+    job_id: int,
+    client: MajorAccountClient,
+) -> dict[str, object]:
+    job = read_refresh_job(database_path, job_id=job_id)
+    if job is None:
+        return {}
+    items = read_refresh_job_items(
+        database_path,
+        job_id=job_id,
+        statuses=["pending"],
+        limit=int(job.get("batch_size", 25) or 25),
+    )
+    if not items:
+        return job
+
+    business_years = [
+        str(year)
+        for year in range(
+            int(job.get("year_from", default_end_year() - DEFAULT_RECENT_YEARS + 1)),
+            int(job.get("year_to", default_end_year())) + 1,
+        )
+    ]
+    fs_div = _parse_fs_div(str(job.get("fs_div", "CFS")))
+    for item in items:
+        corp_code = str(item.get("corp_code", "")).strip()
+        corp_name = str(item.get("corp_name", "")).strip()
+        if not corp_code:
+            record_refresh_job_item_result(
+                database_path,
+                job_id=job_id,
+                corp_code=corp_code,
+                corp_name=corp_name,
+                status="skipped",
+                last_error="corp_code is missing",
+            )
+            continue
+        try:
+            run = collect_financial_statement_run(
+                client,
+                corp_codes=[corp_code],
+                business_years=business_years,
+                report_codes=DEFAULT_REPORT_CODES,
+                fs_div=fs_div,
+                continue_on_error=True,
+            )
+            artifacts = build_analysis_artifacts(
+                run.rows,
+                collection_errors=run.errors,
+                expected_corp_codes=[corp_code],
+                expected_business_years=business_years,
+                expected_report_codes=DEFAULT_REPORT_CODES,
+                threshold_percent=Decimal("20"),
+                recent_annual_periods=3,
+                recent_quarterly_periods=12,
+            )
+            if run.errors or artifacts.collection_errors:
+                raise RuntimeError(_summarize_collection_errors(run.errors, artifacts))
+            if not artifacts.financial_statement_rows:
+                raise RuntimeError("재무 데이터를 가져오지 못했습니다.")
+            replace_company_analysis_artifacts(
+                database_path,
+                corp_code=corp_code,
+                artifacts=artifacts,
+            )
+            record_refresh_job_item_result(
+                database_path,
+                job_id=job_id,
+                corp_code=corp_code,
+                corp_name=corp_name,
+                status="success",
+            )
+        except Exception as error:
+            classification = _classify_refresh_job_error(error)
+            if classification["job_status"] == "blocked":
+                update_refresh_job_status(
+                    database_path,
+                    job_id=job_id,
+                    status="blocked",
+                    last_error=_blocked_refresh_job_message(error),
+                )
+                break
+            record_refresh_job_item_result(
+                database_path,
+                job_id=job_id,
+                corp_code=corp_code,
+                corp_name=corp_name,
+                status=classification["item_status"],
+                last_error=classification["reason"],
+            )
+    return read_refresh_job(database_path, job_id=job_id) or {}
+
+
+def _normalize_refresh_scope(value: str) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized in {"", "ALL"}:
+        return "ALL"
+    if normalized not in {"KOSPI", "KOSDAQ"}:
+        return "ALL"
+    return normalized
+
+
+def _normalize_refresh_job_fs_div(value: str) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized in {"", "CFS"}:
+        return "CFS"
+    if normalized not in {"OFS", "ALL"}:
+        return "CFS"
+    return normalized
+
+
+def _normalize_refresh_batch_size(value: int) -> int:
+    if value in {10, 25, 50, 100}:
+        return value
+    return 25
+
+
+def _normalize_ranking_sort(*, sort_by: str) -> str:
+    normalized = sort_by.strip().lower()
+    if normalized in {"market_cap", "overall_minimum_growth_rate"}:
+        return normalized
+    return DEFAULT_RANKING_SORT_BY
+
+
+def _build_ranking_href(
+    *,
+    growth_conditions: Iterable[str] | None = None,
+    growth_threshold_inputs: dict[str, str] | None = None,
+    market: str = DEFAULT_MARKET_FILTER,
+    recent_years: str,
+    display_limit: str = str(DEFAULT_RANKING_DISPLAY_LIMIT),
+    end_year: str,
+    fs_div: str,
+    threshold_percent: str,
+    sort_by: str = DEFAULT_RANKING_SORT_BY,
+    submitted: bool = False,
+    return_analysis: str = "",
+    return_compare: str = "",
+    return_ranking: str = "",
+    return_db_update: str = "",
+) -> str:
+    params: list[tuple[str, str]] = []
+    for condition in growth_conditions or ():
+        normalized = str(condition or "").strip()
+        if normalized:
+            params.append(("growth_condition", normalized))
+    for key, value in (growth_threshold_inputs or {}).items():
+        normalized_key = str(key or "").strip()
+        normalized_value = str(value or "").strip()
+        if normalized_key and normalized_value and normalized_value != str(DEFAULT_THRESHOLD_PERCENT):
+            params.append((normalized_key, normalized_value))
+    if str(market).strip() and str(market).strip().upper() != "ALL":
+        params.append(("market", str(market).strip()))
+    for key, value in (
+        ("display_limit", display_limit),
+        ("end_year", end_year),
+        ("fs_div", fs_div),
+        ("threshold_percent", threshold_percent),
+    ):
+        if key == "display_limit" and str(value).strip() == str(DEFAULT_RANKING_DISPLAY_LIMIT):
+            continue
+        if str(value).strip():
+            params.append((key, str(value).strip()))
+    normalized_sort = _normalize_ranking_sort(sort_by=sort_by)
+    if normalized_sort != DEFAULT_RANKING_SORT_BY:
+        params.append(("sort_by", normalized_sort))
+    if submitted:
+        params.append(("submitted", "1"))
+    for key, value in (
+        ("return_analysis", return_analysis),
+        ("return_compare", return_compare),
+        ("return_ranking", return_ranking),
+        ("return_db_update", return_db_update),
+    ):
+        normalized_value = _normalize_return_href(value)
+        if normalized_value:
+            params.append((key, normalized_value))
+    query = urlencode(params)
+    return f"/ranking?{query}" if query else "/ranking"
+
+
+def _build_db_update_href(
+    *,
+    growth_conditions: Iterable[str] | None = None,
+    growth_threshold_inputs: dict[str, str] | None = None,
+    market: str = DEFAULT_MARKET_FILTER,
+    recent_years: str,
+    display_limit: str = str(DEFAULT_RANKING_DISPLAY_LIMIT),
+    end_year: str,
+    fs_div: str,
+    threshold_percent: str,
+    sort_by: str = DEFAULT_RANKING_SORT_BY,
+    return_analysis: str = "",
+    return_compare: str = "",
+    return_ranking: str = "",
+    return_db_update: str = "",
+) -> str:
+    params: list[tuple[str, str]] = []
+    for condition in growth_conditions or ():
+        normalized = str(condition or "").strip()
+        if normalized:
+            params.append(("growth_condition", normalized))
+    for key, value in (growth_threshold_inputs or {}).items():
+        normalized_key = str(key or "").strip()
+        normalized_value = str(value or "").strip()
+        if normalized_key and normalized_value and normalized_value != str(DEFAULT_THRESHOLD_PERCENT):
+            params.append((normalized_key, normalized_value))
+    if str(market).strip() and str(market).strip().upper() != "ALL":
+        params.append(("market", str(market).strip()))
+    for key, value in (
+        ("display_limit", display_limit),
+        ("end_year", end_year),
+        ("fs_div", fs_div),
+        ("threshold_percent", threshold_percent),
+    ):
+        if key == "display_limit" and str(value).strip() == str(DEFAULT_RANKING_DISPLAY_LIMIT):
+            continue
+        if str(value).strip():
+            params.append((key, str(value).strip()))
+    normalized_sort = _normalize_ranking_sort(sort_by=sort_by)
+    if normalized_sort != DEFAULT_RANKING_SORT_BY:
+        params.append(("sort_by", normalized_sort))
+    for key, value in (
+        ("return_analysis", return_analysis),
+        ("return_compare", return_compare),
+        ("return_ranking", return_ranking),
+        ("return_db_update", return_db_update),
+    ):
+        normalized_value = _normalize_return_href(value)
+        if normalized_value:
+            params.append((key, normalized_value))
+    query = urlencode(params)
+    return f"/db-update?{query}" if query else "/db-update"
+
+
+def _format_datetime_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = text[:-1] if text.endswith("Z") else text
+    try:
+        return normalized.replace("T", " ")
+    except Exception:
+        return text
+
+
+def _render_ranking_update_panel_duplicate(
+    form: RankingForm,
+    company_master_status: dict[str, object],
+    update_job: dict[str, object],
+) -> str:
+    default_year_to = _safe_int(form.end_year, default_end_year())
+    default_recent_years = _safe_int(form.recent_years, DEFAULT_RECENT_YEARS)
+    default_year_from = max(
+        MIN_OPENDART_YEAR,
+        default_year_to - default_recent_years + 1,
+    )
+    last_synced = _format_datetime_text(company_master_status.get("last_synced_at"))
+    count = company_master_status.get("count", 0)
+    stale = company_master_status.get("is_stale") is True
+    job_status = str(update_job.get("status", "") or "")
+    return f"""
+    <section class="panel" id="ranking-update-panel" data-refresh-panel data-refresh-fs-div="{escape(form.fs_div)}" data-job-id="{escape(str(update_job.get('id', '')))}" data-job-status="{escape(job_status)}">
+      <div class="panel-heading panel-heading-split">
+        <div>
+          <h3>DB 업데이트</h3>
+          <p>전체 상장사를 한 번에 끝까지 돌리지 않고, 배치 단위로 끊어서 진행합니다. 중간 정지와 이어받기가 가능합니다.</p>
+        </div>
+        <div class="toolbar-meta">
+          <span class="inline-pill{ ' inline-pill-contrast' if stale else ' inline-pill-accent' }">회사 목록 {escape(str(count))}개</span>
+          <span class="inline-pill">마지막 동기화 {escape(last_synced or '-')}</span>
+          <span class="inline-pill">작업 상태 {escape(job_status or '-')}</span>
+        </div>
+      </div>
+      <div class="toolbar-note" style="margin-top: 6px;">
+        <strong>회사 목록 동기화</strong>: 상장사 대상 목록 생성 |
+        <strong>새 작업 시작</strong>: 목록 기준으로 배치 job 생성 |
+        <strong>전체 DB 초기화</strong>: 전체 캐시 삭제
+      </div>
+      <div class="query-form" style="grid-template-columns: repeat(5, minmax(120px, 1fr)); margin-top: 6px;">
+        <label class="field">
+          <span>대상 범위</span>
+          <select id="refresh-scope">
+            <option value="ALL">전체</option>
+            <option value="KOSPI">KOSPI</option>
+            <option value="KOSDAQ">KOSDAQ</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select id="refresh-fs-div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>시작 연도</span>
+          <input id="refresh-year-from" value="{escape(str(default_year_from))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input id="refresh-year-to" value="{escape(str(default_year_to))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>배치 크기</span>
+          <select id="refresh-batch-size">
+            <option value="10">10</option>
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
+      </div>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="segmented">
+          <button type="button" class="segmented-button" id="sync-company-master-button">회사 목록 동기화</button>
+          <button type="button" class="segmented-button" id="create-refresh-job-button">새 작업 시작</button>
+          <button type="button" class="segmented-button" id="pause-refresh-job-button">일시정지</button>
+          <button type="button" class="segmented-button" id="resume-refresh-job-button">이어받기</button>
+          <button type="button" class="segmented-button" id="retry-refresh-job-button">실패만 재시도</button>
+          <button type="button" class="segmented-button segmented-button-danger" id="reset-databases-button">전체 DB 초기화</button>
+        </div>
+        <div class="toolbar-note" id="refresh-job-message">회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.</div>
+      </div>
+      <div class="toolbar-row toolbar-row-dense" id="refresh-job-summary">
+        {render_refresh_job_status_summary(update_job)}
+      </div>
+    </section>
+    """
+
+
+def _safe_int(value: object, default: int) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default

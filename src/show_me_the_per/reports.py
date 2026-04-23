@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -8,6 +8,7 @@ from typing import Iterable
 
 from .growth import (
     ANNUAL_YOY,
+    QUARTERLY_QOQ,
     QUARTERLY_YOY,
     TRAILING_FOUR_QUARTER_YOY,
 )
@@ -26,16 +27,20 @@ METRIC_LABELS = {
     "net_income": "순이익",
 }
 
+METRIC_LABELS["eps"] = "EPS"
+
 SERIES_LABELS = {
     ANNUAL_YOY: "연간 YoY",
     QUARTERLY_YOY: "분기 YoY",
+    QUARTERLY_QOQ: "분기 QoQ",
     TRAILING_FOUR_QUARTER_YOY: "최근 4분기 합산 YoY",
 }
 
 SERIES_ORDER = {
     ANNUAL_YOY: 0,
     QUARTERLY_YOY: 1,
-    TRAILING_FOUR_QUARTER_YOY: 2,
+    QUARTERLY_QOQ: 2,
+    TRAILING_FOUR_QUARTER_YOY: 3,
 }
 
 METRIC_ORDER = {
@@ -44,6 +49,8 @@ METRIC_ORDER = {
     "net_income": 2,
 }
 
+
+METRIC_ORDER["eps"] = 3
 
 def build_company_growth_report_payload(
     database_path: Path,
@@ -120,6 +127,7 @@ def write_company_growth_report_html(
 def build_growth_ranking_report_payload(
     database_path: Path,
     *,
+    growth_conditions: Iterable[dict[str, object] | str] | None = None,
     growth_metric: str | None = None,
     growth_series_type: str | None = None,
     include_failed_growth: bool = False,
@@ -127,10 +135,22 @@ def build_growth_ranking_report_payload(
 ) -> dict[str, object]:
     payload = build_database_growth_ranking_payload(
         database_path,
+        growth_conditions=growth_conditions,
         growth_metric=growth_metric,
         growth_series_type=growth_series_type,
         include_failed_growth=include_failed_growth,
         limit=limit,
+    )
+    filters = _dict(payload.get("filters"))
+    filter_conditions = [
+        _dict(condition)
+        for condition in _list(filters.get("growth_conditions"))
+    ]
+    primary_condition = filter_conditions[0] if filter_conditions else {}
+    display_metric = growth_metric or str(primary_condition.get("metric", "")).strip()
+    display_series_type = (
+        growth_series_type
+        or str(primary_condition.get("series_type", "")).strip()
     )
     rankings = [
         {
@@ -151,20 +171,18 @@ def build_growth_ranking_report_payload(
         **payload,
         "display": {
             "metric_label": (
-                METRIC_LABELS.get(growth_metric, growth_metric)
-                if growth_metric is not None
+                METRIC_LABELS.get(display_metric, display_metric)
+                if display_metric
                 else "전체 지표"
             ),
             "series_label": (
-                SERIES_LABELS.get(growth_series_type, growth_series_type)
-                if growth_series_type is not None
+                SERIES_LABELS.get(display_series_type, display_series_type)
+                if display_series_type
                 else "전체 기준"
             ),
         },
         "growth_rankings": rankings,
     }
-
-
 def write_growth_ranking_report_html(
     output_path: Path,
     payload: dict[str, object],
@@ -801,3 +819,5 @@ def _dict(value: object) -> dict[str, object]:
 
 def _list(value: object) -> list[object]:
     return value if isinstance(value, list) else []
+
+

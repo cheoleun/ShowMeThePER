@@ -1,5 +1,9 @@
 # ShowMeThePER
 
+## Getting Started
+
+- 처음 설치하고 실행하는 방법: [docs/getting-started.md](docs/getting-started.md)
+
 한국 상장기업의 재무제표와 성장률 지표를 수집하고 보여주는 프로젝트입니다.
 
 ## 현재 구현 범위
@@ -21,8 +25,22 @@
 - 분석 산출물을 SQLite DB에 저장하고 요약 조회
 - SQLite DB에 저장된 성장률 필터 결과로 성장률 랭킹 조회
 - SQLite DB에 저장된 회사별 성장률을 정적 HTML 리포트로 출력
+- SQLite DB에 저장된 성장률 필터 결과를 정적 HTML 랭킹 리포트로 출력
+- FastAPI 브라우저 화면에서 요청 기업의 N년치 재무제표 수집과 성장률 분석 실행
 - 성장률, PER, PBR, ROE 기반 순위 JSON 출력
 - API 키 없이 실행 가능한 단위 테스트
+
+## 브라우저 UI
+
+OpenDART API 키를 환경변수로 설정한 뒤 FastAPI 서버를 실행하면 브라우저에서 기업 이름과 조회 연수를 입력해 바로 분석할 수 있습니다.
+
+```powershell
+$env:OPENDART_API_KEY="..."
+$env:PYTHONPATH="src"
+python -m show_me_the_per.cli web --host 127.0.0.1 --port 8000
+```
+
+브라우저에서 `http://127.0.0.1:8000`을 열고 기업 이름, 조회 연수, 기준 연도, 재무제표 구분을 입력합니다. 기업 이름 대신 종목코드나 OpenDART 고유번호도 사용할 수 있습니다. 결과 화면에는 연간 금액, 분기 금액, 성장률 필터 결과, 성장률 차트가 표시됩니다.
 
 ## CLI
 

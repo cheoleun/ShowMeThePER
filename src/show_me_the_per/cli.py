@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 from decimal import Decimal
 import json
 import os
@@ -17,6 +18,7 @@ from .financials import (
 from .growth import read_financial_period_values, write_growth_metrics_payload
 from .krx import KrxClient
 from .matching import match_listings_to_dart
+from .naver_finance import NaverFinanceClient
 from .opendart import OpenDartClient
 from .pipeline import (
     DEFAULT_REPORT_CODES,
@@ -27,6 +29,10 @@ from .pipeline import (
     write_analysis_outputs,
 )
 from .rankings import (
+    DEFAULT_SCREENING_GROWTH_METRIC,
+    DEFAULT_SCREENING_GROWTH_SERIES_TYPE,
+    ValuationSnapshot,
+    normalize_growth_conditions,
     read_growth_metrics_payload,
     read_valuation_snapshots,
     write_ranking_payload,
@@ -38,9 +44,12 @@ from .reports import (
     write_growth_ranking_report_html,
 )
 from .storage import (
+    build_database_company_screening_payload,
     build_database_growth_ranking_payload,
+    read_dart_companies_from_database,
     store_analysis_artifacts,
     store_analysis_directory,
+    store_valuation_snapshot,
     summarize_database,
 )
 
@@ -57,6 +66,8 @@ COMMANDS = {
     "rank-growth-from-db",
     "company-growth-report",
     "growth-ranking-report",
+    "refresh-valuations",
+    "web",
 }
 
 
@@ -214,12 +225,16 @@ def main(argv: list[str] | None = None) -> None:
 
     ranking_parser = subparsers.add_parser(
         "rank-companies",
-        help="Build growth and valuation rankings from analysis JSON files.",
+        help="Build growth and valuation rankings from JSON or SQLite data.",
+    )
+    ranking_parser.add_argument(
+        "--database",
+        type=Path,
+        help="Optional SQLite database path to read rankings from.",
     )
     ranking_parser.add_argument(
         "--growth-input",
         type=Path,
-        required=True,
         help="Path to growth metrics JSON.",
     )
     ranking_parser.add_argument(
@@ -232,6 +247,15 @@ def main(argv: list[str] | None = None) -> None:
         type=Path,
         required=True,
         help="Path to write ranking JSON.",
+    )
+    ranking_parser.add_argument(
+        "--growth-condition",
+        action="append",
+        default=[],
+        help=(
+            "Growth condition in the form annual_yoy:revenue[:recent_periods]. "
+            "May be repeated."
+        ),
     )
     ranking_parser.add_argument(
         "--growth-metric",
@@ -266,6 +290,28 @@ def main(argv: list[str] | None = None) -> None:
         choices=["per", "pbr", "roe"],
         default="roe",
         help="Valuation ranking metric. Defaults to roe.",
+    )
+    ranking_parser.add_argument(
+        "--market",
+        choices=["KOSPI", "KOSDAQ"],
+        help="Optional market filter when reading from --database.",
+    )
+    ranking_parser.add_argument(
+        "--end-year",
+        type=int,
+        help="Optional end year for database screening. Defaults to the current year.",
+    )
+    ranking_parser.add_argument(
+        "--recent-years",
+        type=int,
+        default=3,
+        help="Recent years to evaluate for database screening. Defaults to 3.",
+    )
+    ranking_parser.add_argument(
+        "--sort-by",
+        choices=["market_cap", "overall_minimum_growth_rate"],
+        default="market_cap",
+        help="Sort key for combined database screening. Defaults to market_cap.",
     )
 
     collect_parser = subparsers.add_parser(
@@ -408,6 +454,15 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional path to write growth ranking JSON.",
     )
     db_growth_rank_parser.add_argument(
+        "--growth-condition",
+        action="append",
+        default=[],
+        help=(
+            "Growth condition in the form annual_yoy:revenue[:recent_periods]. "
+            "May be repeated."
+        ),
+    )
+    db_growth_rank_parser.add_argument(
         "--growth-metric",
         help="Optional growth metric to rank, for example revenue.",
     )
@@ -465,6 +520,15 @@ def main(argv: list[str] | None = None) -> None:
         help="SQLite database path.",
     )
     growth_ranking_report_parser.add_argument(
+        "--growth-condition",
+        action="append",
+        default=[],
+        help=(
+            "Growth condition in the form annual_yoy:revenue[:recent_periods]. "
+            "May be repeated."
+        ),
+    )
+    growth_ranking_report_parser.add_argument(
         "--growth-metric",
         help="Optional growth metric to rank, for example revenue.",
     )
@@ -487,6 +551,54 @@ def main(argv: list[str] | None = None) -> None:
         type=Path,
         required=True,
         help="Path to write static HTML ranking report.",
+    )
+
+    refresh_valuations_parser = subparsers.add_parser(
+        "refresh-valuations",
+        help="Fetch Naver Finance valuation snapshots and store them in SQLite.",
+    )
+    refresh_valuations_parser.add_argument(
+        "--database",
+        type=Path,
+        required=True,
+        help="SQLite database path.",
+    )
+    refresh_valuations_parser.add_argument(
+        "--stock-code",
+        action="append",
+        default=[],
+        help="Optional stock code. May be repeated or comma-separated.",
+    )
+    refresh_valuations_parser.add_argument(
+        "--limit",
+        type=int,
+        help="Optional limit when refreshing all companies from the database.",
+    )
+    refresh_valuations_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional path to write refresh summary JSON.",
+    )
+
+    web_parser = subparsers.add_parser(
+        "web",
+        help="Run the browser UI with FastAPI.",
+    )
+    web_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host for the FastAPI server. Defaults to 127.0.0.1.",
+    )
+    web_parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port for the FastAPI server. Defaults to 8000.",
+    )
+    web_parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Enable uvicorn reload for local development.",
     )
 
     args = parser.parse_args(args_list)
@@ -512,6 +624,10 @@ def main(argv: list[str] | None = None) -> None:
         run_company_growth_report(args)
     elif args.command == "growth-ranking-report":
         run_growth_ranking_report(args)
+    elif args.command == "refresh-valuations":
+        run_refresh_valuations(args)
+    elif args.command == "web":
+        run_web(args)
 
 
 def run_company_master(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -586,6 +702,40 @@ def run_financial_period_values(args: argparse.Namespace) -> None:
 
 
 def run_rank_companies(args: argparse.Namespace) -> None:
+    growth_conditions = normalize_growth_conditions(
+        args.growth_condition,
+        growth_metric=args.growth_metric or DEFAULT_SCREENING_GROWTH_METRIC,
+        growth_series_type=(
+            args.growth_series_type or DEFAULT_SCREENING_GROWTH_SERIES_TYPE
+        ),
+    )
+
+    if args.database is not None:
+        end_year = args.end_year or datetime_now_year()
+        screening_recent_years = max(
+            max(args.recent_years, 1),
+            derive_recent_years_from_growth_conditions(growth_conditions),
+        )
+        start_year = end_year - screening_recent_years + 1
+        payload = build_database_company_screening_payload(
+            args.database,
+            start_year=start_year,
+            end_year=end_year,
+            fs_div="CFS",
+            growth_conditions=growth_conditions,
+            include_failed_growth=args.include_failed_growth,
+            threshold_percent=Decimal("20"),
+            recent_annual_periods=max(args.recent_years, 1),
+            recent_quarterly_periods=max(args.recent_years, 1) * 4,
+            market=args.market,
+            sort_by=args.sort_by,
+        )
+        write_or_print_json(payload, args.output)
+        return
+
+    if args.growth_input is None:
+        raise SystemExit("--growth-input is required when --database is not used.")
+
     growth_payload = read_growth_metrics_payload(args.growth_input)
     valuations = (
         read_valuation_snapshots(args.valuation_input)
@@ -596,8 +746,7 @@ def run_rank_companies(args: argparse.Namespace) -> None:
         args.output,
         growth_payload,
         valuations,
-        growth_metric=args.growth_metric,
-        growth_series_type=args.growth_series_type,
+        growth_conditions=growth_conditions,
         include_failed_growth=args.include_failed_growth,
         max_per=args.max_per,
         max_pbr=args.max_pbr,
@@ -666,6 +815,7 @@ def run_database_summary(args: argparse.Namespace) -> None:
 def run_rank_growth_from_db(args: argparse.Namespace) -> None:
     payload = build_database_growth_ranking_payload(
         args.database,
+        growth_conditions=args.growth_condition,
         growth_metric=args.growth_metric,
         growth_series_type=args.growth_series_type,
         include_failed_growth=args.include_failed_growth,
@@ -686,12 +836,110 @@ def run_company_growth_report(args: argparse.Namespace) -> None:
 def run_growth_ranking_report(args: argparse.Namespace) -> None:
     payload = build_growth_ranking_report_payload(
         args.database,
+        growth_conditions=args.growth_condition,
         growth_metric=args.growth_metric,
         growth_series_type=args.growth_series_type,
         include_failed_growth=args.include_failed_growth,
         limit=args.limit,
     )
     write_growth_ranking_report_html(args.output, payload)
+
+
+def run_refresh_valuations(args: argparse.Namespace) -> None:
+    client = NaverFinanceClient()
+    companies = read_dart_companies_from_database(args.database)
+    requested_stock_codes = set(parse_corp_code_args(args.stock_code))
+    if requested_stock_codes:
+        companies = [
+            company
+            for company in companies
+            if company.stock_code in requested_stock_codes
+        ]
+    if args.limit is not None:
+        companies = companies[: args.limit]
+
+    refreshed = []
+    for company in companies:
+        if not company.stock_code:
+            continue
+        raw_snapshot = client.fetch_snapshot(company.stock_code)
+        snapshot = cli_valuation_snapshot_from_company(company, raw_snapshot)
+        store_valuation_snapshot(args.database, snapshot)
+        refreshed.append(
+            {
+                "corp_code": snapshot.corp_code,
+                "corp_name": snapshot.corp_name,
+                "stock_code": snapshot.stock_code,
+                "base_date": snapshot.base_date,
+                "market": snapshot.market,
+            }
+        )
+
+    write_or_print_json(
+        {
+            "summary": {
+                "database": str(args.database),
+                "companies": len(refreshed),
+            },
+            "companies": refreshed,
+        },
+        args.output,
+    )
+
+
+def run_web(args: argparse.Namespace) -> None:
+    import uvicorn
+
+    uvicorn.run(
+        "show_me_the_per.web:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+    )
+
+
+def cli_valuation_snapshot_from_company(
+    company: object,
+    raw_snapshot: object,
+) -> ValuationSnapshot:
+    return ValuationSnapshot(
+        corp_code=str(getattr(company, "corp_code", "")),
+        corp_name=str(getattr(company, "corp_name", "")) or str(getattr(raw_snapshot, "corp_name", "")),
+        stock_code=str(getattr(company, "stock_code", "")),
+        per=getattr(raw_snapshot, "per", None),
+        pbr=getattr(raw_snapshot, "pbr", None),
+        roe=getattr(raw_snapshot, "roe", None),
+        eps=getattr(raw_snapshot, "eps", None),
+        close_price=getattr(raw_snapshot, "close_price", None),
+        market_cap=getattr(raw_snapshot, "market_cap", None),
+        market=getattr(raw_snapshot, "market", None),
+        base_date=str(getattr(raw_snapshot, "base_date", "")),
+        source=str(getattr(raw_snapshot, "source", "")),
+        fetched_at=str(getattr(raw_snapshot, "fetched_at", "")),
+    )
+
+
+def datetime_now_year() -> int:
+    return date.today().year
+
+
+def derive_recent_years_from_growth_conditions(
+    growth_conditions: list[dict[str, object]],
+) -> int:
+    recent_years = 1
+    for condition in growth_conditions:
+        try:
+            recent_periods = int(condition.get("recent_periods", 0))
+        except (TypeError, ValueError):
+            continue
+        if recent_periods <= 0:
+            continue
+        series_type = str(condition.get("series_type", "")).strip()
+        if series_type in {"annual_yoy", "trailing_four_quarter_yoy"}:
+            recent_years = max(recent_years, recent_periods)
+        else:
+            recent_years = max(recent_years, max(1, (recent_periods + 3) // 4))
+    return recent_years
 
 
 def write_or_print_json(payload: dict[str, object], output: Path | None) -> None:

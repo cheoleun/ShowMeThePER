@@ -57,6 +57,26 @@ class OpenDartParserTests(unittest.TestCase):
             ],
         )
 
+    def test_parse_corp_code_zip_accepts_plain_xml_response(self) -> None:
+        companies = parse_corp_code_zip(CORP_CODE_XML)
+
+        self.assertEqual(len(companies), 2)
+        self.assertEqual(companies[0].corp_code, "00126380")
+
+    def test_parse_corp_code_zip_surfaces_open_dart_error_message(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "OpenDART corp code request failed: 010 등록되지 않은 키입니다",
+        ):
+            parse_corp_code_zip(
+                """<?xml version="1.0" encoding="UTF-8"?>
+<result>
+  <status>010</status>
+  <message>등록되지 않은 키입니다</message>
+</result>
+""".encode("utf-8")
+            )
+
     def test_parse_major_accounts_payload_extracts_amounts(self) -> None:
         payload = {
             "status": "000",

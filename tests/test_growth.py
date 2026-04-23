@@ -6,10 +6,12 @@ from pathlib import Path
 
 from show_me_the_per.growth import (
     ANNUAL_YOY,
+    QUARTERLY_QOQ,
     QUARTERLY_YOY,
     TRAILING_FOUR_QUARTER_YOY,
     build_growth_metrics_payload,
     calculate_annual_yoy_growth,
+    calculate_quarterly_qoq_growth,
     calculate_quarterly_yoy_growth,
     calculate_trailing_four_quarter_yoy_growth,
     passes_recent_growth_threshold,
@@ -74,6 +76,33 @@ class GrowthCalculationTests(unittest.TestCase):
         self.assertEqual(q4_2025.amount, Decimal("500"))
         self.assertEqual(q4_2025.base_amount, Decimal("400"))
         self.assertEqual(q4_2025.growth_rate, Decimal("25.00"))
+
+    def test_calculate_quarterly_qoq_growth_compares_previous_quarter(self) -> None:
+        points = calculate_quarterly_qoq_growth(
+            [
+                quarter_value(2024, 3, "100"),
+                quarter_value(2024, 4, "120"),
+                quarter_value(2025, 1, "144"),
+            ]
+        )
+
+        q1_2025 = [point for point in points if point.period_label == "2025Q1"][0]
+
+        self.assertEqual(q1_2025.series_type, QUARTERLY_QOQ)
+        self.assertEqual(q1_2025.base_amount, Decimal("120"))
+        self.assertEqual(q1_2025.growth_rate, Decimal("20.0"))
+
+    def test_calculate_quarterly_qoq_growth_requires_positive_previous_value(self) -> None:
+        points = calculate_quarterly_qoq_growth(
+            [
+                quarter_value(2024, 4, "0"),
+                quarter_value(2025, 1, "144"),
+            ]
+        )
+
+        q1_2025 = [point for point in points if point.period_label == "2025Q1"][0]
+
+        self.assertIsNone(q1_2025.growth_rate)
 
     def test_recent_threshold_requires_all_points_to_pass_not_average(self) -> None:
         points = calculate_annual_yoy_growth(

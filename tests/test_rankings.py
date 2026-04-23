@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import tempfile
 import unittest
@@ -6,8 +8,11 @@ from pathlib import Path
 
 from show_me_the_per.rankings import (
     ValuationSnapshot,
+    build_screening_rows,
     build_ranking_payload,
     filter_valuation_snapshots,
+    normalize_growth_conditions,
+    parse_growth_condition,
     rank_growth_filter_results,
     rank_valuation_snapshots,
     read_valuation_snapshots,
@@ -63,19 +68,94 @@ class RankingTests(unittest.TestCase):
     def test_build_ranking_payload_combines_growth_and_valuation_rankings(self) -> None:
         payload = build_ranking_payload(
             {
-                "filter": {
-                    "results": [
-                        growth_result("00126380", "revenue", "annual_yoy", "25", True)
-                    ]
-                }
+                "growth_points": [
+                    growth_point(
+                        "00126380",
+                        "revenue",
+                        "annual_yoy",
+                        "2025",
+                        growth_rate="25",
+                    )
+                ]
             },
             [valuation("00126380", per="8", pbr="0.9", roe="22")],
+            growth_conditions=[{"metric": "revenue", "series_type": "annual_yoy", "recent_periods": 1}],
             max_per=Decimal("10"),
             min_roe=Decimal("20"),
         )
 
         self.assertEqual(payload["summary"]["growth_rankings"], 1)
         self.assertEqual(payload["summary"]["valuation_rankings"], 1)
+        self.assertEqual(payload["summary"]["screening_rows"], 1)
+
+    def test_build_screening_rows_applies_market_and_multiple_growth_conditions(self) -> None:
+        rows = build_screening_rows(
+            [
+                growth_point("00126380", "revenue", "annual_yoy", "2025", growth_rate="25"),
+                growth_point("00126380", "operating_income", "quarterly_yoy", "2025", quarter=4, growth_rate="21"),
+                growth_point("00434003", "revenue", "annual_yoy", "2025", growth_rate="30"),
+                growth_point("00434003", "operating_income", "quarterly_yoy", "2025", quarter=4, growth_rate="19"),
+            ],
+            [
+                valuation(
+                    "00126380",
+                    per="8",
+                    pbr="0.9",
+                    roe="22",
+                    market_cap="504448025000000",
+                    market="KOSPI",
+                ),
+                valuation(
+                    "00434003",
+                    per="6",
+                    pbr="0.8",
+                    roe="18",
+                    market_cap="160000000000000",
+                    market="KOSPI",
+                ),
+            ],
+            growth_conditions=[
+                "annual_yoy:revenue:1",
+                "quarterly_yoy:operating_income:1",
+            ],
+            include_failed_growth=True,
+            market="KOSPI",
+            sort_by="overall_minimum_growth_rate",
+            threshold_percent=Decimal("20"),
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["corp_code"], "00126380")
+        self.assertEqual(rows[0]["matched_growth_condition_count"], 2)
+        self.assertEqual(rows[0]["overall_minimum_growth_rate"], "21")
+        self.assertTrue(rows[0]["passed"])
+        self.assertFalse(rows[1]["passed"])
+        self.assertEqual(len(rows[0]["growth_checks"]), 2)
+
+    def test_normalize_growth_conditions_uses_default_when_empty(self) -> None:
+        conditions = normalize_growth_conditions()
+
+        self.assertEqual(
+            conditions,
+            [{"metric": "revenue", "series_type": "annual_yoy", "recent_periods": 3}],
+        )
+
+    def test_parse_growth_condition_supports_explicit_recent_periods(self) -> None:
+        condition = parse_growth_condition("quarterly_qoq:net_income:8")
+
+        self.assertEqual(
+            condition,
+            {
+                "metric": "net_income",
+                "series_type": "quarterly_qoq",
+                "recent_periods": 8,
+            },
+        )
+
+    def test_parse_growth_condition_uses_default_period_when_omitted(self) -> None:
+        condition = parse_growth_condition("annual_yoy:revenue")
+
+        self.assertEqual(condition["recent_periods"], 3)
 
     def test_read_and_write_ranking_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -104,13 +184,18 @@ class RankingTests(unittest.TestCase):
             write_ranking_payload(
                 output_path,
                 {
-                    "filter": {
-                        "results": [
-                            growth_result("00126380", "revenue", "annual_yoy", "25", True)
-                        ]
-                    }
+                    "growth_points": [
+                        growth_point(
+                            "00126380",
+                            "revenue",
+                            "annual_yoy",
+                            "2025",
+                            growth_rate="25",
+                        )
+                    ]
                 },
                 snapshots,
+                growth_conditions=["annual_yoy:revenue:1"],
             )
             payload = json.loads(output_path.read_text("utf-8"))
 
@@ -134,12 +219,35 @@ def growth_result(
     }
 
 
+def growth_point(
+    corp_code: str,
+    metric: str,
+    series_type: str,
+    fiscal_year: str,
+    *,
+    quarter: int | None = None,
+    growth_rate: str,
+) -> dict[str, object]:
+    return {
+        "corp_code": corp_code,
+        "metric": metric,
+        "series_type": series_type,
+        "fiscal_year": int(fiscal_year),
+        "fiscal_quarter": quarter,
+        "amount": "100",
+        "base_amount": "80",
+        "growth_rate": growth_rate,
+    }
+
+
 def valuation(
     corp_code: str,
     *,
     per: str,
     pbr: str,
     roe: str,
+    market_cap: str | None = None,
+    market: str | None = None,
 ) -> ValuationSnapshot:
     return ValuationSnapshot(
         corp_code=corp_code,
@@ -148,6 +256,8 @@ def valuation(
         per=Decimal(per),
         pbr=Decimal(pbr),
         roe=Decimal(roe),
+        market_cap=None if market_cap is None else Decimal(market_cap),
+        market=market,
     )
 
 
