@@ -5,7 +5,7 @@ from decimal import Decimal
 import json
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 from urllib.request import urlopen
 
 from .models import KOREAN_EQUITY_MARKETS, KrxListing, normalize_stock_code, parse_decimal_amount
@@ -45,7 +45,7 @@ class KrxClient:
         endpoint: str = DEFAULT_KRX_LISTED_INFO_ENDPOINT,
         timeout_seconds: int = 30,
     ) -> None:
-        self.service_key = service_key
+        self.service_key = _normalize_service_key(service_key)
         self.endpoint = endpoint
         self.timeout_seconds = timeout_seconds
 
@@ -114,7 +114,7 @@ class KrxStockPriceClient:
         endpoint: str = DEFAULT_KRX_STOCK_PRICE_ENDPOINT,
         timeout_seconds: int = 30,
     ) -> None:
-        self.service_key = service_key
+        self.service_key = _normalize_service_key(service_key)
         self.endpoint = endpoint
         self.timeout_seconds = timeout_seconds
 
@@ -235,6 +235,16 @@ def _translate_krx_http_error(
         f"응답 코드 {error.code}을(를) 받았습니다.",
         status_code=error.code,
     )
+
+
+def _normalize_service_key(service_key: str) -> str:
+    text = str(service_key or "").strip()
+    if not text:
+        return ""
+    if "%" not in text:
+        return text
+    normalized = unquote(text)
+    return normalized or text
 
 
 def _extract_items(payload: dict[str, Any]) -> list[dict[str, Any]]:

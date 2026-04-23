@@ -130,6 +130,22 @@ class KrxParserTests(unittest.TestCase):
         self.assertIsNone(context.exception.status_code)
         self.assertIn("KRX 시세 조회 중 네트워크 오류가 발생했습니다.", str(context.exception))
 
+    def test_encoded_service_key_is_normalized_before_urlencode(self) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_urlopen(url: str, timeout: int = 30) -> object:
+            captured["url"] = url
+            raise HTTPError(url, 403, "Forbidden", None, None)
+
+        client = KrxClient("abc%2Bdef%3D%3D")
+
+        with patch("show_me_the_per.krx.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(KrxApiError):
+                client.fetch_listings()
+
+        self.assertIn("serviceKey=abc%2Bdef%3D%3D", captured["url"])
+        self.assertNotIn("%252B", captured["url"])
+
 
 if __name__ == "__main__":
     unittest.main()
