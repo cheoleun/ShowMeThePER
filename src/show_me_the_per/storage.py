@@ -194,21 +194,22 @@ def store_analysis_artifacts(
     artifacts: AnalysisArtifacts,
 ) -> dict[str, int]:
     initialize_database(database_path)
-    growth_points = _parse_growth_points_payload(artifacts.growth_metrics)
-    filter_results = _parse_growth_filter_results_payload(artifacts.growth_metrics)
-
     with sqlite3.connect(database_path) as connection:
-        store_financial_statement_rows(
-            connection,
-            artifacts.financial_statement_rows,
-        )
-        store_financial_period_values(
-            connection,
-            artifacts.financial_period_values,
-        )
-        store_growth_points(connection, growth_points)
-        store_growth_filter_results(connection, filter_results)
-        store_collection_errors(connection, artifacts.collection_errors)
+        _store_analysis_artifacts_in_connection(connection, artifacts)
+
+    return summarize_database(database_path)
+
+
+def replace_company_analysis_artifacts(
+    database_path: Path,
+    *,
+    corp_code: str,
+    artifacts: AnalysisArtifacts,
+) -> dict[str, int]:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        _delete_company_analysis_rows(connection, corp_code=corp_code)
+        _store_analysis_artifacts_in_connection(connection, artifacts)
 
     return summarize_database(database_path)
 
@@ -403,6 +404,57 @@ def store_collection_errors(
             )
             for error in errors
         ],
+    )
+
+
+def _store_analysis_artifacts_in_connection(
+    connection: sqlite3.Connection,
+    artifacts: AnalysisArtifacts,
+) -> None:
+    growth_points = _parse_growth_points_payload(artifacts.growth_metrics)
+    filter_results = _parse_growth_filter_results_payload(artifacts.growth_metrics)
+    store_financial_statement_rows(
+        connection,
+        artifacts.financial_statement_rows,
+    )
+    store_financial_period_values(
+        connection,
+        artifacts.financial_period_values,
+    )
+    store_growth_points(connection, growth_points)
+    store_growth_filter_results(connection, filter_results)
+    store_collection_errors(connection, artifacts.collection_errors)
+
+
+def _delete_company_analysis_rows(
+    connection: sqlite3.Connection,
+    *,
+    corp_code: str,
+) -> None:
+    for table_name in (
+        "financial_statement_rows",
+        "financial_period_values",
+        "growth_points",
+        "growth_filter_results",
+    ):
+        connection.execute(
+            f"DELETE FROM {table_name} WHERE corp_code = ?",
+            (corp_code,),
+        )
+    connection.execute(
+        """
+        DELETE FROM collection_errors
+        WHERE corp_codes = ?
+           OR corp_codes LIKE ?
+           OR corp_codes LIKE ?
+           OR corp_codes LIKE ?
+        """,
+        (
+            corp_code,
+            f"{corp_code},%",
+            f"%,{corp_code}",
+            f"%,{corp_code},%",
+        ),
     )
 
 

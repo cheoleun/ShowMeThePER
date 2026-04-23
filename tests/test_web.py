@@ -3,6 +3,7 @@
 import os
 import tempfile
 from decimal import Decimal
+from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -10,8 +11,10 @@ from fastapi.testclient import TestClient
 
 from show_me_the_per.krx import KrxStockPriceSnapshot
 from show_me_the_per.models import DartCompany, FinancialStatementRow
+from show_me_the_per.storage import read_financial_period_values_from_database
 from show_me_the_per.web import (
     _format_won,
+    _web_cache_database_path,
     create_app,
     default_end_year,
     render_compare_metric_chart,
@@ -27,6 +30,28 @@ class WebTests(TestCase):
         self.assertEqual(_format_won("1000"), "1,000원")
         self.assertEqual(_format_won("0"), "0원")
         self.assertEqual(_format_won(None), "-")
+
+    def test_default_web_cache_path_uses_user_local_cache_directory(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            path = _web_cache_database_path("CFS")
+
+        normalized = str(path).replace("\\", "/")
+        self.assertTrue(normalized.endswith("/show-me-the-per-cfs.sqlite3"))
+        self.assertNotIn("/data/web-cache/", normalized)
+
+    def test_web_cache_path_respects_environment_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                path = _web_cache_database_path("CFS")
+
+        self.assertEqual(
+            path,
+            Path(directory) / "show-me-the-per-cfs.sqlite3",
+        )
 
     def test_home_renders_v2_analysis_toolbar(self) -> None:
         client = TestClient(
@@ -144,6 +169,41 @@ class WebTests(TestCase):
         )
         self.assertIn(
             '/compare?primary_company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20',
+            response.text,
+        )
+
+    def test_analysis_refresh_link_keeps_current_query_state(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "10",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                        "tab": "growth",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            '/analysis?company_query=Samsung+Electronics&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=growth&amp;refresh=1#growth-details',
             response.text,
         )
 
@@ -677,6 +737,114 @@ class WebTests(TestCase):
         self.assertEqual(fetched_years, {"2025"})
         self.assertIn("최신 1개 연도 갱신", second.text)
 
+    def test_refresh_replaces_corrupted_company_cache(self) -> None:
+        seed_client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+        refresh_client = TestClient(
+            create_app(
+                CorrectedSamsungOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                "OPENDART_API_KEY": "test-key",
+                "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+            }
+            with patch.dict(os.environ, env):
+                seeded = seed_client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "10",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+                database_path = Path(directory) / "show-me-the-per-cfs.sqlite3"
+                self.assertEqual(_read_annual_amount(database_path, "00126380", 2019), Decimal("88"))
+
+                refreshed = refresh_client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "10",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                        "refresh": "1",
+                    },
+                )
+                self.assertEqual(
+                    _read_annual_amount(database_path, "00126380", 2019),
+                    Decimal("230400881000000"),
+                )
+
+                self.assertEqual(seeded.status_code, 200)
+                self.assertEqual(refreshed.status_code, 200)
+                self.assertIn("OpenDART 강제 재수집", refreshed.text)
+
+    def test_refresh_failure_keeps_existing_company_cache(self) -> None:
+        seed_client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+        failing_refresh_client = TestClient(
+            create_app(
+                FailingFinancialClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                "OPENDART_API_KEY": "test-key",
+                "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+            }
+            with patch.dict(os.environ, env):
+                seeded = seed_client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "10",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+                database_path = Path(directory) / "show-me-the-per-cfs.sqlite3"
+                before_amount = _read_annual_amount(database_path, "00126380", 2019)
+                failed = failing_refresh_client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "10",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                        "refresh": "1",
+                    },
+                )
+                self.assertEqual(seeded.status_code, 200)
+                self.assertEqual(failed.status_code, 200)
+                self.assertIn("temporary financial fetch failure", failed.text)
+                self.assertEqual(before_amount, Decimal("88"))
+                self.assertEqual(
+                    _read_annual_amount(database_path, "00126380", 2019),
+                    Decimal("88"),
+                )
 
     def test_ranking_page_filters_from_db_cache(self) -> None:
         client = TestClient(
@@ -869,6 +1037,116 @@ class FakeOpenDartClient:
         return rows
 
 
+class CorrectedSamsungOpenDartClient(FakeOpenDartClient):
+    def fetch_major_accounts(
+        self,
+        corp_codes: list[str],
+        business_year: str,
+        report_code: str,
+        fs_div: str | None = None,
+        batch_size: int = 100,
+    ) -> list[FinancialStatementRow]:
+        corp_code = corp_codes[0]
+        if corp_code != "00126380":
+            return super().fetch_major_accounts(
+                corp_codes,
+                business_year,
+                report_code,
+                fs_div=fs_div,
+                batch_size=batch_size,
+            )
+
+        year = int(business_year)
+        annual_amounts = {
+            2015: Decimal("200653482000000"),
+            2016: Decimal("201866745000000"),
+            2017: Decimal("239575376000000"),
+            2018: Decimal("243771415000000"),
+            2019: Decimal("230400881000000"),
+            2020: Decimal("236806988000000"),
+            2021: Decimal("279604799000000"),
+            2022: Decimal("302231360000000"),
+            2023: Decimal("258935494000000"),
+            2024: Decimal("300870903000000"),
+            2025: Decimal("333605938000000"),
+        }
+        quarter_amounts = {
+            2024: {
+                "11013": Decimal("71915600000000"),
+                "11012": Decimal("155000000000000"),
+                "11014": Decimal("228000000000000"),
+                "11011": Decimal("300870903000000"),
+            },
+            2025: {
+                "11013": Decimal("79000000000000"),
+                "11012": Decimal("166000000000000"),
+                "11014": Decimal("248000000000000"),
+                "11011": Decimal("333605938000000"),
+            },
+        }
+        current_amount = quarter_amounts.get(year, {}).get(
+            report_code,
+            annual_amounts.get(year, Decimal("0")),
+        )
+        rows = [
+            FinancialStatementRow(
+                corp_code="00126380",
+                corp_name="Samsung Electronics",
+                stock_code="005930",
+                business_year=business_year,
+                report_code=report_code,
+                fs_div=fs_div or "CFS",
+                fs_name="Consolidated financial statements",
+                statement_div="IS",
+                statement_name="Income statement",
+                account_id="ifrs-full_Revenue",
+                account_name="Revenue",
+                current_term_name="Current",
+                current_amount=current_amount,
+                previous_term_name="Previous",
+                previous_amount=annual_amounts.get(year - 1),
+                before_previous_term_name="Before previous",
+                before_previous_amount=annual_amounts.get(year - 2),
+            )
+        ]
+        if report_code == "11011":
+            eps_amounts = {
+                2015: Decimal("2500"),
+                2016: Decimal("2750"),
+                2017: Decimal("3200"),
+                2018: Decimal("3600"),
+                2019: Decimal("3166"),
+                2020: Decimal("3841"),
+                2021: Decimal("3991"),
+                2022: Decimal("5777"),
+                2023: Decimal("8057"),
+                2024: Decimal("9300"),
+                2025: Decimal("10150"),
+            }
+            rows.append(
+                FinancialStatementRow(
+                    corp_code="00126380",
+                    corp_name="Samsung Electronics",
+                    stock_code="005930",
+                    business_year=business_year,
+                    report_code=report_code,
+                    fs_div=fs_div or "CFS",
+                    fs_name="Consolidated financial statements",
+                    statement_div="IS",
+                    statement_name="Income statement",
+                    account_id="ifrs-full_BasicEarningsLossPerShare",
+                    account_name="Basic earnings per share",
+                    current_term_name="Current",
+                    current_amount=eps_amounts.get(year),
+                    previous_term_name="Previous",
+                    previous_amount=eps_amounts.get(year - 1),
+                    before_previous_term_name="Before previous",
+                    before_previous_amount=eps_amounts.get(year - 2),
+                )
+            )
+        return rows
+
+
 class FakeKrxStockPriceClient:
     def __init__(self, service_key: str) -> None:
         self.service_key = service_key
@@ -1031,6 +1309,23 @@ def _build_quarterly_rows(
                 }
             )
     return rows
+
+
+def _read_annual_amount(
+    database_path: Path,
+    corp_code: str,
+    fiscal_year: int,
+) -> Decimal:
+    values = read_financial_period_values_from_database(
+        database_path,
+        corp_code=corp_code,
+        metric="revenue",
+        period_type="annual",
+    )
+    for value in values:
+        if value.fiscal_year == fiscal_year:
+            return value.amount
+    raise AssertionError(f"annual revenue not found for {corp_code} {fiscal_year}")
 
 
 def _build_annual_rows(start_year: int, end_year: int) -> list[dict[str, object]]:

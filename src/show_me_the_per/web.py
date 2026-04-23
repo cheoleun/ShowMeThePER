@@ -48,6 +48,7 @@ from .storage import (
     read_latest_equity_price_snapshot,
     read_latest_valuation_snapshot,
     read_financial_statement_rows_from_database,
+    replace_company_analysis_artifacts,
     store_equity_price_snapshot,
     store_analysis_artifacts,
     store_valuation_snapshot,
@@ -57,7 +58,6 @@ from .storage import (
 DEFAULT_RECENT_YEARS = 10
 DEFAULT_THRESHOLD_PERCENT = Decimal("20")
 MIN_OPENDART_YEAR = 2015
-DEFAULT_WEB_CACHE_DIR = Path("data/web-cache")
 DEFAULT_PERIOD_KEY = "quarterly"
 DEFAULT_METRIC_KEY = "revenue"
 DEFAULT_ANALYSIS_TAB = "financials"
@@ -147,6 +147,7 @@ class AnalysisForm:
     fs_div: str = "CFS"
     threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
     top_tab: str = DEFAULT_ANALYSIS_TAB
+    refresh: str = ""
 
 
 @dataclass(frozen=True)
@@ -193,6 +194,7 @@ def create_app(
         fs_div: str = "CFS",
         threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
         tab: str = DEFAULT_ANALYSIS_TAB,
+        refresh: str = "",
     ) -> HTMLResponse:
         form = AnalysisForm(
             company_query=(company_query or corp_code).strip(),
@@ -201,6 +203,7 @@ def create_app(
             fs_div=fs_div.strip().upper() or "CFS",
             threshold_percent=threshold_percent.strip(),
             top_tab=_normalize_analysis_tab(tab),
+            refresh=refresh.strip(),
         )
 
         try:
@@ -415,6 +418,7 @@ def parse_analysis_request(form: AnalysisForm) -> dict[str, object]:
         ],
         "fs_div": fs_div,
         "threshold_percent": threshold_percent,
+        "refresh": _parse_refresh(form.refresh),
     }
 
 
@@ -434,6 +438,11 @@ def parse_compare_request(form: CompareForm) -> dict[str, object]:
     request["primary_company_query"] = form.primary_company_query
     request["secondary_company_query"] = form.secondary_company_query
     return request
+
+
+def _parse_refresh(value: object) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "on"}
 
 
 def parse_ranking_request(form: RankingForm) -> dict[str, object]:
@@ -532,6 +541,7 @@ def _collect_browser_payload(
     request: dict[str, object],
 ) -> dict[str, object]:
     database_path = _web_cache_database_path(str(request["fs_div"] or "ALL"))
+    force_refresh = bool(request.get("refresh"))
     try:
         company, company_source = _resolve_company_for_browser(
             client,
@@ -564,7 +574,32 @@ def _collect_browser_payload(
     ]
 
     try:
-        if missing_years:
+        if force_refresh:
+            run = collect_financial_statement_run(
+                client,
+                corp_codes=[company.corp_code],
+                business_years=request["business_years"],
+                report_codes=DEFAULT_REPORT_CODES,
+                fs_div=request["fs_div"],
+                continue_on_error=True,
+            )
+            artifacts = _build_browser_analysis_artifacts(
+                rows=run.rows,
+                corp_code=company.corp_code,
+                request=request,
+                collection_errors=run.errors,
+            )
+            if run.errors or artifacts.collection_errors:
+                raise RuntimeError(_summarize_collection_errors(run.errors, artifacts))
+            replace_company_analysis_artifacts(
+                database_path,
+                corp_code=company.corp_code,
+                artifacts=artifacts,
+            )
+            source_label = "refresh"
+            available_years = sorted({row.business_year for row in artifacts.financial_statement_rows})
+            fetched_business_years = list(request["business_years"])
+        elif missing_years:
             run = collect_financial_statement_run(
                 client,
                 corp_codes=[company.corp_code],
@@ -583,6 +618,7 @@ def _collect_browser_payload(
             store_analysis_artifacts(database_path, artifacts)
             source_label = "network" if not cached_rows else "cache+network"
             available_years = sorted({row.business_year for row in merged_rows})
+            fetched_business_years = missing_years
         else:
             artifacts = _build_browser_analysis_artifacts(
                 rows=cached_rows,
@@ -592,6 +628,7 @@ def _collect_browser_payload(
             )
             source_label = "cache"
             available_years = cached_years
+            fetched_business_years = []
     except Exception as error:  # pragma: no cover - exercised through route tests
         raise RuntimeError(
             _format_request_error(
@@ -616,10 +653,12 @@ def _collect_browser_payload(
             "data_source": source_label,
             "company_source": company_source,
             "cached_business_years": available_years,
-            "fetched_business_years": missing_years,
+            "fetched_business_years": fetched_business_years,
+            "refresh_requested": force_refresh,
             "cache_status": _describe_cache_status(
                 source_label=source_label,
-                fetched_business_years=missing_years,
+                fetched_business_years=fetched_business_years,
+                force_refresh=force_refresh,
             ),
         }
     )
@@ -745,6 +784,26 @@ def _build_browser_analysis_artifacts(
     )
 
 
+def _summarize_collection_errors(
+    run_errors: list[object],
+    artifacts: AnalysisArtifacts,
+) -> str:
+    messages = [
+        str(getattr(error, "message", "")).strip()
+        for error in run_errors
+        if str(getattr(error, "message", "")).strip()
+    ]
+    if not messages:
+        messages = [
+            str(getattr(error, "message", "")).strip()
+            for error in artifacts.collection_errors
+            if str(getattr(error, "message", "")).strip()
+        ]
+    if messages:
+        return messages[0]
+    return "강제 재수집 중 일부 연도 데이터를 완전히 수집하지 못했습니다."
+
+
 def _resolve_company_for_browser(
     client: MajorAccountClient,
     *,
@@ -809,20 +868,45 @@ def _merge_financial_statement_rows(
 
 
 def _web_cache_database_path(fs_div: str) -> Path:
-    base_dir = Path(
-        os.getenv(
-            "SHOW_ME_THE_PER_WEB_CACHE_DIR",
-            str(DEFAULT_WEB_CACHE_DIR),
-        )
-    )
+    base_dir = _default_web_cache_dir()
     return base_dir / f"show-me-the-per-{(fs_div or 'ALL').lower()}.sqlite3"
+
+
+def _default_web_cache_dir() -> Path:
+    override = os.getenv("SHOW_ME_THE_PER_WEB_CACHE_DIR", "").strip()
+    if override:
+        return Path(override)
+    if os.name == "nt":
+        local_appdata = os.getenv("LOCALAPPDATA", "").strip()
+        root = Path(local_appdata) if local_appdata else _safe_home_dir() / "AppData" / "Local"
+        return root / "ShowMeThePER" / "web-cache"
+    return _safe_home_dir() / ".cache" / "show_me_the_per" / "web-cache"
+
+
+def _safe_home_dir() -> Path:
+    try:
+        return Path.home()
+    except RuntimeError:
+        user_profile = os.getenv("USERPROFILE", "").strip()
+        if user_profile:
+            return Path(user_profile)
+        home_drive = os.getenv("HOMEDRIVE", "").strip()
+        home_path = os.getenv("HOMEPATH", "").strip()
+        if home_drive and home_path:
+            return Path(f"{home_drive}{home_path}")
+    return Path.cwd()
 
 
 def _describe_cache_status(
     *,
     source_label: str,
     fetched_business_years: list[object],
+    force_refresh: bool = False,
 ) -> str:
+    if force_refresh:
+        if fetched_business_years:
+            return f"OpenDART 강제 재수집 ({len(fetched_business_years)}개 연도)"
+        return "현재 기업 재무 재수집"
     if source_label == "cache":
         return "DB 캐시 사용"
     if not fetched_business_years:
@@ -1325,13 +1409,31 @@ def render_analysis_header(
     payload: dict[str, object] | None,
 ) -> str:
     company = _dict(payload.get("company")) if payload else {}
-    query = str(_dict(payload.get("summary")).get("company_query", "")) if payload else form.company_query
+    summary = _dict(payload.get("summary")) if payload else {}
+    query = str(summary.get("company_query", "")) if payload else form.company_query
     compare_href = _build_compare_href(
         primary_company_query=query or form.company_query,
         recent_years=form.recent_years,
         end_year=form.end_year or str(default_end_year()),
         fs_div=form.fs_div,
         threshold_percent=form.threshold_percent,
+    )
+    refresh_href = ""
+    if query or form.company_query:
+        refresh_href = _build_analysis_href(
+            company_query=query or form.company_query,
+            recent_years=form.recent_years,
+            end_year=form.end_year or str(default_end_year()),
+            fs_div=form.fs_div,
+            threshold_percent=form.threshold_percent,
+            top_tab=form.top_tab,
+            fragment=_analysis_tab_fragment(form.top_tab),
+            refresh=True,
+        )
+    refresh_link = (
+        f'<a class="ghost-link" href="{escape(refresh_href)}">재무 재수집</a>'
+        if refresh_href
+        else ""
     )
     return f"""
     <section class="toolbar-surface">
@@ -1342,6 +1444,7 @@ def render_analysis_header(
       </div>
       <form id="analysis-form" class="query-form" data-loading-form method="get" action="/analysis">
         <input id="analysis-recent-years" type="hidden" name="recent_years" value="{escape(form.recent_years or str(DEFAULT_RECENT_YEARS))}">
+        <input type="hidden" name="tab" value="{escape(_normalize_analysis_tab(form.top_tab))}">
         <label class="field field-grow">
           <span>기업명</span>
           <input name="company_query" value="{escape(form.company_query)}" placeholder="예: 삼성전자" required>
@@ -1373,6 +1476,7 @@ def render_analysis_header(
           {render_year_preset_button("5년", "5", form.recent_years, "analysis-form", "analysis-recent-years")}
           {render_year_preset_button("10년", "10", form.recent_years, "analysis-form", "analysis-recent-years")}
         </div>
+        {refresh_link}
         <a class="ghost-link" href="{escape(compare_href)}">VS 기업비교 열기</a>
         {render_toolbar_meta(company, form)}
       </div>
@@ -1531,7 +1635,7 @@ def render_cache_status_pill(summary: dict[str, object]) -> str:
     class_name = "inline-pill"
     if status == "DB 캐시 사용":
         class_name = "inline-pill inline-pill-accent"
-    elif "OpenDART 신규 수집" in status:
+    elif "OpenDART 신규 수집" in status or "OpenDART 강제 재수집" in status:
         class_name = "inline-pill inline-pill-contrast"
     return f'<span class="{class_name}">{escape(status)}</span>'
 
@@ -1650,6 +1754,18 @@ def render_browser_report(
         ),
         threshold_percent=str(summary.get("threshold_percent", DEFAULT_THRESHOLD_PERCENT)),
     )
+    refresh_href = _build_analysis_href(
+        company_query=str(summary.get("company_query", "")),
+        recent_years=str(summary.get("recent_years", DEFAULT_RECENT_YEARS)),
+        end_year=str(summary.get("end_year", default_end_year())),
+        fs_div="CFS" if str(summary.get("fs_div", "전체")) == "연결" else (
+            "OFS" if str(summary.get("fs_div", "전체")) == "별도" else "ALL"
+        ),
+        threshold_percent=str(summary.get("threshold_percent", DEFAULT_THRESHOLD_PERCENT)),
+        top_tab=top_tab,
+        fragment=_analysis_tab_fragment(top_tab),
+        refresh=True,
+    )
 
     return f"""
     <section class="report-shell" data-dashboard data-initial-period="{DEFAULT_PERIOD_KEY}" data-initial-metric="{escape(initial_metric)}">
@@ -1664,6 +1780,7 @@ def render_browser_report(
           {render_cache_status_pill(summary)}
           <span class="inline-pill">원천 row {escape(str(summary.get("raw_rows", 0)))}개</span>
           <span class="inline-pill">성장률 {escape(str(summary.get("growth_points", 0)))}개</span>
+          <a class="ghost-link" href="{escape(refresh_href)}">재무 재수집</a>
           <a class="ghost-link" href="{escape(compare_href)}">이 기업으로 비교 시작</a>
         </div>
       </section>
@@ -4042,6 +4159,7 @@ def _build_analysis_href(
     threshold_percent: str,
     top_tab: str = "",
     fragment: str = "",
+    refresh: bool = False,
 ) -> str:
     params = {
         "company_query": company_query,
@@ -4050,6 +4168,7 @@ def _build_analysis_href(
         "fs_div": fs_div,
         "threshold_percent": threshold_percent,
         "tab": _normalize_analysis_tab(top_tab) if top_tab else "",
+        "refresh": "1" if refresh else "",
     }
     filtered = {key: value for key, value in params.items() if str(value).strip()}
     query = urlencode(filtered)
@@ -4077,6 +4196,15 @@ def _build_compare_href(
     filtered = {key: value for key, value in params.items() if str(value).strip()}
     query = urlencode(filtered)
     return f"/compare?{query}" if query else "/compare"
+
+
+def _analysis_tab_fragment(top_tab: str) -> str:
+    normalized = _normalize_analysis_tab(top_tab)
+    if normalized == "overview":
+        return "overview-summary"
+    if normalized == "growth":
+        return "growth-details"
+    return "financials-details"
 
 
 def _build_ranking_href(
