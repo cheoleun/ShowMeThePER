@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 import httpx
+import json
 from typing import Any
 from urllib.parse import unquote
 
@@ -42,6 +43,44 @@ class KrxStockPriceSnapshot:
     close_price: Decimal | None
     market_cap: Decimal | None
     listed_stock_count: Decimal | None
+
+
+def diagnose_krx_service(
+    service_key: str,
+    *,
+    timeout_seconds: int = 15,
+) -> dict[str, object]:
+    normalized_key = _normalize_service_key(service_key)
+    probes = [
+        _probe_krx_endpoint(
+            name="company_list",
+            endpoint=DEFAULT_KRX_LISTED_INFO_ENDPOINT,
+            params={
+                "serviceKey": normalized_key,
+                "resultType": "json",
+                "numOfRows": "1",
+                "pageNo": "1",
+            },
+            timeout_seconds=timeout_seconds,
+        ),
+        _probe_krx_endpoint(
+            name="stock_price",
+            endpoint=DEFAULT_KRX_STOCK_PRICE_ENDPOINT,
+            params={
+                "serviceKey": normalized_key,
+                "resultType": "json",
+                "numOfRows": "1",
+                "pageNo": "1",
+            },
+            timeout_seconds=timeout_seconds,
+        ),
+    ]
+    return {
+        "service_key_present": bool(normalized_key),
+        "service_key_length": len(normalized_key),
+        "service_key_masked": _mask_service_key(normalized_key),
+        "probes": probes,
+    }
 
 
 class KrxClient:
@@ -264,6 +303,65 @@ def _translate_krx_http_error(
     )
 
 
+def _probe_krx_endpoint(
+    *,
+    name: str,
+    endpoint: str,
+    params: dict[str, str],
+    timeout_seconds: int,
+) -> dict[str, object]:
+    try:
+        response = httpx.get(
+            endpoint,
+            params=params,
+            headers=DEFAULT_KRX_REQUEST_HEADERS,
+            timeout=timeout_seconds,
+            follow_redirects=True,
+            trust_env=False,
+        )
+        content_type = response.headers.get("content-type", "")
+        preview = response.text[:400]
+        result_code = ""
+        result_message = ""
+        try:
+            payload = response.json()
+            result_code = str(
+                payload.get("response", {})
+                .get("header", {})
+                .get("resultCode", "")
+            ).strip()
+            result_message = str(
+                payload.get("response", {})
+                .get("header", {})
+                .get("resultMsg", "")
+            ).strip()
+            preview = json.dumps(payload, ensure_ascii=False)[:400]
+        except Exception:
+            payload = None
+        return {
+            "name": name,
+            "endpoint": endpoint,
+            "status_code": response.status_code,
+            "ok": response.is_success,
+            "content_type": content_type,
+            "result_code": result_code,
+            "result_message": result_message,
+            "response_preview": preview,
+        }
+    except httpx.RequestError as error:
+        return {
+            "name": name,
+            "endpoint": endpoint,
+            "status_code": None,
+            "ok": False,
+            "content_type": "",
+            "result_code": "",
+            "result_message": "",
+            "response_preview": "",
+            "error": str(error),
+        }
+
+
 def _normalize_service_key(service_key: str) -> str:
     text = str(service_key or "").strip()
     if not text:
@@ -272,6 +370,14 @@ def _normalize_service_key(service_key: str) -> str:
         return text
     normalized = unquote(text)
     return normalized or text
+
+
+def _mask_service_key(service_key: str) -> str:
+    if not service_key:
+        return ""
+    if len(service_key) <= 8:
+        return "*" * len(service_key)
+    return f"{service_key[:4]}{'*' * (len(service_key) - 8)}{service_key[-4:]}"
 
 
 def _extract_items(payload: dict[str, Any]) -> list[dict[str, Any]]:

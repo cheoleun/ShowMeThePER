@@ -13,7 +13,13 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .growth import ANNUAL_YOY, QUARTERLY_QOQ, QUARTERLY_YOY, TRAILING_FOUR_QUARTER_YOY
-from .krx import KrxApiError, KrxClient, KrxStockPriceClient, KrxStockPriceSnapshot
+from .krx import (
+    KrxApiError,
+    KrxClient,
+    KrxStockPriceClient,
+    KrxStockPriceSnapshot,
+    diagnose_krx_service,
+)
 from .matching import match_listings_to_dart
 from .naver_finance import NaverFinanceClient
 from .models import (
@@ -467,6 +473,37 @@ def create_app(
                 "message": "전체 DB 캐시 초기화 완료. 회사목록, 재무, 시세, 작업 상태가 모두 삭제되었습니다.",
                 "databases": databases,
                 "summary": summary,
+            }
+        )
+
+    @app.post("/ranking/krx-diagnostics")
+    async def ranking_krx_diagnostics(
+        request: Request,
+    ) -> JSONResponse:
+        _ = await _read_request_json(request)
+        service_key = os.getenv("KRX_SERVICE_KEY", "").strip()
+        if not service_key:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "KRX_SERVICE_KEY가 필요합니다."},
+            )
+        diagnostics = diagnose_krx_service(service_key)
+        probes = diagnostics.get("probes", [])
+        parts: list[str] = []
+        for probe in probes:
+            if not isinstance(probe, dict):
+                continue
+            probe_name = "회사목록" if probe.get("name") == "company_list" else "시세"
+            parts.append(
+                f"{probe_name} {probe.get('status_code') or '-'} "
+                f"({probe.get('result_code') or '-'} {probe.get('result_message') or ''})".strip()
+            )
+        message = " | ".join(parts) if parts else "KRX 연결 점검 결과를 확인해 주세요."
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": message,
+                "diagnostics": diagnostics,
             }
         )
 
@@ -5653,6 +5690,7 @@ def render_ranking_update_panel(
       </div>
       <div class="toolbar-row toolbar-row-dense">
         <div class="segmented">
+          <button type="button" class="segmented-button" id="diagnose-krx-button">KRX 연결 점검</button>
           <button type="button" class="segmented-button" id="sync-company-master-button">회사 목록 동기화</button>
           <button type="button" class="segmented-button" id="create-refresh-job-button">새 작업 시작</button>
           <button type="button" class="segmented-button" id="pause-refresh-job-button">일시정지</button>
@@ -5807,6 +5845,7 @@ def render_ranking_job_script(form: RankingForm) -> str:
       }}
       const summaryNode = document.getElementById("refresh-job-summary");
       const messageNode = document.getElementById("refresh-job-message");
+      const diagnoseButton = document.getElementById("diagnose-krx-button");
       const syncButton = document.getElementById("sync-company-master-button");
       const createButton = document.getElementById("create-refresh-job-button");
       const pauseButton = document.getElementById("pause-refresh-job-button");
@@ -5925,6 +5964,18 @@ def render_ranking_job_script(form: RankingForm) -> str:
             setMessage(`회사 목록 동기화 완료: ${{summary.count || 0}}개`);
             activeJobId = "";
             renderSummary(null);
+          }} catch (error) {{
+            setMessage(String(error.message || error));
+          }}
+        }});
+      }}
+
+      if (diagnoseButton) {{
+        diagnoseButton.addEventListener("click", async () => {{
+          setMessage("KRX 연결을 점검하고 있습니다...");
+          try {{
+            const payload = await callJson("/ranking/krx-diagnostics", "POST", {{}});
+            setMessage(payload.message || "KRX 연결 점검 완료");
           }} catch (error) {{
             setMessage(String(error.message || error));
           }}

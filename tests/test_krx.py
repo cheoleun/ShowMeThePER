@@ -5,6 +5,7 @@ from show_me_the_per.krx import (
     KrxApiError,
     KrxClient,
     KrxStockPriceClient,
+    diagnose_krx_service,
     parse_krx_listings,
     parse_stock_price_payload,
 )
@@ -169,6 +170,43 @@ class KrxParserTests(unittest.TestCase):
         self.assertEqual(headers["User-Agent"], "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
         self.assertEqual(headers["Accept"], "application/json,text/plain,*/*")
         self.assertEqual(captured["trust_env"], False)
+
+    def test_diagnose_krx_service_returns_probe_summaries(self) -> None:
+        def fake_get(url: str, **kwargs: object) -> object:
+            request = httpx.Request("GET", url, params=kwargs.get("params"))
+            if "GetKrxListedInfoService" in url:
+                return httpx.Response(
+                    401,
+                    request=request,
+                    json={
+                        "response": {
+                            "header": {
+                                "resultCode": "99",
+                                "resultMsg": "AUTH ERROR",
+                            }
+                        }
+                    },
+                )
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "response": {
+                        "header": {
+                            "resultCode": "00",
+                            "resultMsg": "NORMAL SERVICE.",
+                        }
+                    }
+                },
+            )
+
+        with patch("show_me_the_per.krx.httpx.get", side_effect=fake_get):
+            result = diagnose_krx_service("test-key")
+
+        self.assertTrue(result["service_key_present"])
+        self.assertEqual(len(result["probes"]), 2)
+        self.assertEqual(result["probes"][0]["status_code"], 401)
+        self.assertEqual(result["probes"][1]["status_code"], 200)
 
 
 if __name__ == "__main__":

@@ -940,6 +940,7 @@ class WebTests(TestCase):
         self.assertIn('value="annual_yoy:revenue"', response.text)
         self.assertIn('value="quarterly_qoq:net_income"', response.text)
         self.assertIn("DB 업데이트", response.text)
+        self.assertIn("KRX 연결 점검", response.text)
         self.assertIn("회사 목록 동기화", response.text)
         self.assertIn("전체 DB 초기화", response.text)
         self.assertIn("상장사 대상 목록 생성", response.text)
@@ -1279,6 +1280,53 @@ class WebTests(TestCase):
         self.assertIn("전체 DB 캐시 초기화 완료", response.json()["message"])
         self.assertTrue(all(count == 0 for count in cfs_summary.values()))
         self.assertTrue(all(count == 0 for count in ofs_summary.values()))
+
+    def test_ranking_krx_diagnostics_returns_probe_summary(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        fake_diagnostics = {
+            "service_key_present": True,
+            "service_key_length": 24,
+            "service_key_masked": "abcd********wxyz",
+            "probes": [
+                {
+                    "name": "company_list",
+                    "status_code": 401,
+                    "result_code": "99",
+                    "result_message": "AUTH ERROR",
+                },
+                {
+                    "name": "stock_price",
+                    "status_code": 200,
+                    "result_code": "00",
+                    "result_message": "NORMAL SERVICE.",
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+                clear=True,
+            ):
+                with patch("show_me_the_per.web.diagnose_krx_service", return_value=fake_diagnostics):
+                    response = client.post("/ranking/krx-diagnostics", json={})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ok")
+        self.assertIn("회사목록 401", response.json()["message"])
+        self.assertIn("시세 200", response.json()["message"])
 
 
 class FakeOpenDartClient:
