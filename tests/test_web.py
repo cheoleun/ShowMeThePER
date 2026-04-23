@@ -252,9 +252,10 @@ class WebTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("KOSDAQ", response.text)
-        self.assertIn("PER", response.text)
-        self.assertIn("PBR", response.text)
-        self.assertIn("ROE", response.text)
+        self.assertIn("EPS", response.text)
+        self.assertNotIn(">PER ", response.text)
+        self.assertNotIn(">PBR ", response.text)
+        self.assertNotIn(">ROE ", response.text)
 
     def test_analysis_falls_back_to_valuation_snapshot_when_krx_lookup_fails(self) -> None:
         client = TestClient(
@@ -287,9 +288,10 @@ class WebTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("KOSDAQ", response.text)
-        self.assertIn("PER", response.text)
-        self.assertIn("PBR", response.text)
-        self.assertIn("ROE", response.text)
+        self.assertIn("EPS", response.text)
+        self.assertNotIn(">PER ", response.text)
+        self.assertNotIn(">PBR ", response.text)
+        self.assertNotIn(">ROE ", response.text)
 
     def test_compare_empty_page_renders_form(self) -> None:
         client = TestClient(
@@ -727,9 +729,6 @@ class WebTests(TestCase):
                         "end_year": "2025",
                         "fs_div": "CFS",
                         "threshold_percent": "20",
-                        "max_per": "10",
-                        "min_roe": "20",
-                        "sort_by": "per",
                     },
                 )
 
@@ -737,6 +736,12 @@ class WebTests(TestCase):
         self.assertIn("/ranking?", response.text)
         self.assertIn("Samsung Electronics", response.text)
         self.assertIn('href="/analysis?company_query=Samsung+Electronics', response.text)
+        self.assertNotIn('name="max_per"', response.text)
+        self.assertNotIn('name="max_pbr"', response.text)
+        self.assertNotIn('name="min_roe"', response.text)
+        self.assertNotIn("<th>PER</th>", response.text)
+        self.assertNotIn("<th>PBR</th>", response.text)
+        self.assertNotIn("<th>ROE</th>", response.text)
 
 
 class FakeOpenDartClient:

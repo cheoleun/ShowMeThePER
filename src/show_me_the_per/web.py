@@ -459,10 +459,10 @@ def parse_ranking_request(form: RankingForm) -> dict[str, object]:
         "end_year": end_year,
         "fs_div": fs_div,
         "threshold_percent": threshold_percent,
-        "max_per": _parse_optional_decimal(form.max_per, field_name="PER 상한"),
-        "max_pbr": _parse_optional_decimal(form.max_pbr, field_name="PBR 상한"),
-        "min_roe": _parse_optional_decimal(form.min_roe, field_name="ROE 하한"),
-        "sort_by": _normalize_ranking_sort(sort_by=form.sort_by),
+        "max_per": None,
+        "max_pbr": None,
+        "min_roe": None,
+        "sort_by": "market_cap",
     }
 
 
@@ -1300,10 +1300,6 @@ def render_ranking_top_tabs(form: RankingForm) -> str:
                 end_year=form.end_year or str(default_end_year()),
                 fs_div=form.fs_div,
                 threshold_percent=form.threshold_percent,
-                max_per=form.max_per,
-                max_pbr=form.max_pbr,
-                min_roe=form.min_roe,
-                sort_by=form.sort_by,
             ),
             "ranking",
         ),
@@ -1451,7 +1447,7 @@ def render_ranking_header(form: RankingForm) -> str:
     <section class="toolbar-surface">
       <div class="section-tabs">
         <span class="section-tab is-active">랭킹/검색</span>
-        <span class="section-tab">성장률 + 밸류에이션</span>
+        <span class="section-tab">성장률 + 시장정보</span>
         <span class="section-tab">DB 캐시 기반</span>
       </div>
       <form id="ranking-form" class="query-form query-form-ranking" data-loading-form method="get" action="/ranking">
@@ -1479,27 +1475,6 @@ def render_ranking_header(form: RankingForm) -> str:
         <label class="field">
           <span>성장률 기준</span>
           <input name="threshold_percent" value="{escape(form.threshold_percent)}" inputmode="decimal">
-        </label>
-        <label class="field">
-          <span>PER 상한</span>
-          <input name="max_per" value="{escape(form.max_per)}" inputmode="decimal" placeholder="선택">
-        </label>
-        <label class="field">
-          <span>PBR 상한</span>
-          <input name="max_pbr" value="{escape(form.max_pbr)}" inputmode="decimal" placeholder="선택">
-        </label>
-        <label class="field">
-          <span>ROE 하한</span>
-          <input name="min_roe" value="{escape(form.min_roe)}" inputmode="decimal" placeholder="선택">
-        </label>
-        <label class="field">
-          <span>정렬</span>
-          <select name="sort_by">
-            {_option("market_cap", "시가총액", form.sort_by)}
-            {_option("roe", "ROE", form.sort_by)}
-            {_option("per", "PER", form.sort_by)}
-            {_option("pbr", "PBR", form.sort_by)}
-          </select>
         </label>
         <button id="ranking-submit-button" type="submit" class="primary-button">
           <span data-submit-label>조회</span>
@@ -1601,26 +1576,12 @@ def render_valuation_profile_pills(
     unavailable_status: str = "",
 ) -> str:
     if not profile:
-        if not unavailable_status:
-            return ""
-        return (
-            '<span class="inline-pill inline-pill-muted">'
-            f"{escape(unavailable_status)}"
-            "</span>"
-        )
+        return ""
 
-    pills: list[str] = []
-    for label, key, suffix in (
-        ("PER", "per", "배"),
-        ("PBR", "pbr", "배"),
-        ("ROE", "roe", "%"),
-        ("EPS", "eps", "원"),
-    ):
-        value = _format_ratio(profile.get(key), suffix=suffix)
-        if value == "-":
-            continue
-        pills.append(f'<span class="inline-pill">{escape(label)} {escape(value)}</span>')
-    return "".join(pills)
+    eps = _format_ratio(profile.get("eps"), suffix="원")
+    if eps == "-":
+        return ""
+    return f'<span class="inline-pill">EPS {escape(eps)}</span>'
 
 
 def render_compare_company_meta(
@@ -1945,10 +1906,10 @@ def render_ranking_empty_state() -> str:
     return """
     <section class="empty-state panel">
       <h2>랭킹/검색</h2>
-      <p>DB에 저장된 재무 데이터와 밸류에이션 스냅샷을 조합해 기업을 걸러냅니다.</p>
+      <p>DB에 저장된 재무 데이터와 시장 정보 스냅샷을 조합해 기업을 걸러냅니다.</p>
       <ul class="empty-list">
-        <li>먼저 몇 개 기업을 조회해 DB 캐시를 채우거나 CLI의 refresh-valuations로 valuation을 갱신해 주세요.</li>
-        <li>성장률은 기본 게이트이고, PER/PBR/ROE는 선택 필터와 정렬 기준으로 동작합니다.</li>
+        <li>먼저 몇 개 기업을 조회해 DB 캐시를 채우거나 CLI의 refresh-valuations로 시가/EPS 스냅샷을 갱신해 주세요.</li>
+        <li>기본 랭킹은 최근 연간 매출 성장률을 통과한 기업을 시가총액 순으로 보여줍니다.</li>
       </ul>
     </section>
     """
@@ -1967,7 +1928,7 @@ def render_ranking_results(payload: dict[str, object]) -> str:
         <section class="panel">
           <div class="panel-heading">
             <h3>조건에 맞는 기업이 없습니다</h3>
-            <p>DB에 데이터가 아직 적거나, 최근 연간 매출 성장률과 밸류에이션 조건이 너무 엄격할 수 있습니다.</p>
+            <p>DB에 데이터가 아직 적거나, 최근 연간 매출 성장률 기준을 만족하는 기업이 없을 수 있습니다.</p>
           </div>
           {info_html}
         </section>
@@ -1990,9 +1951,6 @@ def render_ranking_results(payload: dict[str, object]) -> str:
             f'<td>{escape(str(row.get("market", "") or "-"))}</td>'
             f'<td>{escape(_format_won(row.get("close_price")))}</td>'
             f'<td>{escape(_format_market_cap(row.get("market_cap")))}</td>'
-            f'<td>{escape(_format_ratio(row.get("per"), suffix="배"))}</td>'
-            f'<td>{escape(_format_ratio(row.get("pbr"), suffix="배"))}</td>'
-            f'<td>{escape(_format_ratio(row.get("roe"), suffix="%"))}</td>'
             f'<td>{escape(_format_ratio(row.get("eps"), suffix="원"))}</td>'
             f'<td>{escape(str(row.get("minimum_growth_rate", "-")))}%</td>'
             f'<td>{("통과" if row.get("passed") else "실패")}</td>'
@@ -2003,8 +1961,8 @@ def render_ranking_results(payload: dict[str, object]) -> str:
     <section class="panel">
       <div class="panel-heading panel-heading-split">
         <div>
-          <h3>성장률 + 밸류에이션 랭킹</h3>
-          <p>최근 연간 매출 성장률을 먼저 통과한 기업만 밸류에이션 조건으로 정렬합니다.</p>
+          <h3>성장률 랭킹</h3>
+          <p>최근 연간 매출 성장률을 먼저 통과한 기업을 시가총액 순으로 정렬합니다.</p>
         </div>
         {info_html}
       </div>
@@ -2016,9 +1974,6 @@ def render_ranking_results(payload: dict[str, object]) -> str:
               <th>시장</th>
               <th>전일 종가</th>
               <th>시가총액</th>
-              <th>PER</th>
-              <th>PBR</th>
-              <th>ROE</th>
               <th>EPS</th>
               <th>최소 성장률</th>
               <th>통과</th>
@@ -4131,10 +4086,6 @@ def _build_ranking_href(
     end_year: str,
     fs_div: str,
     threshold_percent: str,
-    max_per: str = "",
-    max_pbr: str = "",
-    min_roe: str = "",
-    sort_by: str = DEFAULT_RANKING_SORT_BY,
 ) -> str:
     params = {
         "market": market,
@@ -4142,10 +4093,6 @@ def _build_ranking_href(
         "end_year": end_year,
         "fs_div": fs_div,
         "threshold_percent": threshold_percent,
-        "max_per": max_per,
-        "max_pbr": max_pbr,
-        "min_roe": min_roe,
-        "sort_by": sort_by,
     }
     filtered = {
         key: value
@@ -4305,7 +4252,7 @@ def _page_styles() -> str:
       grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) repeat(3, minmax(120px, 0.7fr)) auto;
     }
     .query-form-ranking {
-      grid-template-columns: repeat(8, minmax(110px, 1fr)) auto;
+      grid-template-columns: repeat(4, minmax(130px, 1fr)) auto;
     }
     .field {
       display: grid;
