@@ -9,13 +9,16 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from show_me_the_per.krx import KrxStockPriceSnapshot
+from show_me_the_per.krx import KrxApiError, KrxStockPriceSnapshot
 from show_me_the_per.models import DartCompany, FinancialStatementRow, KrxListing
 from show_me_the_per.storage import (
+    create_refresh_job,
     read_company_master_entries,
     read_financial_period_values_from_database,
     read_refresh_job,
     read_refresh_job_items,
+    store_company_master_entries,
+    summarize_database,
 )
 from show_me_the_per.web import (
     _format_won,
@@ -938,7 +941,40 @@ class WebTests(TestCase):
         self.assertIn('value="quarterly_qoq:net_income"', response.text)
         self.assertIn("DB 업데이트", response.text)
         self.assertIn("회사 목록 동기화", response.text)
+        self.assertIn("전체 DB 초기화", response.text)
+        self.assertIn("상장사 대상 목록 생성", response.text)
         self.assertIn("전체 최소 성장률", response.text)
+        self.assertIn("window.confirm(", response.text)
+
+    def test_ranking_company_master_sync_returns_korean_message_on_403(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                ForbiddenKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.post(
+                    "/ranking/company-master/sync",
+                    params={"fs_div": "CFS"},
+                    json={},
+                )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("KRX 회사 목록 조회가 403으로 거부되었습니다.", response.json()["message"])
+        self.assertIn("KRX_SERVICE_KEY", response.json()["message"])
 
     def test_ranking_page_supports_repeated_growth_conditions(self) -> None:
         client = TestClient(
@@ -1181,6 +1217,68 @@ class WebTests(TestCase):
         self.assertEqual(retry_response.status_code, 200)
         self.assertEqual(retry_response.json()["job"]["status"], "running")
         self.assertEqual(len(pending_items), 2)
+
+    def test_ranking_reset_databases_clears_cache_and_reports_summary(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfs_database_path = Path(directory) / "show-me-the-per-cfs.sqlite3"
+            ofs_database_path = Path(directory) / "show-me-the-per-ofs.sqlite3"
+            for database_path in (cfs_database_path, ofs_database_path):
+                store_company_master_entries(
+                    database_path,
+                    [
+                        {
+                            "corp_code": "00126380",
+                            "corp_name": "Samsung Electronics",
+                            "stock_code": "005930",
+                            "market": "KOSPI",
+                            "item_name": "Samsung Electronics",
+                            "modify_date": "20260422",
+                        }
+                    ],
+                )
+                create_refresh_job(
+                    database_path,
+                    scope="ALL",
+                    fs_div="CFS",
+                    year_from=2024,
+                    year_to=2025,
+                    batch_size=25,
+                    companies=[
+                        {
+                            "corp_code": "00126380",
+                            "corp_name": "Samsung Electronics",
+                            "stock_code": "005930",
+                            "market": "KOSPI",
+                        }
+                    ],
+                )
+
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.post("/ranking/reset-databases", json={})
+
+            cfs_summary = summarize_database(cfs_database_path)
+            ofs_summary = summarize_database(ofs_database_path)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ok")
+        self.assertEqual(response.json()["summary"]["cleared"], 2)
+        self.assertEqual(response.json()["summary"]["skipped"], 1)
+        self.assertIn("전체 DB 캐시 초기화 완료", response.json()["message"])
+        self.assertTrue(all(count == 0 for count in cfs_summary.values()))
+        self.assertTrue(all(count == 0 for count in ofs_summary.values()))
 
 
 class FakeOpenDartClient:
@@ -1443,6 +1541,19 @@ class FakeKrxListingClient:
                 corporation_name="Vinatac",
             ),
         ]
+
+
+class ForbiddenKrxListingClient:
+    def __init__(self, service_key: str) -> None:
+        self.service_key = service_key
+
+    def fetch_listings(self) -> list[KrxListing]:
+        raise KrxApiError(
+            "KRX 회사 목록 조회가 403으로 거부되었습니다. "
+            "KRX_SERVICE_KEY 값이 올바른지, 공공데이터포털 활용신청/승인이 완료됐는지, "
+            "또는 해당 API 접근이 일시적으로 제한된 것은 아닌지 확인해 주세요.",
+            status_code=403,
+        )
 
 
 class FakeKrxStockPriceClient:

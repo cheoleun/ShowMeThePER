@@ -22,6 +22,18 @@ from .rankings import (
 
 SCHEMA_VERSION = 3
 COMPANY_MASTER_STALE_DAYS = 7
+RESETTABLE_CACHE_TABLES = (
+    "financial_statement_rows",
+    "financial_period_values",
+    "growth_points",
+    "growth_filter_results",
+    "collection_errors",
+    "equity_price_snapshots",
+    "valuation_snapshots",
+    "company_master_entries",
+    "refresh_jobs",
+    "refresh_job_items",
+)
 
 
 SCHEMA_STATEMENTS = (
@@ -1698,6 +1710,34 @@ def summarize_database(database_path: Path) -> dict[str, int]:
             "refresh_jobs": _table_count(connection, "refresh_jobs"),
             "refresh_job_items": _table_count(connection, "refresh_job_items"),
         }
+
+
+def reset_database_cache(database_path: Path) -> dict[str, object]:
+    if not database_path.exists():
+        return {
+            "path": str(database_path),
+            "status": "skipped",
+            "before": {},
+            "after": {},
+            "cleared_rows": 0,
+        }
+
+    initialize_database(database_path)
+    before = summarize_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        for table_name in RESETTABLE_CACHE_TABLES:
+            connection.execute(f"DELETE FROM {table_name}")
+
+    after = summarize_database(database_path)
+    cleared_rows = sum(before.get(table_name, 0) for table_name in RESETTABLE_CACHE_TABLES)
+    return {
+        "path": str(database_path),
+        "status": "cleared",
+        "before": before,
+        "after": after,
+        "cleared_rows": cleared_rows,
+    }
 
 
 def _read_company_index(database_path: Path) -> dict[str, dict[str, str]]:

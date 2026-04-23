@@ -1,4 +1,13 @@
-from show_me_the_per.krx import parse_krx_listings, parse_stock_price_payload
+from urllib.error import HTTPError, URLError
+from unittest.mock import patch
+
+from show_me_the_per.krx import (
+    KrxApiError,
+    KrxClient,
+    KrxStockPriceClient,
+    parse_krx_listings,
+    parse_stock_price_payload,
+)
 import unittest
 
 
@@ -93,6 +102,33 @@ class KrxParserTests(unittest.TestCase):
         self.assertEqual(str(snapshots[0].close_price), "37100")
         self.assertEqual(str(snapshots[0].market_cap), "561080217600")
         self.assertEqual(snapshots[0].market, "KOSDAQ")
+
+    def test_fetch_listings_translates_http_403_to_korean_message(self) -> None:
+        client = KrxClient("bad-key")
+
+        with patch(
+            "show_me_the_per.krx.urlopen",
+            side_effect=HTTPError("https://example.com", 403, "Forbidden", None, None),
+        ):
+            with self.assertRaises(KrxApiError) as context:
+                client.fetch_listings()
+
+        self.assertEqual(context.exception.status_code, 403)
+        self.assertIn("KRX 회사 목록 조회가 403으로 거부되었습니다.", str(context.exception))
+        self.assertIn("KRX_SERVICE_KEY", str(context.exception))
+
+    def test_fetch_stock_price_translates_network_error(self) -> None:
+        client = KrxStockPriceClient("test-key")
+
+        with patch(
+            "show_me_the_per.krx.urlopen",
+            side_effect=URLError("temporary outage"),
+        ):
+            with self.assertRaises(KrxApiError) as context:
+                client.fetch_stock_price("126340", base_date="20260421")
+
+        self.assertIsNone(context.exception.status_code)
+        self.assertIn("KRX 시세 조회 중 네트워크 오류가 발생했습니다.", str(context.exception))
 
 
 if __name__ == "__main__":

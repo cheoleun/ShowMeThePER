@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+import sqlite3
 
 from show_me_the_per.krx import KrxStockPriceSnapshot
 from show_me_the_per.models import FinancialStatementRow
@@ -27,6 +28,7 @@ from show_me_the_per.storage import (
     read_refresh_job_items,
     read_growth_filter_results_from_database,
     read_growth_points_from_database,
+    reset_database_cache,
     record_refresh_job_item_result,
     retry_failed_refresh_job_items,
     store_analysis_artifacts,
@@ -263,6 +265,107 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(latest.base_date, "20260421")
         self.assertEqual(latest.market, "KOSDAQ")
         self.assertEqual(latest.close_price, Decimal("37100"))
+
+    def test_reset_database_cache_clears_all_cache_tables_and_keeps_schema_version(self) -> None:
+        artifacts = build_analysis_artifacts(
+            [
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "130",
+                    previous_amount=Decimal("100"),
+                )
+            ],
+            expected_corp_codes=["00126380"],
+            expected_business_years=["2025"],
+            expected_report_codes=["11011"],
+            recent_annual_periods=1,
+            recent_quarterly_periods=1,
+        )
+        snapshot = KrxStockPriceSnapshot(
+            base_date="20260421",
+            stock_code="126340",
+            item_name="Vinatac",
+            market="KOSDAQ",
+            close_price=Decimal("37100"),
+            market_cap=Decimal("561080217600"),
+            listed_stock_count=Decimal("15123456"),
+        )
+        valuation = ValuationSnapshot(
+            stock_code="126340",
+            corp_code="00888888",
+            corp_name="Vinatac",
+            market="KOSDAQ",
+            close_price=Decimal("37100"),
+            market_cap=Decimal("561080217600"),
+            per=Decimal("9.1"),
+            pbr=Decimal("1.2"),
+            roe=Decimal("21.4"),
+            eps=Decimal("4100"),
+            base_date="20260422",
+            source="naver_finance",
+            fetched_at="2026-04-22T07:30:00Z",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            store_analysis_artifacts(database_path, artifacts)
+            store_company_master_entries(
+                database_path,
+                [
+                    {
+                        "corp_code": "00126380",
+                        "corp_name": "Samsung Electronics",
+                        "stock_code": "005930",
+                        "market": "KOSPI",
+                        "item_name": "Samsung Electronics",
+                        "modify_date": "20260422",
+                    }
+                ],
+            )
+            create_refresh_job(
+                database_path,
+                scope="ALL",
+                fs_div="CFS",
+                year_from=2024,
+                year_to=2025,
+                batch_size=25,
+                companies=[
+                    {
+                        "corp_code": "00126380",
+                        "corp_name": "Samsung Electronics",
+                        "stock_code": "005930",
+                        "market": "KOSPI",
+                    }
+                ],
+            )
+            store_equity_price_snapshot(database_path, snapshot)
+            store_valuation_snapshot(database_path, valuation)
+
+            result = reset_database_cache(database_path)
+            summary = summarize_database(database_path)
+
+            connection = sqlite3.connect(database_path)
+            try:
+                schema_version = connection.execute(
+                    "SELECT version FROM schema_version"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+
+        self.assertEqual(result["status"], "cleared")
+        self.assertGreater(int(result["cleared_rows"]), 0)
+        self.assertEqual(schema_version, 3)
+        self.assertTrue(all(count == 0 for count in summary.values()))
+
+    def test_reset_database_cache_skips_missing_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "missing.sqlite3"
+            result = reset_database_cache(database_path)
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["cleared_rows"], 0)
 
     def test_store_analysis_directory_loads_written_json_outputs(self) -> None:
         artifacts = build_analysis_artifacts(

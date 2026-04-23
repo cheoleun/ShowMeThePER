@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 import json
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -18,6 +19,12 @@ DEFAULT_KRX_STOCK_PRICE_ENDPOINT = (
     "https://apis.data.go.kr/1160100/service/"
     "GetStockSecuritiesInfoService/getStockPriceInfo"
 )
+
+
+class KrxApiError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -85,8 +92,19 @@ class KrxClient:
             params["basDt"] = base_date
 
         url = f"{self.endpoint}?{urlencode(params)}"
-        with urlopen(url, timeout=self.timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(url, timeout=self.timeout_seconds) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            raise _translate_krx_http_error(
+                error,
+                action="회사 목록 조회",
+            ) from error
+        except URLError as error:
+            raise KrxApiError(
+                "KRX 회사 목록 조회 중 네트워크 오류가 발생했습니다. "
+                "잠시 후 다시 시도해 주세요.",
+            ) from error
 
 
 class KrxStockPriceClient:
@@ -119,8 +137,19 @@ class KrxStockPriceClient:
             "likeSrtnCd": normalized_stock_code,
         }
         url = f"{self.endpoint}?{urlencode(params)}"
-        with urlopen(url, timeout=self.timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(url, timeout=self.timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            raise _translate_krx_http_error(
+                error,
+                action="시세 조회",
+            ) from error
+        except URLError as error:
+            raise KrxApiError(
+                "KRX 시세 조회 중 네트워크 오류가 발생했습니다. "
+                "잠시 후 다시 시도해 주세요.",
+            ) from error
 
         for snapshot in parse_stock_price_payload(payload):
             if snapshot.stock_code == normalized_stock_code:
@@ -187,6 +216,25 @@ def parse_stock_price_payload(payload: dict[str, Any]) -> list[KrxStockPriceSnap
         )
 
     return snapshots
+
+
+def _translate_krx_http_error(
+    error: HTTPError,
+    *,
+    action: str,
+) -> KrxApiError:
+    if error.code == 403:
+        return KrxApiError(
+            f"KRX {action}가 403으로 거부되었습니다. "
+            "KRX_SERVICE_KEY 값이 올바른지, 공공데이터포털 활용신청/승인이 완료됐는지, "
+            "또는 해당 API 접근이 일시적으로 제한된 것은 아닌지 확인해 주세요.",
+            status_code=403,
+        )
+    return KrxApiError(
+        f"KRX {action} 중 오류가 발생했습니다. "
+        f"응답 코드 {error.code}을(를) 받았습니다.",
+        status_code=error.code,
+    )
 
 
 def _extract_items(payload: dict[str, Any]) -> list[dict[str, Any]]:

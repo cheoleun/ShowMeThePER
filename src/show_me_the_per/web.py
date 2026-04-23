@@ -13,7 +13,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .growth import ANNUAL_YOY, QUARTERLY_QOQ, QUARTERLY_YOY, TRAILING_FOUR_QUARTER_YOY
-from .krx import KrxClient, KrxStockPriceClient, KrxStockPriceSnapshot
+from .krx import KrxApiError, KrxClient, KrxStockPriceClient, KrxStockPriceSnapshot
 from .matching import match_listings_to_dart
 from .naver_finance import NaverFinanceClient
 from .models import (
@@ -59,6 +59,7 @@ from .storage import (
     read_financial_statement_rows_from_database,
     read_refresh_job,
     read_refresh_job_items,
+    reset_database_cache,
     replace_company_analysis_artifacts,
     record_refresh_job_item_result,
     retry_failed_refresh_job_items,
@@ -423,12 +424,51 @@ def create_app(
                 opendart_client=client_factory(api_key),
                 listing_client=listing_client_factory(service_key),
             )
-        except Exception as error:
+        except KrxApiError as error:
             return JSONResponse(
-                status_code=500,
+                status_code=403 if error.status_code == 403 else 502,
                 content={"status": "error", "message": str(error)},
             )
+        except Exception:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "message": "회사 목록 동기화 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+                },
+            )
         return JSONResponse({"status": "ok", **summary})
+
+    @app.post("/ranking/reset-databases")
+    async def ranking_reset_databases(
+        request: Request,
+    ) -> JSONResponse:
+        _ = await _read_request_json(request)
+        databases = _reset_web_cache_databases()
+        summary = {
+            "cleared": sum(1 for item in databases if item.get("status") == "cleared"),
+            "skipped": sum(1 for item in databases if item.get("status") == "skipped"),
+            "errors": sum(1 for item in databases if item.get("status") == "error"),
+            "cleared_rows": sum(int(item.get("cleared_rows", 0) or 0) for item in databases),
+        }
+        if summary["errors"]:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "message": "일부 DB 초기화에 실패했습니다. databases 항목을 확인해 주세요.",
+                    "databases": databases,
+                    "summary": summary,
+                },
+            )
+        return JSONResponse(
+            {
+                "status": "ok",
+                "message": "전체 DB 캐시 초기화 완료. 회사목록, 재무, 시세, 작업 상태가 모두 삭제되었습니다.",
+                "databases": databases,
+                "summary": summary,
+            }
+        )
 
     @app.post("/ranking/update-jobs")
     async def create_ranking_update_job(
@@ -1086,6 +1126,26 @@ def _default_web_cache_dir() -> Path:
         root = Path(local_appdata) if local_appdata else _safe_home_dir() / "AppData" / "Local"
         return root / "ShowMeThePER" / "web-cache"
     return _safe_home_dir() / ".cache" / "show_me_the_per" / "web-cache"
+
+
+def _reset_web_cache_databases() -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    for fs_div in ("CFS", "OFS", "ALL"):
+        database_path = _web_cache_database_path(fs_div)
+        try:
+            result = reset_database_cache(database_path)
+        except Exception as error:
+            result = {
+                "path": str(database_path),
+                "status": "error",
+                "before": {},
+                "after": {},
+                "cleared_rows": 0,
+                "error": str(error),
+            }
+        result["fs_div"] = fs_div
+        results.append(result)
+    return results
 
 
 def _safe_home_dir() -> Path:
@@ -4712,6 +4772,11 @@ def _page_styles() -> str:
       background: var(--accent-soft);
       color: var(--accent-strong);
     }
+    .segmented-button-danger {
+      border-color: #f4b7b7;
+      background: #fff5f5;
+      color: #b3261e;
+    }
     .notice {
       padding: 12px 14px;
       margin-bottom: 14px;
@@ -5546,6 +5611,11 @@ def render_ranking_update_panel(
           <span class="inline-pill">작업 상태 {escape(job_status or '-')}</span>
         </div>
       </div>
+      <div class="toolbar-note" style="margin-top: 6px;">
+        <strong>회사 목록 동기화</strong>: 상장사 대상 목록 생성 |
+        <strong>새 작업 시작</strong>: 목록 기준으로 배치 job 생성 |
+        <strong>전체 DB 초기화</strong>: 전체 캐시 삭제
+      </div>
       <div class="query-form" style="grid-template-columns: repeat(5, minmax(120px, 1fr)); margin-top: 6px;">
         <label class="field">
           <span>대상 범위</span>
@@ -5588,6 +5658,7 @@ def render_ranking_update_panel(
           <button type="button" class="segmented-button" id="pause-refresh-job-button">일시정지</button>
           <button type="button" class="segmented-button" id="resume-refresh-job-button">이어받기</button>
           <button type="button" class="segmented-button" id="retry-refresh-job-button">실패만 재시도</button>
+          <button type="button" class="segmented-button segmented-button-danger" id="reset-databases-button">전체 DB 초기화</button>
         </div>
         <div class="toolbar-note" id="refresh-job-message">회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.</div>
       </div>
@@ -5741,6 +5812,7 @@ def render_ranking_job_script(form: RankingForm) -> str:
       const pauseButton = document.getElementById("pause-refresh-job-button");
       const resumeButton = document.getElementById("resume-refresh-job-button");
       const retryButton = document.getElementById("retry-refresh-job-button");
+      const resetButton = document.getElementById("reset-databases-button");
       const scopeInput = document.getElementById("refresh-scope");
       const fsDivInput = document.getElementById("refresh-fs-div");
       const yearFromInput = document.getElementById("refresh-year-from");
@@ -5923,6 +5995,31 @@ def render_ranking_job_script(form: RankingForm) -> str:
             renderSummary(payload.job);
             setMessage("실패 항목만 다시 대기열에 넣었습니다.");
             schedulePump();
+          }} catch (error) {{
+            setMessage(String(error.message || error));
+          }}
+        }});
+      }}
+
+      if (resetButton) {{
+        resetButton.addEventListener("click", async () => {{
+          const firstConfirm = window.confirm("전체 DB의 모든 캐시를 삭제합니다. 계속할까요?");
+          if (!firstConfirm) {{
+            return;
+          }}
+          const secondConfirm = window.confirm("회사목록, 재무, 시세, 작업 상태가 모두 삭제됩니다. 정말 초기화할까요?");
+          if (!secondConfirm) {{
+            return;
+          }}
+          stopPump();
+          setMessage("전체 DB 캐시를 초기화하고 있습니다...");
+          try {{
+            const payload = await callJson("/ranking/reset-databases", "POST", {{}});
+            activeJobId = "";
+            panel.setAttribute("data-job-id", "");
+            renderSummary(null);
+            setMessage(payload.message || "전체 DB 캐시 초기화 완료");
+            window.location.reload();
           }} catch (error) {{
             setMessage(String(error.message || error));
           }}
@@ -6169,6 +6266,11 @@ def render_ranking_update_panel(
           <span class="inline-pill">작업 상태 {escape(job_status or '-')}</span>
         </div>
       </div>
+      <div class="toolbar-note" style="margin-top: 6px;">
+        <strong>회사 목록 동기화</strong>: 상장사 대상 목록 생성 |
+        <strong>새 작업 시작</strong>: 목록 기준으로 배치 job 생성 |
+        <strong>전체 DB 초기화</strong>: 전체 캐시 삭제
+      </div>
       <div class="query-form" style="grid-template-columns: repeat(5, minmax(120px, 1fr)); margin-top: 6px;">
         <label class="field">
           <span>대상 범위</span>
@@ -6211,6 +6313,7 @@ def render_ranking_update_panel(
           <button type="button" class="segmented-button" id="pause-refresh-job-button">일시정지</button>
           <button type="button" class="segmented-button" id="resume-refresh-job-button">이어받기</button>
           <button type="button" class="segmented-button" id="retry-refresh-job-button">실패만 재시도</button>
+          <button type="button" class="segmented-button segmented-button-danger" id="reset-databases-button">전체 DB 초기화</button>
         </div>
         <div class="toolbar-note" id="refresh-job-message">회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.</div>
       </div>
