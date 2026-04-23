@@ -104,6 +104,7 @@ class KrxClient:
                 headers=DEFAULT_KRX_REQUEST_HEADERS,
                 timeout=self.timeout_seconds,
                 follow_redirects=True,
+                trust_env=False,
             )
             response.raise_for_status()
             return response.json()
@@ -155,6 +156,7 @@ class KrxStockPriceClient:
                 headers=DEFAULT_KRX_REQUEST_HEADERS,
                 timeout=self.timeout_seconds,
                 follow_redirects=True,
+                trust_env=False,
             )
             response.raise_for_status()
             payload = response.json()

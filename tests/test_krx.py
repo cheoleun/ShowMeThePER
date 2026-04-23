@@ -155,6 +155,7 @@ class KrxParserTests(unittest.TestCase):
 
         def fake_get(url: str, **kwargs: object) -> object:
             captured["headers"] = kwargs.get("headers")
+            captured["trust_env"] = kwargs.get("trust_env")
             request = httpx.Request("GET", url, params=kwargs.get("params"))
             return httpx.Response(403, request=request)
 
@@ -167,6 +168,7 @@ class KrxParserTests(unittest.TestCase):
         headers = captured["headers"]
         self.assertEqual(headers["User-Agent"], "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
         self.assertEqual(headers["Accept"], "application/json,text/plain,*/*")
+        self.assertEqual(captured["trust_env"], False)
 
 
 if __name__ == "__main__":
