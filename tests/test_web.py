@@ -181,8 +181,8 @@ class WebTests(TestCase):
         self.assertIn(">기업필터</a>", response.text)
         self.assertIn(">DB 업데이트</a>", response.text)
         self.assertIn('threshold_percent=20', response.text)
-        self.assertIn("데이터/API 설정", response.text)
-        self.assertIn("OpenDART 키 관리", response.text)
+        self.assertNotIn("데이터/API 설정", response.text)
+        self.assertNotIn("OpenDART 키 관리", response.text)
         self.assertNotIn(">요약</a>", response.text)
         self.assertNotIn("tab=overview#overview-summary", response.text)
         self.assertNotIn("tab=growth#growth-details", response.text)
@@ -508,8 +508,8 @@ class WebTests(TestCase):
         self.assertIn("/db-update?", response.text)
         self.assertIn(">기업필터</a>", response.text)
         self.assertIn(">DB 업데이트</a>", response.text)
-        self.assertIn("데이터/API 설정", response.text)
-        self.assertIn("OpenDART 키 관리", response.text)
+        self.assertNotIn("데이터/API 설정", response.text)
+        self.assertNotIn("OpenDART 키 관리", response.text)
         self.assertNotIn(">요약</a>", response.text)
         self.assertNotIn(">성장률</a>", response.text)
 
@@ -1020,10 +1020,11 @@ class WebTests(TestCase):
         self.assertIn(">100개</option>", response.text)
         self.assertIn("기업필터", response.text)
         self.assertIn(">DB 업데이트</a>", response.text)
-        self.assertIn("데이터/API 설정", response.text)
-        self.assertIn("OpenDART 키 관리", response.text)
-        self.assertIn("save-opendart-key-button", response.text)
+        self.assertNotIn("데이터/API 설정", response.text)
+        self.assertNotIn("OpenDART 키 관리", response.text)
+        self.assertNotIn('id="shared-settings-panel"', response.text)
         self.assertIn("DB 업데이트는 별도 페이지에서 관리합니다.", response.text)
+        self.assertIn('class="ranking-action-row"', response.text)
         self.assertIn("전체 최소 성장률", response.text)
         self.assertNotIn("KRX 연결 점검 실행", response.text)
         self.assertNotIn("회사 목록 동기화", response.text)
@@ -1059,6 +1060,8 @@ class WebTests(TestCase):
         self.assertIn("데이터/API 설정", response.text)
         self.assertIn("OpenDART 키 관리", response.text)
         self.assertIn("krx-diagnostic-result", response.text)
+        self.assertIn('id="refresh-status-panel"', response.text)
+        self.assertIn("DB 업데이트 대기 중", response.text)
         self.assertIn("window.confirm(", response.text)
 
     def test_ranking_company_master_sync_returns_korean_message_on_403(self) -> None:
@@ -1202,6 +1205,8 @@ class WebTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("최근 1년", response.text)
+        self.assertIn("조건에 맞는 기업", response.text)
+        self.assertNotIn("성장률 랭킹", response.text)
         self.assertIn("growth_condition=annual_yoy%3Arevenue%3A1", str(response.url))
 
     def test_ranking_update_job_requires_company_master_sync(self) -> None:

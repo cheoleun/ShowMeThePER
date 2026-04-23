@@ -1806,7 +1806,7 @@ def render_analysis_page(
     return render_shell(
         company_title=company_title,
         top_tabs_html=top_tabs_html,
-        settings_html=render_shared_settings_panel(payload),
+        settings_html="",
         toolbar_html=header_html,
         content_html=body_html,
         message_html=render_message(error=error),
@@ -1830,7 +1830,7 @@ def render_compare_page(
     return render_shell(
         company_title=company_title,
         top_tabs_html=render_compare_top_tabs(form, payload),
-        settings_html=render_shared_settings_panel(payload),
+        settings_html="",
         toolbar_html=render_compare_header(form, payload),
         content_html=(
             render_compare_dashboard(_dict(payload))
@@ -5060,7 +5060,27 @@ def _page_styles() -> str:
       grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) repeat(3, minmax(120px, 0.7fr)) auto;
     }
     .query-form-ranking {
-      grid-template-columns: repeat(4, minmax(130px, 1fr)) auto;
+      grid-template-columns: repeat(3, minmax(180px, 1fr));
+      gap: 10px 12px;
+    }
+    .query-form-ranking .field {
+      gap: 4px;
+    }
+    .query-form-ranking input,
+    .query-form-ranking select {
+      min-height: 36px;
+      padding: 6px 10px;
+    }
+    .query-form-ranking .primary-button {
+      min-height: 36px;
+      padding: 8px 18px;
+      min-width: 180px;
+    }
+    .ranking-action-row {
+      grid-column: 1 / -1;
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 8px;
     }
     .field {
       display: grid;
@@ -5234,6 +5254,73 @@ def _page_styles() -> str:
       word-break: break-word;
       white-space: pre-wrap;
     }
+    .refresh-status-card {
+      margin-top: 12px;
+      padding: 14px 16px;
+      border: 1px solid #d6dbe7;
+      border-radius: 8px;
+      background: #f8fafc;
+      display: grid;
+      gap: 8px;
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+    .refresh-status-card[data-state="running"] {
+      border-color: #b7d9d0;
+      background: #f2fbf8;
+    }
+    .refresh-status-card[data-state="success"] {
+      border-color: #b6f1df;
+      background: #ebfbf7;
+    }
+    .refresh-status-card[data-state="warning"] {
+      border-color: #ffe2a8;
+      background: #fff8e8;
+    }
+    .refresh-status-card[data-state="error"],
+    .refresh-status-card[data-state="blocked"] {
+      border-color: #ffccd7;
+      background: #fff0f4;
+    }
+    .refresh-status-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .refresh-status-title {
+      font-size: 15px;
+      font-weight: 800;
+      color: #2f4259;
+    }
+    .refresh-status-card[data-state="running"] .refresh-status-title {
+      color: #16423b;
+    }
+    .refresh-status-card[data-state="success"] .refresh-status-title {
+      color: #0f766e;
+    }
+    .refresh-status-card[data-state="warning"] .refresh-status-title {
+      color: #9a6700;
+    }
+    .refresh-status-card[data-state="error"] .refresh-status-title,
+    .refresh-status-card[data-state="blocked"] .refresh-status-title {
+      color: #be123c;
+    }
+    .refresh-status-spinner {
+      display: none;
+      width: 16px;
+      height: 16px;
+      border-width: 2px;
+    }
+    .refresh-status-card[data-state="running"] .refresh-status-spinner {
+      display: inline-block;
+    }
+    .refresh-status-copy {
+      font-size: 14px;
+      color: #334155;
+      line-height: 1.5;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
     .notice {
       padding: 12px 14px;
       margin-bottom: 14px;
@@ -5358,7 +5445,7 @@ def _page_styles() -> str:
       display: none !important;
     }
     .matrix-heading {
-      margin-bottom: 8px;
+      margin-bottom: 6px;
       color: #415264;
       font-size: 13px;
       font-weight: 700;
@@ -5371,7 +5458,7 @@ def _page_styles() -> str:
     }
     .matrix-table th,
     .matrix-table td {
-      padding: 8px 8px;
+      padding: 6px 8px;
       border-bottom: 1px solid #ebeff4;
       text-align: left;
       vertical-align: top;
@@ -5389,31 +5476,32 @@ def _page_styles() -> str:
     }
     .matrix-table thead th:not(:first-child),
     .matrix-table td:not(:first-child) {
-      padding-left: 18px;
+      padding-left: 12px;
     }
     .matrix-cell {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 6px;
       flex-wrap: nowrap;
-      min-height: 32px;
+      min-height: 28px;
     }
     .matrix-check-label,
     .matrix-period-label {
       display: inline-flex;
       align-items: center;
-      gap: 5px;
+      gap: 4px;
       margin: 0;
       white-space: nowrap;
+      line-height: 1.1;
     }
     .matrix-check-label {
       font-weight: 600;
     }
     .matrix-period-input {
-      width: 72px;
-      min-height: 32px;
-      height: 32px;
-      padding: 4px 8px;
+      width: 60px;
+      min-height: 30px;
+      height: 30px;
+      padding: 3px 6px;
       font-size: 13px;
       line-height: 1.2;
     }
@@ -6140,7 +6228,7 @@ def render_ranking_page(
     return render_shell(
         company_title="기업필터",
         top_tabs_html=render_ranking_top_tabs(form),
-        settings_html=render_shared_settings_panel(payload),
+        settings_html="",
         toolbar_html=render_ranking_header(form, payload=_dict(payload)),
         content_html=(
             (
@@ -6247,12 +6335,14 @@ def render_ranking_header(
             {"".join(_option(str(value), f"{value}개", form.display_limit) for value in RANKING_DISPLAY_LIMIT_OPTIONS)}
           </select>
         </label>
-        <button id="ranking-submit-button" type="submit" class="primary-button">
-          <span data-submit-label>조회</span>
-          <span data-submit-loading hidden>조회 중...</span>
-        </button>
         <div style="grid-column: 1 / -1;">
           {render_ranking_growth_condition_matrix(form)}
+        </div>
+        <div class="ranking-action-row">
+          <button id="ranking-submit-button" type="submit" class="primary-button">
+            <span data-submit-label>조회</span>
+            <span data-submit-loading hidden>조회 중...</span>
+          </button>
         </div>
       </form>
       <div class="toolbar-row toolbar-row-dense">
@@ -6395,7 +6485,7 @@ def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
             "</tr>"
         )
     return (
-        '<div class="panel" style="margin-top:12px;padding:14px 16px;">'
+        '<div class="panel" style="margin-top:10px;padding:10px 12px;">'
         '<div class="matrix-heading">성장률 조건 선택</div>'
         '<table class="matrix-table">'
         f"<thead><tr><th>구분</th>{header_cells}</tr></thead>"
@@ -6535,6 +6625,18 @@ def render_ranking_update_panel(
       </div>
       <div class="toolbar-note" style="margin-top: 4px;">{sync_note}</div>
       <div class="toolbar-note" style="margin-top: 4px;">OpenDART 키 변경은 데이터/API 설정에서 관리합니다.</div>
+      <div
+        id="refresh-status-panel"
+        class="refresh-status-card"
+        data-state="idle"
+        aria-live="polite"
+      >
+        <div class="refresh-status-header">
+          <div class="spinner refresh-status-spinner" aria-hidden="true"></div>
+          <strong id="refresh-status-title" class="refresh-status-title">DB 업데이트 대기 중</strong>
+        </div>
+        <div id="refresh-job-message" class="refresh-status-copy">회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.</div>
+      </div>
       <div class="diagnostic-card">
         <div class="diagnostic-heading">
           <div>
@@ -6589,7 +6691,6 @@ def render_ranking_update_panel(
           <button type="button" class="segmented-button" id="retry-refresh-job-button">실패만 재시도</button>
           <button type="button" class="segmented-button segmented-button-danger" id="reset-databases-button">전체 DB 초기화</button>
         </div>
-        <div class="toolbar-note" id="refresh-job-message">회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.</div>
       </div>
       <div class="toolbar-row toolbar-row-dense" id="refresh-job-summary">
         {render_refresh_job_status_summary(update_job)}
@@ -6708,7 +6809,7 @@ def render_ranking_results(payload: dict[str, object]) -> str:
     <section class="panel">
       <div class="panel-heading panel-heading-split">
         <div>
-          <h3>성장률 랭킹</h3>
+          <h3>조건에 맞는 기업</h3>
           <p>선택 조건: {escape(condition_labels or "연간 YoY 매출")}. 선택 조건을 모두 충족한 기업만 표시합니다.</p>
         </div>
         {info_html}
@@ -6765,6 +6866,8 @@ def render_ranking_job_script(form: RankingForm) -> str:
       if (!panel) {{
         return;
       }}
+      const statusPanel = document.getElementById("refresh-status-panel");
+      const statusTitleNode = document.getElementById("refresh-status-title");
       const summaryNode = document.getElementById("refresh-job-summary");
       const reasonSummaryNode = document.getElementById("refresh-reason-summary");
       const messageNode = document.getElementById("refresh-job-message");
@@ -6865,7 +6968,17 @@ def render_ranking_job_script(form: RankingForm) -> str:
         renderReasonSummary(job.reason_summary || null);
       }};
 
-      const setMessage = (value) => {{
+      const setStatus = (state, title) => {{
+        if (statusPanel) {{
+          statusPanel.setAttribute("data-state", state || "idle");
+        }}
+        if (statusTitleNode) {{
+          statusTitleNode.textContent = title || "DB 업데이트 대기 중";
+        }}
+      }};
+
+      const setMessage = (value, state = "idle", title = "DB 업데이트 안내") => {{
+        setStatus(state, title);
         if (messageNode) {{
           messageNode.textContent = value;
         }}
@@ -6896,7 +7009,11 @@ def render_ranking_job_script(form: RankingForm) -> str:
           if (elapsedSeconds >= 8) {{
             phase = "3/3 종목을 매칭하고 DB에 저장하는 중";
           }}
-          setMessage(`회사 목록 동기화 진행 중... ${{phase}} (${{elapsedSeconds}}초 경과)`);
+          setMessage(
+            `회사 목록 동기화 진행 중... ${{phase}} (${{elapsedSeconds}}초 경과)`,
+            "running",
+            "회사 목록 동기화 진행 중"
+          );
         }};
         updateSyncMessage();
         syncProgressTimer = window.setInterval(updateSyncMessage, 1000);
@@ -6925,7 +7042,11 @@ def render_ranking_job_script(form: RankingForm) -> str:
         const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}?fs_div=${{encodeURIComponent(currentFsDiv())}}`);
         renderSummary(payload.job);
         if (payload.job && payload.job.status === "blocked") {{
-          setMessage(payload.job.last_error || "OpenDART 차단 상태입니다. 키를 바꾸거나 내일 다시 이어받아 주세요.");
+          setMessage(
+            payload.job.last_error || "OpenDART 차단 상태입니다. 키를 바꾸거나 내일 다시 이어받아 주세요.",
+            "blocked",
+            "작업 차단됨"
+          );
         }}
         return payload.job;
       }};
@@ -6953,28 +7074,48 @@ def render_ranking_job_script(form: RankingForm) -> str:
           renderSummary(job);
           if (!job || job.status !== "running") {{
             if (job && job.status === "blocked") {{
-              setMessage(job.last_error || "OpenDART 차단 상태입니다. 키를 바꾸거나 이어받기를 준비해 주세요.");
+              setMessage(
+                job.last_error || "OpenDART 차단 상태입니다. 키를 바꾸거나 이어받기를 준비해 주세요.",
+                "blocked",
+                "작업 차단됨"
+              );
+            }} else if (job && job.status === "paused") {{
+              setMessage(
+                "작업이 일시정지 상태입니다. 이어받기를 누르면 다시 진행합니다.",
+                "warning",
+                "작업 일시정지"
+              );
             }}
             pumpBusy = false;
             return;
           }}
           setMessage(
-            `배치 업데이트 진행 중... 다음 회사 ${{job.next_pending_corp_name || "-"}} / 예상 남은 배치 ${{job.estimated_remaining_batches || 0}}개`
+            `배치 업데이트 진행 중... 다음 회사 ${{job.next_pending_corp_name || "-"}} / 예상 남은 배치 ${{job.estimated_remaining_batches || 0}}개`,
+            "running",
+            "배치 업데이트 진행 중"
           );
           const nextPayload = await callJson(`/ranking/update-jobs/${{activeJobId}}/run-next-batch?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
           renderSummary(nextPayload.job);
           if (nextPayload.job && nextPayload.job.status === "blocked") {{
-            setMessage(nextPayload.job.last_error || "OpenDART 차단으로 작업이 멈췄습니다.");
+            setMessage(
+              nextPayload.job.last_error || "OpenDART 차단으로 작업이 멈췄습니다.",
+              "blocked",
+              "작업 차단됨"
+            );
             return;
           }}
           setMessage(
-            `배치 업데이트 진행 중: 완료 ${{nextPayload.job.completed_companies || 0}}개, 실패 ${{nextPayload.job.failed_companies || 0}}개, 건너뜀 ${{nextPayload.job.skipped_companies || 0}}개, 최근 회사 ${{nextPayload.job.last_processed_corp_name || "-"}}, 예상 남은 배치 ${{nextPayload.job.estimated_remaining_batches || 0}}개`
+            `배치 업데이트 진행 중: 완료 ${{nextPayload.job.completed_companies || 0}}개, 실패 ${{nextPayload.job.failed_companies || 0}}개, 건너뜀 ${{nextPayload.job.skipped_companies || 0}}개, 최근 회사 ${{nextPayload.job.last_processed_corp_name || "-"}}, 예상 남은 배치 ${{nextPayload.job.estimated_remaining_batches || 0}}개`,
+            "running",
+            "배치 업데이트 진행 중"
           );
           if (nextPayload.job && nextPayload.job.status === "running") {{
             schedulePump();
+          }} else if (nextPayload.job && nextPayload.job.status === "completed") {{
+            setMessage("배치 업데이트가 완료되었습니다.", "success", "업데이트 완료");
           }}
         }} catch (error) {{
-          setMessage(String(error.message || error));
+          setMessage(String(error.message || error), "error", "업데이트 오류");
         }} finally {{
           pumpBusy = false;
         }}
@@ -6988,31 +7129,37 @@ def render_ranking_job_script(form: RankingForm) -> str:
             const summary = payload.company_master_status || {{}};
             stopSyncProgress();
             if (payload.skipped_today) {{
-              setMessage(payload.message || `오늘 이미 동기화됨 · 마지막 동기화 ${{summary.last_synced_at || "-"}}`);
+              setMessage(
+                payload.message || `오늘 이미 동기화됨 · 마지막 동기화 ${{summary.last_synced_at || "-"}}`,
+                "success",
+                "회사 목록 동기화 생략"
+              );
             }} else {{
               setMessage(
-                `회사 목록 동기화 완료: ${{summary.count || 0}}개 저장, KRX ${{payload.krx_listing_count || 0}}개 / OpenDART ${{payload.dart_company_count || 0}}개 / 기준일 ${{payload.krx_base_date || "-"}}`
+                `회사 목록 동기화 완료: ${{summary.count || 0}}개 저장, KRX ${{payload.krx_listing_count || 0}}개 / OpenDART ${{payload.dart_company_count || 0}}개 / 기준일 ${{payload.krx_base_date || "-"}}`,
+                "success",
+                "회사 목록 동기화 완료"
               );
             }}
             activeJobId = "";
             renderSummary(null);
           }} catch (error) {{
             stopSyncProgress();
-            setMessage(String(error.message || error));
+            setMessage(String(error.message || error), "error", "동기화 오류");
           }}
         }});
       }}
 
       if (diagnoseButton) {{
         diagnoseButton.addEventListener("click", async () => {{
-          setMessage("KRX 연결을 점검하고 있습니다...");
+          setMessage("KRX 연결을 점검하고 있습니다...", "running", "KRX 연결 점검 중");
           setDiagnosticResult("KRX 연결을 점검하고 있습니다...");
           try {{
             const payload = await callJson("/ranking/krx-diagnostics", "POST", {{}});
-            setMessage(payload.message || "KRX 연결 점검 완료");
+            setMessage(payload.message || "KRX 연결 점검 완료", "success", "KRX 연결 점검 완료");
             setDiagnosticResult(payload.message || "KRX 연결 점검 완료");
           }} catch (error) {{
-            setMessage(String(error.message || error));
+            setMessage(String(error.message || error), "error", "KRX 연결 점검 오류");
             setDiagnosticResult(String(error.message || error));
           }}
         }});
@@ -7020,7 +7167,7 @@ def render_ranking_job_script(form: RankingForm) -> str:
 
       if (createButton) {{
         createButton.addEventListener("click", async () => {{
-          setMessage("새 DB 업데이트 작업을 만들고 있습니다...");
+          setMessage("새 DB 업데이트 작업을 만들고 있습니다...", "running", "새 작업 생성 중");
           try {{
             const payload = await callJson(`/ranking/update-jobs?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST", {{
               scope: scopeInput ? scopeInput.value : "ALL",
@@ -7033,13 +7180,13 @@ def render_ranking_job_script(form: RankingForm) -> str:
             panel.setAttribute("data-job-id", activeJobId);
             renderSummary(payload.job);
             if (payload.job && payload.job.status === "blocked") {{
-              setMessage(payload.job.last_error || "OpenDART 차단 상태입니다.");
+              setMessage(payload.job.last_error || "OpenDART 차단 상태입니다.", "blocked", "작업 차단됨");
             }} else {{
-              setMessage("새 작업을 시작했습니다.");
+              setMessage("새 작업을 시작했습니다.", "running", "배치 업데이트 진행 중");
               schedulePump();
             }}
           }} catch (error) {{
-            setMessage(String(error.message || error));
+            setMessage(String(error.message || error), "error", "작업 생성 오류");
           }}
         }});
       }}
@@ -7053,9 +7200,9 @@ def render_ranking_job_script(form: RankingForm) -> str:
           try {{
             const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}/pause?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
             renderSummary(payload.job);
-            setMessage("작업을 일시정지했습니다.");
+            setMessage("작업을 일시정지했습니다.", "warning", "작업 일시정지");
           }} catch (error) {{
-            setMessage(String(error.message || error));
+            setMessage(String(error.message || error), "error", "일시정지 오류");
           }}
         }});
       }}
@@ -7068,10 +7215,10 @@ def render_ranking_job_script(form: RankingForm) -> str:
           try {{
             const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}/resume?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
             renderSummary(payload.job);
-            setMessage("작업을 이어받습니다.");
+            setMessage("작업을 이어받습니다.", "running", "배치 업데이트 진행 중");
             schedulePump();
           }} catch (error) {{
-            setMessage(String(error.message || error));
+            setMessage(String(error.message || error), "error", "이어받기 오류");
           }}
         }});
       }}
@@ -7084,10 +7231,10 @@ def render_ranking_job_script(form: RankingForm) -> str:
           try {{
             const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}/retry-failed?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
             renderSummary(payload.job);
-            setMessage("실패 항목만 다시 대기열에 넣었습니다.");
+            setMessage("실패 항목만 다시 대기열에 넣었습니다.", "running", "실패 항목 재시도 준비");
             schedulePump();
           }} catch (error) {{
-            setMessage(String(error.message || error));
+            setMessage(String(error.message || error), "error", "재시도 오류");
           }}
         }});
       }}
@@ -7103,23 +7250,25 @@ def render_ranking_job_script(form: RankingForm) -> str:
             return;
           }}
           stopPump();
-          setMessage("전체 DB 캐시를 초기화하고 있습니다...");
+          setMessage("전체 DB 캐시를 초기화하고 있습니다...", "running", "DB 초기화 진행 중");
           try {{
             const payload = await callJson("/ranking/reset-databases", "POST", {{}});
             activeJobId = "";
             panel.setAttribute("data-job-id", "");
             renderSummary(null);
-            setMessage(payload.message || "전체 DB 캐시 초기화 완료");
+            setMessage(payload.message || "전체 DB 캐시 초기화 완료", "success", "DB 초기화 완료");
             window.location.reload();
           }} catch (error) {{
-            setMessage(String(error.message || error));
+            setMessage(String(error.message || error), "error", "DB 초기화 오류");
           }}
         }});
       }}
 
       if (activeJobId) {{
+        setMessage("진행 중인 작업 상태를 불러오는 중입니다...", "running", "배치 업데이트 진행 중");
         schedulePump();
       }} else {{
+        setMessage("회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.", "idle", "DB 업데이트 대기 중");
         renderSummary(null);
       }}
     }})();
