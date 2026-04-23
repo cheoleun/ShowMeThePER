@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import tempfile
 import unittest
 from decimal import Decimal
@@ -14,10 +15,15 @@ from show_me_the_per.pipeline import (
     write_analysis_outputs,
 )
 from show_me_the_per.storage import (
+    activate_opendart_api_key,
     build_database_company_screening_payload,
     build_database_growth_ranking_payload,
     create_refresh_job,
+    delete_opendart_api_key,
+    list_opendart_api_keys,
+    normalize_refresh_job_error_reason,
     read_dart_companies_from_database,
+    read_active_opendart_api_key,
     read_company_master_entries,
     read_company_master_status,
     read_financial_statement_rows_from_database,
@@ -31,6 +37,7 @@ from show_me_the_per.storage import (
     reset_database_cache,
     record_refresh_job_item_result,
     retry_failed_refresh_job_items,
+    store_opendart_api_key,
     store_analysis_artifacts,
     store_analysis_directory,
     store_company_master_entries,
@@ -182,6 +189,70 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(status["count"], 2)
         self.assertFalse(status["is_stale"])
 
+    def test_company_master_status_is_skipped_within_same_seoul_day(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            store_company_master_entries(
+                database_path,
+                [
+                    {
+                        "corp_code": "00126380",
+                        "corp_name": "Samsung Electronics",
+                        "stock_code": "005930",
+                        "market": "KOSPI",
+                        "item_name": "Samsung Electronics",
+                        "modify_date": "20260422",
+                        "matched_at": "2026-04-22T16:30:00Z",
+                    }
+                ],
+            )
+            same_day_status = read_company_master_status(
+                database_path,
+                today=date(2026, 4, 23),
+            )
+            next_day_status = read_company_master_status(
+                database_path,
+                today=date(2026, 4, 24),
+            )
+
+        self.assertFalse(same_day_status["is_stale"])
+        self.assertTrue(next_day_status["is_stale"])
+
+    def test_store_activate_and_delete_opendart_api_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings_database_path = Path(directory) / "settings.sqlite3"
+            first_keys = store_opendart_api_key(
+                settings_database_path,
+                label="개인키 1",
+                api_key="first-key",
+            )
+            stored_keys = store_opendart_api_key(
+                settings_database_path,
+                label="개인키 2",
+                api_key="second-key",
+            )
+            activated_keys = activate_opendart_api_key(
+                settings_database_path,
+                key_id=int(stored_keys[1]["id"]),
+            )
+            active_key = read_active_opendart_api_key(settings_database_path)
+            deleted_keys = delete_opendart_api_key(
+                settings_database_path,
+                key_id=int(stored_keys[1]["id"]),
+            )
+            listed_keys = list_opendart_api_keys(settings_database_path)
+
+            self.assertEqual(len(first_keys), 1)
+            self.assertTrue(first_keys[0]["is_active"])
+            self.assertEqual(len(stored_keys), 2)
+            self.assertEqual(len(listed_keys), 1)
+            self.assertTrue(activated_keys[0]["is_active"])
+            self.assertIsNotNone(active_key)
+            self.assertEqual(active_key["api_key"], "second-key")
+            self.assertEqual(len(deleted_keys), 1)
+            self.assertTrue(deleted_keys[0]["is_active"])
+            self.assertEqual(deleted_keys[0]["api_key"], "first-key")
+
     def test_create_refresh_job_and_retry_failed_items(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "analysis.sqlite3"
@@ -235,6 +306,30 @@ class StorageTests(unittest.TestCase):
         self.assertIn(
             refreshed["next_pending_corp_name"],
             {"Samsung Electronics", "Vinatac"},
+        )
+
+    def test_normalize_refresh_job_error_reason_maps_opendart_statuses(self) -> None:
+        self.assertEqual(
+            normalize_refresh_job_error_reason(
+                "OpenDART major account request failed: 020 요청 제한 초과"
+            ),
+            "요청 제한 초과 (020)",
+        )
+        self.assertEqual(
+            normalize_refresh_job_error_reason(
+                "OpenDART major account request failed: 013 조회된 데이타가 없습니다."
+            ),
+            "데이터 없음",
+        )
+        self.assertEqual(
+            normalize_refresh_job_error_reason("재무 데이터를 가져오지 못했습니다."),
+            "데이터 없음",
+        )
+        self.assertEqual(
+            normalize_refresh_job_error_reason(
+                "OpenDART major account request failed: 021 조회 가능한 회사 개수가 초과하였습니다."
+            ),
+            "조회 가능 회사 수 초과 (021)",
         )
 
     def test_store_and_read_latest_equity_price_snapshot(self) -> None:
@@ -704,6 +799,79 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["screening_rows"], 1)
         self.assertEqual(payload["screening_rows"][0]["corp_code"], "00126380")
         self.assertEqual(payload["screening_rows"][0]["per"], "8")
+
+    def test_build_database_company_screening_payload_limits_rendered_rows(
+        self,
+    ) -> None:
+        artifacts = build_analysis_artifacts(
+            [
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "150",
+                    business_year="2025",
+                    previous_amount=Decimal("120"),
+                    before_previous_amount=Decimal("100"),
+                    stock_code="005930",
+                ),
+                financial_row(
+                    "00126380",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "120",
+                    business_year="2024",
+                    previous_amount=Decimal("100"),
+                    before_previous_amount=Decimal("80"),
+                    stock_code="005930",
+                ),
+                financial_row(
+                    "00434003",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "140",
+                    business_year="2025",
+                    previous_amount=Decimal("110"),
+                    before_previous_amount=Decimal("90"),
+                    stock_code="000660",
+                ),
+                financial_row(
+                    "00434003",
+                    "ifrs-full_Revenue",
+                    "Revenue",
+                    "110",
+                    business_year="2024",
+                    previous_amount=Decimal("90"),
+                    before_previous_amount=Decimal("70"),
+                    stock_code="000660",
+                ),
+            ],
+            expected_corp_codes=["00126380", "00434003"],
+            expected_business_years=["2024", "2025"],
+            expected_report_codes=["11011"],
+            recent_annual_periods=2,
+            recent_quarterly_periods=8,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            store_analysis_artifacts(database_path, artifacts)
+            payload = build_database_company_screening_payload(
+                database_path,
+                start_year=2024,
+                end_year=2025,
+                fs_div="CFS",
+                growth_metric="revenue",
+                growth_series_type="annual_yoy",
+                threshold_percent=Decimal("20"),
+                sort_by="market_cap",
+                result_limit=1,
+            )
+
+        self.assertEqual(payload["summary"]["screening_rows"], 2)
+        self.assertEqual(payload["summary"]["rendered_rows"], 1)
+        self.assertEqual(payload["summary"]["result_limit"], 1)
+        self.assertEqual(len(payload["screening_rows"]), 1)
 
 
 def financial_row(

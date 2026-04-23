@@ -17,6 +17,7 @@ from show_me_the_per.storage import (
     read_financial_period_values_from_database,
     read_refresh_job,
     read_refresh_job_items,
+    store_opendart_api_key,
     store_company_master_entries,
     summarize_database,
 )
@@ -97,7 +98,7 @@ class WebTests(TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("OPENDART_API_KEY", response.text)
+        self.assertIn("OpenDART 키를 먼저 설정해 주세요.", response.text)
 
     def test_analysis_collects_and_renders_v2_dashboard(self) -> None:
         client = TestClient(
@@ -164,7 +165,7 @@ class WebTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(
-            'class="top-tab is-active" href="/analysis?company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=overview#overview-summary"',
+            'class="top-tab is-active" href="/analysis?company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials#financials-details"',
             response.text,
         )
         self.assertIn(
@@ -172,13 +173,19 @@ class WebTests(TestCase):
             response.text,
         )
         self.assertIn(
-            '/analysis?company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=growth#growth-details',
-            response.text,
-        )
-        self.assertIn(
             '/compare?primary_company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20',
             response.text,
         )
+        self.assertIn('/ranking?', response.text)
+        self.assertIn('/db-update?', response.text)
+        self.assertIn(">기업필터</a>", response.text)
+        self.assertIn(">DB 업데이트</a>", response.text)
+        self.assertIn('threshold_percent=20', response.text)
+        self.assertIn("데이터/API 설정", response.text)
+        self.assertIn("OpenDART 키 관리", response.text)
+        self.assertNotIn(">요약</a>", response.text)
+        self.assertNotIn("tab=overview#overview-summary", response.text)
+        self.assertNotIn("tab=growth#growth-details", response.text)
 
     def test_analysis_refresh_link_keeps_current_query_state(self) -> None:
         client = TestClient(
@@ -211,11 +218,11 @@ class WebTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(
-            '/analysis?company_query=Samsung+Electronics&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=growth&amp;refresh=1#growth-details',
+            '/analysis?company_query=Samsung+Electronics&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials&amp;refresh=1#financials-details',
             response.text,
         )
 
-    def test_growth_tab_opens_growth_details_without_losing_data(self) -> None:
+    def test_growth_tab_url_normalizes_to_financials_without_breaking_page(self) -> None:
         client = TestClient(
             create_app(
                 FakeOpenDartClient,
@@ -246,7 +253,8 @@ class WebTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Samsung Electronics", response.text)
-        self.assertIn('<details class="panel" open>', response.text)
+        self.assertIn('class="top-tab is-active"', response.text)
+        self.assertIn("tab=financials#financials-details", response.text)
         self.assertIn('class="growth-detail-chart amount-chart"', response.text)
         self.assertIn('class="growth-table"', response.text)
         self.assertIn('stroke="#c4b5fd"', response.text)
@@ -497,6 +505,13 @@ class WebTests(TestCase):
             '/analysis?company_query=Samsung+Electronics&amp;recent_years=5&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials#financials-details',
             response.text,
         )
+        self.assertIn("/db-update?", response.text)
+        self.assertIn(">기업필터</a>", response.text)
+        self.assertIn(">DB 업데이트</a>", response.text)
+        self.assertIn("데이터/API 설정", response.text)
+        self.assertIn("OpenDART 키 관리", response.text)
+        self.assertNotIn(">요약</a>", response.text)
+        self.assertNotIn(">성장률</a>", response.text)
 
     def test_analysis_validation_errors_stay_in_browser(self) -> None:
         client = TestClient(
@@ -910,8 +925,7 @@ class WebTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("/ranking?", response.text)
-        self.assertIn("Samsung Electronics", response.text)
-        self.assertIn('href="/analysis?company_query=Samsung+Electronics', response.text)
+        self.assertIn("현재 조건을 통과한 기업이 없습니다", response.text)
         self.assertNotIn('name="max_per"', response.text)
         self.assertNotIn('name="max_pbr"', response.text)
         self.assertNotIn('name="min_roe"', response.text)
@@ -919,7 +933,65 @@ class WebTests(TestCase):
         self.assertNotIn("<th>PBR</th>", response.text)
         self.assertNotIn("<th>ROE</th>", response.text)
 
-    def test_ranking_page_renders_growth_condition_matrix_and_update_panel(self) -> None:
+    def test_ranking_page_limits_rendered_rows_for_browser_safety(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                "OPENDART_API_KEY": "test-key",
+                "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+            }
+            with patch.dict(os.environ, env):
+                client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "3",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+                client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Vinatac",
+                        "recent_years": "3",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.get(
+                    "/ranking",
+                    params={
+                        "display_limit": "1",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("현재 조건을 통과한 기업이 없습니다", response.text)
+        self.assertIn('name="display_limit"', response.text)
+        self.assertNotIn("Vinatac", response.text)
+        self.assertNotIn("미통과", response.text)
+        self.assertNotIn("<th>통과</th>", response.text)
+
+    def test_ranking_page_renders_growth_condition_matrix_without_update_panel(self) -> None:
         client = TestClient(
             create_app(
                 FakeOpenDartClient,
@@ -944,14 +1016,49 @@ class WebTests(TestCase):
         self.assertIn('value="3"', response.text)
         self.assertIn('name="growth_period__quarterly_qoq__net_income"', response.text)
         self.assertIn('value="12"', response.text)
+        self.assertIn('name="display_limit"', response.text)
+        self.assertIn(">100개</option>", response.text)
+        self.assertIn("기업필터", response.text)
+        self.assertIn(">DB 업데이트</a>", response.text)
+        self.assertIn("데이터/API 설정", response.text)
+        self.assertIn("OpenDART 키 관리", response.text)
+        self.assertIn("save-opendart-key-button", response.text)
+        self.assertIn("DB 업데이트는 별도 페이지에서 관리합니다.", response.text)
+        self.assertIn("전체 최소 성장률", response.text)
+        self.assertNotIn("KRX 연결 점검 실행", response.text)
+        self.assertNotIn("회사 목록 동기화", response.text)
+        self.assertNotIn("전체 DB 초기화", response.text)
+        self.assertNotIn("krx-diagnostic-result", response.text)
+        self.assertNotIn(">요약</a>", response.text)
+        self.assertNotIn('class="top-tab">성장률</a>', response.text)
+
+    def test_db_update_page_renders_operational_panel(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.get("/db-update")
+
+        self.assertEqual(response.status_code, 200)
         self.assertIn("DB 업데이트", response.text)
-        self.assertIn("KRX 연결 문제 진단", response.text)
         self.assertIn("KRX 연결 점검 실행", response.text)
-        self.assertIn("krx-diagnostic-result", response.text)
         self.assertIn("회사 목록 동기화", response.text)
         self.assertIn("전체 DB 초기화", response.text)
         self.assertIn("상장사 대상 목록 생성", response.text)
-        self.assertIn("전체 최소 성장률", response.text)
+        self.assertIn("OpenDART 키 변경은 데이터/API 설정에서 관리합니다.", response.text)
+        self.assertIn("데이터/API 설정", response.text)
+        self.assertIn("OpenDART 키 관리", response.text)
+        self.assertIn("krx-diagnostic-result", response.text)
         self.assertIn("window.confirm(", response.text)
 
     def test_ranking_company_master_sync_returns_korean_message_on_403(self) -> None:
@@ -1042,10 +1149,7 @@ class WebTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('value="annual_yoy:revenue" checked', response.text)
         self.assertIn('value="quarterly_yoy:operating_income" checked', response.text)
-        self.assertIn("0/2", response.text)
-        self.assertIn("조건별 확인", response.text)
-        self.assertIn("최근 3년", response.text)
-        self.assertIn("최근 12분기", response.text)
+        self.assertIn("현재 조건을 통과한 기업이 없습니다", response.text)
         self.assertIn("growth_condition=annual_yoy%3Arevenue%3A3", str(response.url))
         self.assertIn(
             "growth_condition=quarterly_yoy%3Aoperating_income%3A12",
@@ -1225,6 +1329,236 @@ class WebTests(TestCase):
         self.assertEqual(resume_response.json()["job"]["status"], "running")
         self.assertIsNotNone(job)
         self.assertEqual(job["pending_companies"], 0)
+
+    def test_ranking_company_master_sync_skips_same_seoul_day(self) -> None:
+        client = TestClient(
+            create_app(
+                FailingCompanyListClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "show-me-the-per-cfs.sqlite3"
+            store_company_master_entries(
+                database_path,
+                [
+                    {
+                        "corp_code": "00126380",
+                        "corp_name": "Samsung Electronics",
+                        "stock_code": "005930",
+                        "market": "KOSPI",
+                        "item_name": "Samsung Electronics",
+                        "modify_date": "20260422",
+                        "matched_at": "2026-04-22T16:30:00Z",
+                    }
+                ],
+            )
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.post(
+                    "/ranking/company-master/sync",
+                    params={"fs_div": "CFS"},
+                    json={},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["skipped_today"])
+        self.assertIn("오늘 이미 동기화됨", response.json()["message"])
+
+    def test_ranking_run_next_batch_marks_no_data_as_skipped(self) -> None:
+        client = TestClient(
+            create_app(
+                NoDataOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "show-me-the-per-cfs.sqlite3"
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                client.post("/ranking/company-master/sync", params={"fs_div": "CFS"}, json={})
+                create_response = client.post(
+                    "/ranking/update-jobs",
+                    params={"fs_div": "CFS"},
+                    json={
+                        "scope": "ALL",
+                        "fs_div": "CFS",
+                        "year_from": 2024,
+                        "year_to": 2025,
+                        "batch_size": 25,
+                    },
+                )
+                job_id = int(create_response.json()["job"]["id"])
+                batch_response = client.post(
+                    f"/ranking/update-jobs/{job_id}/run-next-batch",
+                    params={"fs_div": "CFS"},
+                )
+            skipped_items = read_refresh_job_items(
+                database_path,
+                job_id=job_id,
+                statuses=["skipped"],
+            )
+
+        self.assertEqual(batch_response.status_code, 200)
+        self.assertEqual(batch_response.json()["job"]["skipped_companies"], 2)
+        self.assertEqual(batch_response.json()["job"]["failed_companies"], 0)
+        self.assertEqual(len(skipped_items), 2)
+        self.assertEqual(skipped_items[0]["last_error"], "데이터 없음")
+
+    def test_ranking_run_next_batch_blocks_on_opendart_rate_limit(self) -> None:
+        client = TestClient(
+            create_app(
+                RateLimitedOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "show-me-the-per-cfs.sqlite3"
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                client.post("/ranking/company-master/sync", params={"fs_div": "CFS"}, json={})
+                create_response = client.post(
+                    "/ranking/update-jobs",
+                    params={"fs_div": "CFS"},
+                    json={
+                        "scope": "ALL",
+                        "fs_div": "CFS",
+                        "year_from": 2024,
+                        "year_to": 2025,
+                        "batch_size": 1,
+                    },
+                )
+                job_id = int(create_response.json()["job"]["id"])
+                batch_response = client.post(
+                    f"/ranking/update-jobs/{job_id}/run-next-batch",
+                    params={"fs_div": "CFS"},
+                )
+            job = read_refresh_job(database_path, job_id=job_id)
+            pending_items = read_refresh_job_items(
+                database_path,
+                job_id=job_id,
+                statuses=["pending"],
+            )
+
+        self.assertEqual(batch_response.status_code, 200)
+        self.assertEqual(batch_response.json()["job"]["status"], "blocked")
+        self.assertIn("요청 제한 초과 (020)", batch_response.json()["job"]["last_error"])
+        self.assertIsNotNone(job)
+        self.assertEqual(job["status"], "blocked")
+        self.assertEqual(job["failed_companies"], 0)
+        self.assertEqual(job["pending_companies"], 2)
+        self.assertEqual(len(pending_items), 2)
+
+    def test_ranking_company_master_sync_prefers_active_local_opendart_key(self) -> None:
+        RecordingApiKeyOpenDartClient.used_api_keys = []
+        client = TestClient(
+            create_app(
+                RecordingApiKeyOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings_database_path = Path(directory) / "show-me-the-per-settings.sqlite3"
+            store_opendart_api_key(
+                settings_database_path,
+                label="로컬 키",
+                api_key="local-key",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "env-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.post(
+                    "/ranking/company-master/sync",
+                    params={"fs_div": "CFS"},
+                    json={},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(RecordingApiKeyOpenDartClient.used_api_keys, ["local-key"])
+
+    def test_ranking_opendart_key_endpoints_manage_local_keys(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                add_first = client.post(
+                    "/ranking/opendart-keys",
+                    json={"label": "키1", "api_key": "first-key"},
+                )
+                add_second = client.post(
+                    "/ranking/opendart-keys",
+                    json={"label": "키2", "api_key": "second-key"},
+                )
+                second_row = next(
+                    item for item in add_second.json()["keys"] if item["label"] == "키2"
+                )
+                second_id = int(second_row["id"])
+                activate_second = client.post(
+                    f"/ranking/opendart-keys/{second_id}/activate",
+                    json={},
+                )
+                delete_second = client.request(
+                    "DELETE",
+                    f"/ranking/opendart-keys/{second_id}",
+                )
+
+        self.assertEqual(add_first.status_code, 200)
+        self.assertEqual(len(add_first.json()["keys"]), 1)
+        self.assertTrue(add_first.json()["keys"][0]["is_active"])
+        self.assertEqual(add_second.status_code, 200)
+        self.assertEqual(len(add_second.json()["keys"]), 2)
+        self.assertNotIn("second-key", str(add_second.json()["keys"]))
+        self.assertEqual(activate_second.status_code, 200)
+        self.assertIn("활성 OpenDART 키를 변경했습니다.", activate_second.json()["message"])
+        activated_second_row = next(
+            item for item in activate_second.json()["keys"] if item["label"] == "키2"
+        )
+        self.assertTrue(activated_second_row["is_active"])
+        self.assertEqual(delete_second.status_code, 200)
+        self.assertEqual(len(delete_second.json()["keys"]), 1)
 
     def test_ranking_retry_failed_update_job_requeues_failed_items(self) -> None:
         client = TestClient(
@@ -1835,6 +2169,38 @@ class FailingFinancialClient(FakeOpenDartClient):
         batch_size: int = 100,
     ) -> list[FinancialStatementRow]:
         raise RuntimeError("temporary financial fetch failure")
+
+
+class NoDataOpenDartClient(FakeOpenDartClient):
+    def fetch_major_accounts(
+        self,
+        corp_codes: list[str],
+        business_year: str,
+        report_code: str,
+        fs_div: str | None = None,
+        batch_size: int = 100,
+    ) -> list[FinancialStatementRow]:
+        return []
+
+
+class RateLimitedOpenDartClient(FakeOpenDartClient):
+    def fetch_major_accounts(
+        self,
+        corp_codes: list[str],
+        business_year: str,
+        report_code: str,
+        fs_div: str | None = None,
+        batch_size: int = 100,
+    ) -> list[FinancialStatementRow]:
+        raise ValueError("OpenDART major account request failed: 020 요청 제한 초과")
+
+
+class RecordingApiKeyOpenDartClient(FakeOpenDartClient):
+    used_api_keys: list[str] = []
+
+    def fetch_companies(self) -> list[DartCompany]:
+        type(self).used_api_keys.append(self.api_key)
+        return super().fetch_companies()
 
 
 def _build_quarterly_rows(

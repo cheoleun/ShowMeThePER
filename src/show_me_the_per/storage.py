@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import json
+import re
 import sqlite3
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -20,7 +21,6 @@ from .rankings import (
 
 
 SCHEMA_VERSION = 3
-COMPANY_MASTER_STALE_DAYS = 7
 RESETTABLE_CACHE_TABLES = (
     "financial_statement_rows",
     "financial_period_values",
@@ -33,6 +33,31 @@ RESETTABLE_CACHE_TABLES = (
     "refresh_jobs",
     "refresh_job_items",
 )
+
+SETTINGS_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS opendart_api_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT NOT NULL,
+        api_key TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_opendart_api_keys_active
+    ON opendart_api_keys (is_active DESC, updated_at DESC, id DESC)
+    """,
+)
+
+OPENDART_BLOCKING_REASON_LABELS = {
+    "020": "요청 제한 초과 (020)",
+    "010": "키 오류/사용 불가 (010)",
+    "011": "키 오류/사용 불가 (011)",
+    "012": "키 오류/사용 불가 (012)",
+    "901": "키 오류/사용 불가 (901)",
+}
 
 
 SCHEMA_STATEMENTS = (
@@ -258,6 +283,13 @@ def initialize_database(database_path: Path) -> None:
             "INSERT INTO schema_version (version) VALUES (?)",
             (SCHEMA_VERSION,),
         )
+
+
+def initialize_settings_database(settings_database_path: Path) -> None:
+    settings_database_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(settings_database_path) as connection:
+        for statement in SETTINGS_SCHEMA_STATEMENTS:
+            connection.execute(statement)
 
 
 def store_analysis_artifacts(
@@ -714,16 +746,154 @@ def read_company_master_status(
     last_synced_at = str(row[1] or "")
     stale = True
     if count > 0 and last_synced_at:
-        stale = _is_timestamp_stale(
-            last_synced_at,
-            days=COMPANY_MASTER_STALE_DAYS,
-            today=today,
-        )
+        stale = _is_timestamp_before_seoul_today(last_synced_at, today=today)
     return {
         "count": count,
         "last_synced_at": last_synced_at,
         "is_stale": stale if count > 0 else True,
     }
+
+
+def list_opendart_api_keys(settings_database_path: Path) -> list[dict[str, object]]:
+    initialize_settings_database(settings_database_path)
+    with sqlite3.connect(settings_database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, label, api_key, is_active, created_at, updated_at
+            FROM opendart_api_keys
+            ORDER BY is_active DESC, updated_at DESC, id DESC
+            """
+        ).fetchall()
+    return [
+        {
+            "id": int(row[0]),
+            "label": str(row[1] or ""),
+            "api_key": str(row[2] or ""),
+            "is_active": bool(row[3]),
+            "created_at": str(row[4] or ""),
+            "updated_at": str(row[5] or ""),
+        }
+        for row in rows
+    ]
+
+
+def read_active_opendart_api_key(
+    settings_database_path: Path,
+) -> dict[str, object] | None:
+    keys = list_opendart_api_keys(settings_database_path)
+    for item in keys:
+        if item.get("is_active") is True:
+            return item
+    return None
+
+
+def store_opendart_api_key(
+    settings_database_path: Path,
+    *,
+    label: str,
+    api_key: str,
+) -> list[dict[str, object]]:
+    initialize_settings_database(settings_database_path)
+    normalized_key = str(api_key or "").strip()
+    normalized_label = str(label or "").strip()
+    if not normalized_key:
+        raise ValueError("OpenDART API 키를 입력해 주세요.")
+    if not normalized_label:
+        normalized_label = f"키 {_utc_now_text()}"
+    timestamp = _utc_now_text()
+    with sqlite3.connect(settings_database_path) as connection:
+        active_exists = bool(
+            connection.execute(
+                "SELECT 1 FROM opendart_api_keys WHERE is_active = 1 LIMIT 1"
+            ).fetchone()
+        )
+        connection.execute(
+            """
+            INSERT INTO opendart_api_keys (
+                label,
+                api_key,
+                is_active,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_label,
+                normalized_key,
+                0 if active_exists else 1,
+                timestamp,
+                timestamp,
+            ),
+        )
+    return list_opendart_api_keys(settings_database_path)
+
+
+def activate_opendart_api_key(
+    settings_database_path: Path,
+    *,
+    key_id: int,
+) -> list[dict[str, object]]:
+    initialize_settings_database(settings_database_path)
+    timestamp = _utc_now_text()
+    with sqlite3.connect(settings_database_path) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM opendart_api_keys WHERE id = ?",
+            (key_id,),
+        ).fetchone()
+        if exists is None:
+            raise LookupError("OpenDART 키를 찾을 수 없습니다.")
+        connection.execute("UPDATE opendart_api_keys SET is_active = 0")
+        connection.execute(
+            """
+            UPDATE opendart_api_keys
+            SET is_active = 1,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, key_id),
+        )
+    return list_opendart_api_keys(settings_database_path)
+
+
+def delete_opendart_api_key(
+    settings_database_path: Path,
+    *,
+    key_id: int,
+) -> list[dict[str, object]]:
+    initialize_settings_database(settings_database_path)
+    timestamp = _utc_now_text()
+    with sqlite3.connect(settings_database_path) as connection:
+        row = connection.execute(
+            "SELECT is_active FROM opendart_api_keys WHERE id = ?",
+            (key_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("OpenDART 키를 찾을 수 없습니다.")
+        was_active = bool(row[0])
+        connection.execute(
+            "DELETE FROM opendart_api_keys WHERE id = ?",
+            (key_id,),
+        )
+        if was_active:
+            next_row = connection.execute(
+                """
+                SELECT id
+                FROM opendart_api_keys
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if next_row is not None:
+                connection.execute(
+                    """
+                    UPDATE opendart_api_keys
+                    SET is_active = 1,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (timestamp, int(next_row[0])),
+                )
+    return list_opendart_api_keys(settings_database_path)
 
 
 def create_refresh_job(
@@ -893,6 +1063,7 @@ def read_refresh_job(
     estimated_remaining_batches = (
         (remaining_count + batch_size - 1) // batch_size if remaining_count else 0
     )
+    reason_summary = summarize_refresh_job_reasons(database_path, job_id=job_id)
 
     return {
         "id": int(row[0]),
@@ -934,6 +1105,7 @@ def read_refresh_job(
                 "status": recent_item[3],
             }
         ),
+        "reason_summary": reason_summary,
     }
 
 
@@ -1133,6 +1305,57 @@ def retry_failed_refresh_job_items(
             (timestamp, job_id),
         )
     return read_refresh_job(database_path, job_id=job_id)
+
+
+def summarize_refresh_job_reasons(
+    database_path: Path,
+    *,
+    job_id: int,
+    sample_limit: int = 3,
+) -> dict[str, list[dict[str, object]]]:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT status, last_error, corp_name
+            FROM refresh_job_items
+            WHERE job_id = ?
+              AND status IN ('failed', 'skipped')
+            ORDER BY updated_at DESC, corp_code ASC
+            """,
+            (job_id,),
+        ).fetchall()
+
+    grouped: dict[str, dict[str, dict[str, object]]] = {
+        "failed": {},
+        "skipped": {},
+    }
+    for status, last_error, corp_name in rows:
+        normalized_status = str(status or "").strip()
+        if normalized_status not in grouped:
+            continue
+        reason = normalize_refresh_job_error_reason(last_error)
+        bucket = grouped[normalized_status].setdefault(
+            reason,
+            {"reason": reason, "count": 0, "samples": []},
+        )
+        bucket["count"] = int(bucket["count"]) + 1
+        sample_name = str(corp_name or "").strip()
+        samples = bucket["samples"]
+        if (
+            sample_name
+            and sample_name not in samples
+            and len(samples) < max(int(sample_limit), 1)
+        ):
+            samples.append(sample_name)
+
+    return {
+        status: sorted(
+            grouped[status].values(),
+            key=lambda item: (-int(item["count"]), str(item["reason"])),
+        )
+        for status in ("failed", "skipped")
+    }
 
 
 def read_financial_statement_rows_from_database(
@@ -1510,6 +1733,57 @@ def read_growth_filter_results_from_database(
     ]
 
 
+def read_collection_errors_from_database(
+    database_path: Path,
+    *,
+    corp_code: str | None = None,
+) -> list[CollectionError]:
+    query = """
+        SELECT
+            corp_codes,
+            business_year,
+            report_code,
+            fs_div,
+            error_type,
+            message
+        FROM collection_errors
+    """
+    params: list[object] = []
+    if corp_code is not None:
+        query += """
+            WHERE corp_codes = ?
+               OR corp_codes LIKE ?
+               OR corp_codes LIKE ?
+               OR corp_codes LIKE ?
+        """
+        params.extend(
+            (
+                corp_code,
+                f"{corp_code},%",
+                f"%,{corp_code}",
+                f"%,{corp_code},%",
+            )
+        )
+    query += " ORDER BY business_year, report_code, error_type, message"
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(query, params).fetchall()
+
+    return [
+        CollectionError(
+            corp_codes=tuple(
+                value for value in str(row[0] or "").split(",") if value.strip()
+            ),
+            business_year=str(row[1] or ""),
+            report_code=str(row[2] or ""),
+            fs_div=str(row[3] or "") or None,
+            error_type=str(row[4] or ""),
+            message=str(row[5] or ""),
+        )
+        for row in rows
+    ]
+
+
 def build_database_growth_ranking_payload(
     database_path: Path,
     *,
@@ -1593,6 +1867,7 @@ def build_database_company_screening_payload(
     min_roe: Decimal | None = None,
     market: str | None = None,
     sort_by: str = "market_cap",
+    result_limit: int | None = None,
 ) -> dict[str, object]:
     initialize_database(database_path)
     calculation_start_year = max(0, start_year - 1)
@@ -1633,13 +1908,20 @@ def build_database_company_screening_payload(
         sort_by=sort_by,
         threshold_percent=threshold_percent,
     )
+    total_rows = len(rows)
+    if result_limit is not None and result_limit > 0:
+        rendered_rows = rows[:result_limit]
+    else:
+        rendered_rows = rows
 
     return {
         "summary": {
             "database": str(database_path),
             "growth_points": len(growth_points),
             "valuation_snapshots": len(valuation_snapshots),
-            "screening_rows": len(rows),
+            "screening_rows": total_rows,
+            "rendered_rows": len(rendered_rows),
+            "result_limit": result_limit,
             "start_year": start_year,
             "end_year": end_year,
         },
@@ -1655,7 +1937,7 @@ def build_database_company_screening_payload(
             "market": (market or "").strip().upper(),
             "sort_by": sort_by,
         },
-        "screening_rows": rows,
+        "screening_rows": rendered_rows,
     }
 
 
@@ -1920,10 +2202,42 @@ def _utc_now_text() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def _is_timestamp_stale(
+def extract_opendart_status_code(message: object) -> str:
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    matched = re.search(r"OpenDART [^:]* failed:\s*([0-9]{3})\b", text)
+    if matched is None:
+        return ""
+    return matched.group(1)
+
+
+def normalize_refresh_job_error_reason(message: object) -> str:
+    text = str(message or "").strip()
+    status_code = extract_opendart_status_code(text)
+    if status_code == "013":
+        return "데이터 없음"
+    if status_code in OPENDART_BLOCKING_REASON_LABELS:
+        return OPENDART_BLOCKING_REASON_LABELS[status_code]
+    if status_code == "021":
+        return "조회 가능 회사 수 초과 (021)"
+    if status_code in {"800", "900"} or status_code:
+        return "시스템 점검/미정의 오류 (800/900/기타)"
+    if not text:
+        return "일반 예외"
+    lowered = text.lower()
+    if (
+        "재무 데이터를 가져오지 못했습니다." in text
+        or "데이터 없음" in text
+        or "no data" in lowered
+    ):
+        return "데이터 없음"
+    return "일반 예외"
+
+
+def _is_timestamp_before_seoul_today(
     value: str,
     *,
-    days: int,
     today: date | None = None,
 ) -> bool:
     text = str(value or "").strip()
@@ -1934,5 +2248,10 @@ def _is_timestamp_stale(
         timestamp = datetime.fromisoformat(normalized)
     except ValueError:
         return True
-    current = today or date.today()
-    return timestamp.date() < (current - timedelta(days=days))
+    timestamp_in_seoul = timestamp + timedelta(hours=9)
+    current = today or _current_seoul_date()
+    return timestamp_in_seoul.date() < current
+
+
+def _current_seoul_date() -> date:
+    return (datetime.utcnow() + timedelta(hours=9)).date()
