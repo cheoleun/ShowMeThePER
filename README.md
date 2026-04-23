@@ -1,245 +1,263 @@
 # ShowMeThePER
 
-## Getting Started
+한국 상장기업의 재무 데이터를 수집하고, 브라우저에서 분석/비교/필터링할 수 있는 프로젝트입니다.
 
-- 처음 설치하고 실행하는 방법: [docs/getting-started.md](docs/getting-started.md)
+현재 프로젝트는 다음 흐름을 중심으로 동작합니다.
 
-한국 상장기업의 재무제표와 성장률 지표를 수집하고 보여주는 프로젝트입니다.
+- `재무정보`: 단일 기업 재무와 성장률 보기
+- `VS 기업비교`: 두 기업 비교
+- `기업필터`: 성장률 조건에 맞는 기업 찾기
+- `DB 업데이트`: 회사 목록 동기화, 배치 수집, 진단, 키 관리
 
-## 현재 구현 범위
+## 빠른 시작
 
-첫 개발 단계에서는 상장기업 목록과 OpenDART 기업 고유번호를 매칭하는 기반을 제공합니다.
+상세 가이드는 아래 문서를 먼저 보는 것을 권장합니다.
 
-- KRX 상장종목정보 API 응답 파싱
-- OpenDART 고유번호 ZIP/XML 응답 파싱
-- KRX 단축코드와 OpenDART `stock_code` 기반 매칭
-- 매칭 성공, 미매칭, 중복 후보 분리
-- 기업 마스터 JSON, CSV, Markdown 리포트 출력
-- OpenDART 다중회사 주요 재무계정 응답 파싱
-- OpenDART 주요 재무계정 row를 연간 성장률 계산용 기간값으로 정규화
-- 보고서별 누적값에서 분기별 표준 재무값 산출
-- 연간 YoY, 분기 YoY, 최근 4분기 합산 YoY 성장률 계산
-- 최근 N개 성장률이 모두 기준 이상인지 판정하는 기본 성장률 필터
-- 여러 연도와 보고서 코드를 한 번에 수집해 분석 산출물과 커버리지 리포트 출력
-- 수집 요청 일부가 실패해도 계속 진행하고 오류 리포트 출력
-- 분석 산출물을 SQLite DB에 저장하고 요약 조회
-- SQLite DB에 저장된 성장률 필터 결과로 성장률 랭킹 조회
-- SQLite DB에 저장된 회사별 성장률을 정적 HTML 리포트로 출력
-- SQLite DB에 저장된 성장률 필터 결과를 정적 HTML 랭킹 리포트로 출력
-- FastAPI 브라우저 화면에서 요청 기업의 N년치 재무제표 수집과 성장률 분석 실행
-- 성장률, PER, PBR, ROE 기반 순위 JSON 출력
-- API 키 없이 실행 가능한 단위 테스트
+- [처음 사용 가이드](docs/getting-started.md)
 
-## 브라우저 UI
+가장 빠른 실행 순서는 아래와 같습니다.
 
-OpenDART API 키를 환경변수로 설정한 뒤 FastAPI 서버를 실행하면 브라우저에서 기업 이름과 조회 연수를 입력해 바로 분석할 수 있습니다.
+### 1. 저장소 받기
 
 ```powershell
-$env:OPENDART_API_KEY="..."
-$env:PYTHONPATH="src"
+git clone https://github.com/cheoleun/ShowMeThePER.git
+cd ShowMeThePER
+```
+
+### 2. Python 환경 준비
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -e .
+```
+
+또는 conda를 사용해도 됩니다.
+
+```powershell
+conda create -n showmetheper python=3.11 -y
+conda activate showmetheper
+python -m pip install --upgrade pip
+pip install -e .
+```
+
+### 3. API 키 설정
+
+프로젝트는 두 종류의 키를 사용합니다.
+
+- `OPENDART_API_KEY`: 재무제표 수집용
+- `KRX_SERVICE_KEY`: 상장사 목록/전일 종가/시가총액 조회용
+
+PowerShell 예시:
+
+```powershell
+$env:OPENDART_API_KEY="발급받은_OpenDART_키"
+$env:KRX_SERVICE_KEY="발급받은_KRX_서비스키"
+```
+
+발급 방법은 [처음 사용 가이드](docs/getting-started.md)에 정리되어 있습니다.
+
+### 4. 웹 서버 실행
+
+```powershell
 python -m show_me_the_per.cli web --host 127.0.0.1 --port 8000
 ```
 
-브라우저에서 `http://127.0.0.1:8000`을 열고 기업 이름, 조회 연수, 기준 연도, 재무제표 구분을 입력합니다. 기업 이름 대신 종목코드나 OpenDART 고유번호도 사용할 수 있습니다. 결과 화면에는 연간 금액, 분기 금액, 성장률 필터 결과, 성장률 차트가 표시됩니다.
-
-## CLI
-
-환경 변수 또는 인자로 API 키를 넘겨 기업 마스터 파일을 생성할 수 있습니다.
+또는 설치된 콘솔 스크립트를 사용할 수 있습니다.
 
 ```powershell
-$env:KRX_SERVICE_KEY="..."
-$env:OPENDART_API_KEY="..."
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli company-master `
-  --output data/company-master.json `
-  --matched-csv data/company-master-matched.csv `
-  --unmatched-csv data/company-master-unmatched.csv `
-  --ambiguous-json data/company-master-ambiguous.json `
-  --report data/company-master-report.md
+show-me-the-per web --host 127.0.0.1 --port 8000
 ```
 
-하위 호환을 위해 `company-master` 서브커맨드는 생략할 수 있습니다.
+브라우저에서 열기:
 
-OpenDART 주요 재무계정도 기업 고유번호 기준으로 수집할 수 있습니다.
+- [http://127.0.0.1:8000](http://127.0.0.1:8000)
+
+## 현재 구현 범위
+
+현재 기준으로 구현되어 있는 주요 기능은 아래와 같습니다.
+
+### 웹 UI
+
+- FastAPI 기반 브라우저 UI
+- 기업명 기준 조회
+- DB 기준 재무정보 렌더링
+- 단일 기업 재무 차트
+- 두 기업 비교 화면
+- 기업필터 화면
+- DB 업데이트 운영 화면
+
+### 재무/성장률
+
+- 연간 / 분기 / 최근 4분기 누적 금액 표시
+- YoY / QoQ 성장률 계산
+- 최근 구간 요약
+- 매출 / 영업이익 / 순이익 / EPS 표시
+- 전일 종가 / 시가총액 / 시장 구분 표시
+
+### 기업필터
+
+- 시장, 기준 연도, 재무제표 구분, 정렬, 표시 개수 설정
+- 성장률 조건을 아래 축으로 선택 가능
+  - 연간 YoY
+  - 분기 YoY
+  - 분기 QoQ
+  - 최근 4분기 누적 YoY
+- 각 조건마다
+  - 적용 여부
+  - 최근 몇 년 / 몇 분기
+  - 기준 성장률 %
+  를 별도로 지정 가능
+- 조건을 모두 만족한 기업만 결과에 표시
+
+### DB 업데이트
+
+- 회사 목록 동기화
+- 배치 작업 생성 / 일시정지 / 이어받기 / 실패만 재시도
+- KRX 연결 점검
+- OpenDART 키 관리
+- 전체 DB 초기화
+- 실패/건너뜀 원인 요약 표시
+
+### CLI
+
+다음 CLI 명령이 있습니다.
+
+- `company-master`
+- `collect-analysis`
+- `analysis-to-db`
+- `database-summary`
+- `rank-growth-from-db`
+- `company-growth-report`
+- `growth-ranking-report`
+- `rank-companies`
+- `web`
+
+웹 UI가 주 사용 경로이지만, 배치/보고서/DB 요약은 CLI로도 실행할 수 있습니다.
+
+## 탭 설명
+
+### 재무정보
+
+단일 기업의 재무 흐름을 보는 화면입니다.
+
+- 최근 구간 요약
+- 연간/분기/최근 4분기 누적 차트
+- 성장률 상세
+- EPS, 전일 종가, 시가총액, 시장 구분
+
+이 화면은 DB를 먼저 조회하고, 데이터가 없거나 부족하면 OpenDART에서 수집한 뒤 DB에 저장하고 다시 DB 기준으로 렌더링합니다.
+
+### VS 기업비교
+
+두 기업의 재무 흐름을 같은 기준으로 비교합니다.
+
+- 연간/분기/최근 4분기 누적 비교
+- 성장률 비교
+- 회사별 요약 정보
+
+### 기업필터
+
+성장률 조건에 맞는 기업 리스트를 찾는 화면입니다.
+
+- 탭 진입 시 자동 조회하지 않음
+- `조회` 버튼을 눌렀을 때만 결과를 계산
+- 결과는 “조건에 맞는 기업” 리스트로 표시
+
+### DB 업데이트
+
+운영 전용 화면입니다.
+
+- 회사 목록 동기화
+- 재무 데이터 배치 수집
+- KRX 연결 점검
+- OpenDART 키 관리
+- DB 초기화
+
+## 데이터 저장 방식
+
+이 프로젝트는 웹 화면에서도 DB를 적극적으로 사용합니다.
+
+- 재무정보/비교 화면은 DB를 기준 저장소로 사용
+- OpenDART에서 새 데이터를 가져오더라도 먼저 DB에 반영한 뒤 DB 기준으로 다시 렌더링
+- 기업필터도 DB에 저장된 성장률 포인트를 기준으로 계산
+
+### 기본 DB 위치
+
+Windows 기본 경로:
+
+- `%LOCALAPPDATA%\\show-me-the-per-cfs.sqlite3`
+- `%LOCALAPPDATA%\\show-me-the-per-ofs.sqlite3`
+- `%LOCALAPPDATA%\\show-me-the-per-all.sqlite3`
+- `%LOCALAPPDATA%\\show-me-the-per-settings.sqlite3`
+
+원하면 캐시 디렉터리를 직접 지정할 수 있습니다.
 
 ```powershell
-$env:OPENDART_API_KEY="..."
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli financial-statements `
-  --corp-code 00126380 `
-  --business-year 2025 `
-  --report-code 11011 `
-  --fs-div CFS `
-  --output data/financial-statements.json
+$env:SHOW_ME_THE_PER_WEB_CACHE_DIR="C:\\my-cache\\show-me-the-per"
 ```
 
-수집한 주요 재무계정 row에서 매출, 영업이익, 순이익의 연간 기간값을 만들 수 있습니다.
+## API 키와 진단
 
-```powershell
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli financial-period-values `
-  --input data/financial-statements.json `
-  --output data/financial-period-values.json
-```
+### OpenDART
 
-정규화된 기간별 재무값 JSON에서 성장률 지표와 기본 필터 결과를 계산할 수 있습니다.
+재무제표 수집에 사용합니다.
 
-```powershell
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli growth-metrics `
-  --input data/financial-period-values.json `
-  --output data/growth-metrics.json `
-  --threshold-percent 20 `
-  --recent-annual-periods 3 `
-  --recent-quarterly-periods 12
-```
+- 환경변수: `OPENDART_API_KEY`
+- 또는 `DB 업데이트 > 데이터/API 설정`에서 로컬 저장 키 관리 가능
 
-입력 JSON은 다음처럼 `values` 배열을 사용합니다.
+OpenDART 요청 제한 또는 키 오류가 발생하면 배치 작업은 `blocked` 상태로 멈추고, 키를 바꾼 뒤 `이어받기` 할 수 있습니다.
 
-```json
-{
-  "values": [
-    {
-      "corp_code": "00126380",
-      "metric": "revenue",
-      "period_type": "annual",
-      "fiscal_year": 2024,
-      "amount": "300000000000000"
-    },
-    {
-      "corp_code": "00126380",
-      "metric": "revenue",
-      "period_type": "quarter",
-      "fiscal_year": 2025,
-      "fiscal_quarter": 1,
-      "amount": "79000000000000"
-    }
-  ]
-}
-```
+### KRX
 
-성장률 결과와 선택적인 PER/PBR/ROE JSON을 조합해 순위를 만들 수 있습니다.
+상장사 목록과 전일 시세 정보를 위해 사용합니다.
 
-```powershell
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli rank-companies `
-  --growth-input data/growth-metrics.json `
-  --valuation-input data/valuation-metrics.json `
-  --output data/rankings.json `
-  --growth-metric revenue `
-  --growth-series-type annual_yoy `
-  --max-per 15 `
-  --max-pbr 1 `
-  --min-roe 20 `
-  --rank-valuation-by roe
-```
+- 환경변수: `KRX_SERVICE_KEY`
 
-PER/PBR/ROE 입력 JSON은 다음처럼 `companies` 배열을 사용합니다.
+관련 API:
 
-```json
-{
-  "companies": [
-    {
-      "corp_code": "00126380",
-      "corp_name": "삼성전자",
-      "stock_code": "005930",
-      "per": "12.5",
-      "pbr": "1.2",
-      "roe": "18.4"
-    }
-  ]
-}
-```
+- [금융위원회_KRX상장종목정보](https://www.data.go.kr/data/15094775/openapi.do)
+- [금융위원회_주식시세정보](https://www.data.go.kr/data/15094808/openapi.do)
 
-여러 기업과 여러 연도를 한 번에 수집한 뒤 표준 기간값, 성장률, 커버리지 리포트까지 생성할 수 있습니다. 기본 보고서 코드는 1분기, 반기, 3분기, 사업보고서입니다.
+문제가 있으면 `DB 업데이트 > KRX 연결 점검 실행`부터 확인하는 것이 좋습니다.
 
-```powershell
-$env:OPENDART_API_KEY="..."
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli collect-analysis `
-  --corp-code-file data/company-master.json `
-  --year-from 2015 `
-  --year-to 2025 `
-  --fs-div CFS `
-  --output-dir data/analysis `
-  --database data/show-me-the-per.sqlite3 `
-  --threshold-percent 20 `
-  --recent-annual-periods 3 `
-  --recent-quarterly-periods 12
-```
+## 권장 사용 순서
 
-`collect-analysis`는 다음 파일을 생성합니다.
+실제 사용 흐름은 아래 순서를 권장합니다.
 
-- `financial-statements.json`: OpenDART 주요 재무계정 원천 row
-- `financial-period-values.json`: 연간/분기별 표준 재무값
-- `growth-metrics.json`: 연간 YoY, 분기 YoY, 최근 4분기 합산 YoY 성장률과 기본 필터 결과
-- `coverage-report.json`: 기업별 수집 연도, 보고서 코드, 지표별 연간/분기 데이터 확보 여부, 성장률 필터 결과
-- `collection-errors.json`: 수집 요청별 실패 연도, 보고서 코드, 오류 유형과 메시지
-
-일부 OpenDART 요청이 실패하면 기본적으로 나머지 요청을 계속 진행하고 오류를 `collection-errors.json`에 기록합니다. 실패 즉시 중단하려면 `--fail-fast`를 추가합니다.
-
-실제 API 키로 빠르게 점검하는 절차는 [실데이터 수집 스모크런](docs/smoke-run.md)에 정리되어 있습니다.
-
-이미 만들어둔 분석 산출물 디렉터리를 SQLite DB에 저장할 수도 있습니다.
-
-```powershell
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli analysis-to-db `
-  --input-dir data/smoke-analysis-10y `
-  --database data/show-me-the-per.sqlite3 `
-  --summary-output data/db-summary.json
-```
-
-DB 요약은 다음 명령으로 확인할 수 있습니다.
-
-```powershell
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli database-summary `
-  --database data/show-me-the-per.sqlite3 `
-  --output data/db-summary.json
-```
-
-DB에 저장된 성장률 필터 결과로 랭킹을 조회할 수 있습니다.
-
-```powershell
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli rank-growth-from-db `
-  --database data/show-me-the-per.sqlite3 `
-  --growth-metric revenue `
-  --growth-series-type annual_yoy `
-  --output data/db-growth-ranking.json
-```
-
-기본값은 성장률 필터를 통과한 결과만 대상으로 삼습니다. 통과하지 못한 결과까지 함께 비교하려면 `--include-failed-growth`를 추가합니다.
-
-SQLite DB에는 원천 주요 재무계정 row, 표준 기간값, 성장률 포인트, 성장률 필터 결과, 수집 오류가 저장됩니다. `data/`와 DB 파일은 로컬 산출물로 보고 `.gitignore`에 포함합니다.
-
-회사별 성장률 숫자와 차트는 정적 HTML 리포트로 확인할 수 있습니다.
-
-```powershell
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli company-growth-report `
-  --database data/show-me-the-per.sqlite3 `
-  --corp-code 00126380 `
-  --recent-years 10 `
-  --output data/samsung-growth-report.html
-```
-
-DB에 저장된 성장률 필터 결과를 여러 회사 기준으로 비교하는 정적 HTML 랭킹 리포트도 생성할 수 있습니다.
-
-```powershell
-$env:PYTHONPATH="src"
-python -m show_me_the_per.cli growth-ranking-report `
-  --database data/show-me-the-per.sqlite3 `
-  --growth-metric revenue `
-  --growth-series-type annual_yoy `
-  --limit 50 `
-  --output data/growth-ranking-report.html
-```
+1. API 키 준비
+2. 웹 서버 실행
+3. `DB 업데이트`로 이동
+4. `데이터/API 설정` 확인
+5. `KRX 연결 점검 실행`
+6. `회사 목록 동기화`
+7. `새 작업 시작`
+8. 배치 수집 진행
+9. `재무정보`, `VS 기업비교`, `기업필터` 사용
 
 ## 테스트
 
+전체 테스트:
+
 ```powershell
-$env:PYTHONPATH="src"
 python -m unittest discover -s tests -v
 ```
+
+웹 테스트만:
+
+```powershell
+python -m unittest discover -s tests -p "test_web.py" -v
+```
+
+## 문서
+
+- [처음 사용 가이드](docs/getting-started.md)
+- [요구사항 문서](docs/requirements.md)
+- [데이터 수집 전략](docs/data-strategy.md)
+- [스모크 런 가이드](docs/smoke-run.md)
+
+## 참고
+
+이 프로젝트는 현재 웹 UI와 로컬 DB 중심으로 동작합니다.  
+README는 현재 구현 상태에 맞춰 정리했으며, 더 자세한 운영 절차와 키 발급 방법은 [처음 사용 가이드](docs/getting-started.md)를 기준으로 보시면 됩니다.
