@@ -4814,6 +4814,47 @@ def _page_styles() -> str:
       background: #fff5f5;
       color: #b3261e;
     }
+    .diagnostic-card {
+      margin-top: 12px;
+      padding: 14px 16px;
+      border: 1px solid #cfe0ff;
+      border-radius: 8px;
+      background: #f4f8ff;
+      display: grid;
+      gap: 10px;
+    }
+    .diagnostic-heading {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .diagnostic-title {
+      font-size: 15px;
+      font-weight: 800;
+      color: #204b9b;
+    }
+    .diagnostic-copy {
+      font-size: 13px;
+      color: #4d617a;
+    }
+    .diagnostic-button {
+      min-height: 42px;
+      padding: 0 16px;
+      border: 1px solid #8fb0ff;
+      border-radius: 8px;
+      background: #dfeaff;
+      color: #204b9b;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .diagnostic-result {
+      min-height: 20px;
+      font-size: 13px;
+      color: #2f4259;
+      word-break: break-word;
+    }
     .notice {
       padding: 12px 14px;
       margin-bottom: 14px;
@@ -5653,6 +5694,16 @@ def render_ranking_update_panel(
         <strong>새 작업 시작</strong>: 목록 기준으로 배치 job 생성 |
         <strong>전체 DB 초기화</strong>: 전체 캐시 삭제
       </div>
+      <div class="diagnostic-card">
+        <div class="diagnostic-heading">
+          <div>
+            <div class="diagnostic-title">KRX 연결 문제 진단</div>
+            <div class="diagnostic-copy">회사 목록 API와 시세 API를 지금 서버 환경 그대로 점검합니다. 버튼을 누르면 상태 코드와 응답 요약을 바로 확인할 수 있습니다.</div>
+          </div>
+          <button type="button" class="diagnostic-button" id="diagnose-krx-button">KRX 연결 점검 실행</button>
+        </div>
+        <div class="diagnostic-result" id="krx-diagnostic-result">여기에서 회사목록 API와 시세 API의 현재 응답 상태를 바로 보여줍니다.</div>
+      </div>
       <div class="query-form" style="grid-template-columns: repeat(5, minmax(120px, 1fr)); margin-top: 6px;">
         <label class="field">
           <span>대상 범위</span>
@@ -5690,7 +5741,6 @@ def render_ranking_update_panel(
       </div>
       <div class="toolbar-row toolbar-row-dense">
         <div class="segmented">
-          <button type="button" class="segmented-button" id="diagnose-krx-button">KRX 연결 점검</button>
           <button type="button" class="segmented-button" id="sync-company-master-button">회사 목록 동기화</button>
           <button type="button" class="segmented-button" id="create-refresh-job-button">새 작업 시작</button>
           <button type="button" class="segmented-button" id="pause-refresh-job-button">일시정지</button>
@@ -5846,6 +5896,7 @@ def render_ranking_job_script(form: RankingForm) -> str:
       const summaryNode = document.getElementById("refresh-job-summary");
       const messageNode = document.getElementById("refresh-job-message");
       const diagnoseButton = document.getElementById("diagnose-krx-button");
+      const diagnosticResultNode = document.getElementById("krx-diagnostic-result");
       const syncButton = document.getElementById("sync-company-master-button");
       const createButton = document.getElementById("create-refresh-job-button");
       const pauseButton = document.getElementById("pause-refresh-job-button");
@@ -5889,6 +5940,12 @@ def render_ranking_job_script(form: RankingForm) -> str:
       const setMessage = (value) => {{
         if (messageNode) {{
           messageNode.textContent = value;
+        }}
+      }};
+
+      const setDiagnosticResult = (value) => {{
+        if (diagnosticResultNode) {{
+          diagnosticResultNode.textContent = value;
         }}
       }};
 
@@ -5973,11 +6030,14 @@ def render_ranking_job_script(form: RankingForm) -> str:
       if (diagnoseButton) {{
         diagnoseButton.addEventListener("click", async () => {{
           setMessage("KRX 연결을 점검하고 있습니다...");
+          setDiagnosticResult("KRX 연결을 점검하고 있습니다...");
           try {{
             const payload = await callJson("/ranking/krx-diagnostics", "POST", {{}});
             setMessage(payload.message || "KRX 연결 점검 완료");
+            setDiagnosticResult(payload.message || "KRX 연결 점검 완료");
           }} catch (error) {{
             setMessage(String(error.message || error));
+            setDiagnosticResult(String(error.message || error));
           }}
         }});
       }}
@@ -6289,7 +6349,7 @@ def _format_datetime_text(value: object) -> str:
         return text
 
 
-def render_ranking_update_panel(
+def _render_ranking_update_panel_duplicate(
     form: RankingForm,
     company_master_status: dict[str, object],
     update_job: dict[str, object],
