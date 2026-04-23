@@ -6354,7 +6354,13 @@ def _growth_period_input_name(*, series_type: str, metric: str) -> str:
     return f"growth_period__{series_type}__{metric}"
 
 
-def _growth_threshold_input_name(*, series_type: str) -> str:
+def _growth_threshold_input_name(
+    *,
+    series_type: str,
+    metric: str | None = None,
+) -> str:
+    if metric:
+        return f"growth_threshold__{series_type}__{metric}"
     return f"growth_threshold__{series_type}"
 
 
@@ -6372,10 +6378,15 @@ def _read_growth_period_inputs(request: Request) -> dict[str, str]:
 def _read_growth_threshold_inputs(request: Request) -> dict[str, str]:
     values: dict[str, str] = {}
     for series_type in GROWTH_CONDITION_SERIES:
-        key = _growth_threshold_input_name(series_type=series_type)
-        raw_value = request.query_params.get(key)
-        if raw_value is not None:
-            values[key] = str(raw_value).strip()
+        legacy_key = _growth_threshold_input_name(series_type=series_type)
+        legacy_value = request.query_params.get(legacy_key)
+        if legacy_value is not None:
+            values[legacy_key] = str(legacy_value).strip()
+        for metric in GROWTH_CONDITION_METRICS:
+            key = _growth_threshold_input_name(series_type=series_type, metric=metric)
+            raw_value = request.query_params.get(key)
+            if raw_value is not None:
+                values[key] = str(raw_value).strip()
     return values
 
 
@@ -6427,12 +6438,19 @@ def _ranking_selected_conditions(form: RankingForm) -> list[dict[str, object]]:
     enriched_conditions: list[dict[str, object]] = []
     for condition in selected_conditions:
         series_type = str(condition["series_type"])
+        metric = str(condition["metric"])
         enriched_conditions.append(
             {
                 **condition,
                 "threshold_percent": threshold_inputs.get(
-                    _growth_threshold_input_name(series_type=series_type),
-                    default_threshold,
+                    _growth_threshold_input_name(
+                        series_type=series_type,
+                        metric=metric,
+                    ),
+                    threshold_inputs.get(
+                        _growth_threshold_input_name(series_type=series_type),
+                        default_threshold,
+                    ),
                 ),
             }
         )
@@ -6462,11 +6480,15 @@ def _ranking_condition_threshold_value(
     form: RankingForm,
     *,
     series_type: str,
+    metric: str,
 ) -> str:
-    key = _growth_threshold_input_name(series_type=series_type)
+    key = _growth_threshold_input_name(series_type=series_type, metric=metric)
     threshold_inputs = _growth_threshold_input_map(form)
     if key in threshold_inputs and str(threshold_inputs[key]).strip():
         return str(threshold_inputs[key]).strip()
+    legacy_key = _growth_threshold_input_name(series_type=series_type)
+    if legacy_key in threshold_inputs and str(threshold_inputs[legacy_key]).strip():
+        return str(threshold_inputs[legacy_key]).strip()
     return str(form.threshold_percent or DEFAULT_THRESHOLD_PERCENT)
 
 
@@ -6828,11 +6850,6 @@ def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
     for series_type in GROWTH_CONDITION_SERIES:
         cells = []
         unit = growth_condition_period_unit(series_type)
-        threshold_input_name = _growth_threshold_input_name(series_type=series_type)
-        threshold_value = _ranking_condition_threshold_value(
-            form,
-            series_type=series_type,
-        )
         for metric in GROWTH_CONDITION_METRICS:
             value = _growth_condition_value(series_type=series_type, metric=metric)
             checked = " checked" if (series_type, metric) in selected_keys else ""
@@ -6841,6 +6858,15 @@ def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
                 metric=metric,
             )
             period_value = _ranking_condition_period_value(
+                form,
+                series_type=series_type,
+                metric=metric,
+            )
+            threshold_input_name = _growth_threshold_input_name(
+                series_type=series_type,
+                metric=metric,
+            )
+            threshold_value = _ranking_condition_threshold_value(
                 form,
                 series_type=series_type,
                 metric=metric,
@@ -6856,18 +6882,16 @@ def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
                 f'<input class="matrix-period-input" type="number" min="1" name="{escape(period_input_name)}" value="{escape(period_value)}" inputmode="numeric">'
                 f'<span class="matrix-period-unit">{escape(unit)}</span>'
                 "</label>"
+                '<label class="matrix-threshold-label">'
+                f'<input class="matrix-threshold-input" type="number" min="0" step="0.1" name="{escape(threshold_input_name)}" value="{escape(threshold_value)}" inputmode="decimal">'
+                '<span class="matrix-period-unit">%</span>'
+                "</label>"
                 "</div>"
                 "</td>"
             )
         body_rows.append(
             "<tr>"
             f"<th>{escape(GROWTH_SERIES_LABELS.get(series_type, series_type))}</th>"
-            "<td>"
-            '<label class="matrix-threshold-label">'
-            f'<input class="matrix-threshold-input" type="number" min="0" step="0.1" name="{escape(threshold_input_name)}" value="{escape(threshold_value)}" inputmode="decimal">'
-            '<span class="matrix-period-unit">%</span>'
-            "</label>"
-            "</td>"
             f"{''.join(cells)}"
             "</tr>"
         )
@@ -6875,7 +6899,7 @@ def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
         '<div class="panel" style="margin-top:10px;padding:10px 12px;">'
         '<div class="matrix-heading">성장률 조건 선택</div>'
         '<table class="matrix-table">'
-        f"<thead><tr><th>구분</th><th>기준</th>{header_cells}</tr></thead>"
+        f"<thead><tr><th>구분</th>{header_cells}</tr></thead>"
         f"<tbody>{''.join(body_rows)}</tbody>"
         "</table>"
         "</div>"

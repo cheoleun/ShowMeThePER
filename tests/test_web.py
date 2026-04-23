@@ -1020,7 +1020,9 @@ class WebTests(TestCase):
         self.assertIn('name="growth_condition_key"', response.text)
         self.assertIn('name="growth_period__annual_yoy__revenue"', response.text)
         self.assertIn('value="3"', response.text)
-        self.assertIn('name="growth_threshold__annual_yoy"', response.text)
+        self.assertIn('name="growth_threshold__annual_yoy__revenue"', response.text)
+        self.assertIn('name="growth_threshold__annual_yoy__operating_income"', response.text)
+        self.assertIn('name="growth_threshold__annual_yoy__net_income"', response.text)
         self.assertIn('value="20"', response.text)
         self.assertIn('name="growth_period__quarterly_qoq__net_income"', response.text)
         self.assertIn('value="12"', response.text)
@@ -1040,6 +1042,7 @@ class WebTests(TestCase):
         self.assertNotIn("KRX 연결 점검 실행", response.text)
         self.assertNotIn("전체 DB 초기화", response.text)
         self.assertNotIn("krx-diagnostic-result", response.text)
+        self.assertNotIn("<th>기준</th>", response.text)
         self.assertNotIn(">요약</a>", response.text)
         self.assertNotIn('class="top-tab">성장률</a>', response.text)
 
@@ -1215,7 +1218,7 @@ class WebTests(TestCase):
                         ("threshold_percent", "20"),
                         ("growth_condition_key", "annual_yoy:revenue"),
                         ("growth_period__annual_yoy__revenue", "1"),
-                        ("growth_threshold__annual_yoy", "15"),
+                        ("growth_threshold__annual_yoy__revenue", "15"),
                     ],
                 )
 
@@ -1224,6 +1227,59 @@ class WebTests(TestCase):
         self.assertIn("조건에 맞는 기업", response.text)
         self.assertNotIn("성장률 랭킹", response.text)
         self.assertIn("growth_condition=annual_yoy%3Arevenue%3A1", str(response.url))
+        self.assertIn("growth_threshold__annual_yoy__revenue=15", str(response.url))
+
+    def test_ranking_page_supports_legacy_series_threshold_query(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "3",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.get(
+                    "/ranking",
+                    params=[
+                        ("submitted", "1"),
+                        ("end_year", "2025"),
+                        ("fs_div", "CFS"),
+                        ("threshold_percent", "20"),
+                        ("growth_condition_key", "annual_yoy:revenue"),
+                        ("growth_threshold__annual_yoy", "15"),
+                    ],
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('name="growth_threshold__annual_yoy__revenue"', response.text)
+        self.assertIn(
+            'name="growth_threshold__annual_yoy__revenue" value="15"',
+            response.text,
+        )
         self.assertIn("growth_threshold__annual_yoy=15", str(response.url))
 
     def test_ranking_top_tabs_restore_analysis_context(self) -> None:
