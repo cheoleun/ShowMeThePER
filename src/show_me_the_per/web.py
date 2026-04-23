@@ -5313,8 +5313,8 @@ def _page_styles() -> str:
       grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) repeat(3, minmax(120px, 0.7fr)) auto;
     }
     .query-form-ranking {
-      grid-template-columns: repeat(3, minmax(180px, 1fr));
-      gap: 10px 12px;
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: 8px 10px;
     }
     .query-form-ranking .field {
       gap: 4px;
