@@ -512,6 +512,7 @@ def _build_growth_checks(
         series_type = str(condition["series_type"])
         metric = str(condition["metric"])
         recent_periods = int(condition["recent_periods"])
+        condition_threshold = _parse_decimal(condition.get("threshold_percent")) or threshold_percent
         points = point_index.get((series_type, metric), [])
         minimum_growth_rate = minimum_recent_growth_rate(
             points,
@@ -527,12 +528,13 @@ def _build_growth_checks(
                 series_type,
                 recent_periods,
             ),
+            "threshold_percent": _decimal_to_string(condition_threshold),
             "minimum_growth_rate": None
             if minimum_growth_rate is None
             else str(minimum_growth_rate),
             "passed": passes_recent_growth_threshold(
                 points,
-                threshold_percent=threshold_percent,
+                threshold_percent=condition_threshold,
                 recent_periods=recent_periods,
             ),
         }
@@ -685,11 +687,20 @@ def _validate_growth_condition(condition: dict[str, object]) -> dict[str, object
         raise ValueError(
             f"growth recent periods must be a positive integer: {recent_periods}"
         )
-    return {
+    normalized = {
         "metric": metric,
         "series_type": series_type,
         "recent_periods": recent_periods,
     }
+    raw_threshold_percent = condition.get("threshold_percent")
+    if raw_threshold_percent not in {None, ""}:
+        threshold_percent = _parse_decimal(raw_threshold_percent)
+        if threshold_percent is None or threshold_percent < 0:
+            raise ValueError(
+                f"growth threshold percent must be a non-negative number: {raw_threshold_percent}"
+            )
+        normalized["threshold_percent"] = _decimal_to_string(threshold_percent)
+    return normalized
 
 
 def _dict(value: object) -> dict[str, object]:
@@ -725,6 +736,7 @@ def _build_growth_rankings_from_points(
     metric = str(condition["metric"])
     series_type = str(condition["series_type"])
     recent_periods = int(condition["recent_periods"])
+    condition_threshold = _parse_decimal(condition.get("threshold_percent")) or threshold_percent
 
     for corp_code, point_index in grouped_points.items():
         points = point_index.get((series_type, metric), [])
@@ -734,7 +746,7 @@ def _build_growth_rankings_from_points(
         )
         passed = passes_recent_growth_threshold(
             points,
-            threshold_percent=threshold_percent,
+            threshold_percent=condition_threshold,
             recent_periods=recent_periods,
         )
         if minimum_growth_rate is None:

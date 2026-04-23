@@ -7,7 +7,7 @@ from html import escape
 import os
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -98,6 +98,12 @@ DEFAULT_PERIOD_KEY = "quarterly"
 DEFAULT_METRIC_KEY = "revenue"
 DEFAULT_ANALYSIS_TAB = "financials"
 ANALYSIS_TABS = ("overview", "financials", "growth")
+TAB_RETURN_PARAM_KEYS = (
+    "return_analysis",
+    "return_compare",
+    "return_ranking",
+    "return_db_update",
+)
 DEFAULT_RANKING_SORT_BY = "market_cap"
 DEFAULT_MARKET_FILTER = "ALL"
 DEFAULT_RANKING_DISPLAY_LIMIT = 100
@@ -212,6 +218,10 @@ class AnalysisForm:
     threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
     top_tab: str = DEFAULT_ANALYSIS_TAB
     refresh: str = ""
+    return_analysis: str = ""
+    return_compare: str = ""
+    return_ranking: str = ""
+    return_db_update: str = ""
 
 
 @dataclass(frozen=True)
@@ -222,12 +232,17 @@ class CompareForm:
     end_year: str = ""
     fs_div: str = "CFS"
     threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
+    return_analysis: str = ""
+    return_compare: str = ""
+    return_ranking: str = ""
+    return_db_update: str = ""
 
 
 @dataclass(frozen=True)
 class RankingForm:
     growth_conditions: tuple[str, ...] = DEFAULT_RANKING_GROWTH_CONDITIONS
     growth_period_inputs: tuple[tuple[str, str], ...] = ()
+    growth_threshold_inputs: tuple[tuple[str, str], ...] = ()
     market: str = DEFAULT_MARKET_FILTER
     recent_years: str = str(DEFAULT_RECENT_YEARS)
     display_limit: str = str(DEFAULT_RANKING_DISPLAY_LIMIT)
@@ -235,6 +250,11 @@ class RankingForm:
     fs_div: str = "CFS"
     threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
     sort_by: str = DEFAULT_RANKING_SORT_BY
+    submitted: str = ""
+    return_analysis: str = ""
+    return_compare: str = ""
+    return_ranking: str = ""
+    return_db_update: str = ""
 
 
 def create_app(
@@ -260,6 +280,10 @@ def create_app(
         threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
         tab: str = DEFAULT_ANALYSIS_TAB,
         refresh: str = "",
+        return_analysis: str = "",
+        return_compare: str = "",
+        return_ranking: str = "",
+        return_db_update: str = "",
     ) -> HTMLResponse:
         form = AnalysisForm(
             company_query=(company_query or corp_code).strip(),
@@ -269,6 +293,10 @@ def create_app(
             threshold_percent=threshold_percent.strip(),
             top_tab=_normalize_analysis_tab(tab),
             refresh=refresh.strip(),
+            return_analysis=_normalize_return_href(return_analysis),
+            return_compare=_normalize_return_href(return_compare),
+            return_ranking=_normalize_return_href(return_ranking),
+            return_db_update=_normalize_return_href(return_db_update),
         )
 
         try:
@@ -310,6 +338,9 @@ def create_app(
             list_opendart_api_keys(_settings_database_path())
         )
         payload["opendart_key_source"] = _selected_opendart_api_key()[1]
+        payload["update_job"] = read_latest_refresh_job(
+            _web_cache_database_path(str(request["fs_div"] or "ALL"))
+        ) or {}
         return HTMLResponse(render_analysis_page(form=form, payload=payload))
 
     @app.get("/compare", response_class=HTMLResponse)
@@ -320,6 +351,10 @@ def create_app(
         end_year: str = "",
         fs_div: str = "CFS",
         threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
+        return_analysis: str = "",
+        return_compare: str = "",
+        return_ranking: str = "",
+        return_db_update: str = "",
     ) -> HTMLResponse:
         form = CompareForm(
             primary_company_query=primary_company_query.strip(),
@@ -328,6 +363,10 @@ def create_app(
             end_year=end_year.strip() or str(default_end_year()),
             fs_div=fs_div.strip().upper() or "CFS",
             threshold_percent=threshold_percent.strip(),
+            return_analysis=_normalize_return_href(return_analysis),
+            return_compare=_normalize_return_href(return_compare),
+            return_ranking=_normalize_return_href(return_ranking),
+            return_db_update=_normalize_return_href(return_db_update),
         )
 
         if not form.primary_company_query and not form.secondary_company_query:
@@ -385,6 +424,9 @@ def create_app(
                         list_opendart_api_keys(_settings_database_path())
                     ),
                     "opendart_key_source": _selected_opendart_api_key()[1],
+                    "update_job": read_latest_refresh_job(
+                        _web_cache_database_path(str(request["fs_div"] or "ALL"))
+                    ) or {},
                 },
             )
         )
@@ -401,8 +443,14 @@ def create_app(
         fs_div: str = "CFS",
         threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
         sort_by: str = DEFAULT_RANKING_SORT_BY,
+        submitted: str = "",
+        return_analysis: str = "",
+        return_compare: str = "",
+        return_ranking: str = "",
+        return_db_update: str = "",
     ) -> HTMLResponse:
         growth_period_inputs = _read_growth_period_inputs(request)
+        growth_threshold_inputs = _read_growth_threshold_inputs(request)
         form = RankingForm(
             growth_conditions=tuple(
                 growth_condition
@@ -410,6 +458,7 @@ def create_app(
                 or DEFAULT_RANKING_GROWTH_CONDITIONS
             ),
             growth_period_inputs=tuple(growth_period_inputs.items()),
+            growth_threshold_inputs=tuple(growth_threshold_inputs.items()),
             market=(market or DEFAULT_MARKET_FILTER).strip().upper() or DEFAULT_MARKET_FILTER,
             recent_years=recent_years.strip(),
             display_limit=display_limit.strip(),
@@ -417,7 +466,20 @@ def create_app(
             fs_div=fs_div.strip().upper() or "CFS",
             threshold_percent=threshold_percent.strip(),
             sort_by=sort_by.strip() or DEFAULT_RANKING_SORT_BY,
+            submitted=submitted.strip(),
+            return_analysis=_normalize_return_href(return_analysis),
+            return_compare=_normalize_return_href(return_compare),
+            return_ranking=_normalize_return_href(return_ranking),
+            return_db_update=_normalize_return_href(return_db_update),
         )
+
+        if not _parse_submitted(form.submitted):
+            return HTMLResponse(
+                render_ranking_page(
+                    form=form,
+                    update_job=read_latest_refresh_job(_web_cache_database_path(form.fs_div)) or {},
+                )
+            )
 
         try:
             ranking_request = parse_ranking_request(form)
@@ -441,10 +503,16 @@ def create_app(
                     market=form.market,
                     recent_years=form.recent_years,
                     display_limit=form.display_limit,
+                    growth_threshold_inputs=growth_threshold_inputs,
                     end_year=form.end_year or str(default_end_year()),
                     fs_div=form.fs_div,
                     threshold_percent=form.threshold_percent,
                     sort_by=form.sort_by,
+                    submitted=True,
+                    return_analysis=form.return_analysis,
+                    return_compare=form.return_compare,
+                    return_ranking=form.return_ranking,
+                    return_db_update=form.return_db_update,
                 ),
                 status_code=303,
             )
@@ -482,8 +550,13 @@ def create_app(
         fs_div: str = "CFS",
         threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
         sort_by: str = DEFAULT_RANKING_SORT_BY,
+        return_analysis: str = "",
+        return_compare: str = "",
+        return_ranking: str = "",
+        return_db_update: str = "",
     ) -> HTMLResponse:
         growth_period_inputs = _read_growth_period_inputs(request)
+        growth_threshold_inputs = _read_growth_threshold_inputs(request)
         form = RankingForm(
             growth_conditions=tuple(
                 growth_condition
@@ -491,6 +564,7 @@ def create_app(
                 or DEFAULT_RANKING_GROWTH_CONDITIONS
             ),
             growth_period_inputs=tuple(growth_period_inputs.items()),
+            growth_threshold_inputs=tuple(growth_threshold_inputs.items()),
             market=(market or DEFAULT_MARKET_FILTER).strip().upper() or DEFAULT_MARKET_FILTER,
             recent_years=recent_years.strip(),
             display_limit=display_limit.strip(),
@@ -498,6 +572,10 @@ def create_app(
             fs_div=fs_div.strip().upper() or "CFS",
             threshold_percent=threshold_percent.strip(),
             sort_by=sort_by.strip() or DEFAULT_RANKING_SORT_BY,
+            return_analysis=_normalize_return_href(return_analysis),
+            return_compare=_normalize_return_href(return_compare),
+            return_ranking=_normalize_return_href(return_ranking),
+            return_db_update=_normalize_return_href(return_db_update),
         )
 
         try:
@@ -956,6 +1034,11 @@ def parse_compare_request(form: CompareForm) -> dict[str, object]:
 def _parse_refresh(value: object) -> bool:
     normalized = str(value or "").strip().lower()
     return normalized in {"1", "true", "yes", "on"}
+
+
+def _parse_submitted(value: object) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "on", "submit"}
 
 
 def parse_ranking_request(form: RankingForm) -> dict[str, object]:
@@ -1803,6 +1886,10 @@ def render_analysis_page(
         if payload is not None
         else render_analysis_empty_state()
     )
+    body_html += render_background_refresh_job_script(
+        _dict(_dict(payload or {}).get("update_job")),
+        fs_div=form.fs_div,
+    )
     return render_shell(
         company_title=company_title,
         top_tabs_html=top_tabs_html,
@@ -1827,16 +1914,21 @@ def render_compare_page(
             f"{_company_name(_dict(primary))} VS {_company_name(_dict(secondary))}"
         )
 
+    content_html = (
+        render_compare_dashboard(_dict(payload))
+        if payload is not None
+        else render_compare_empty_state(form)
+    )
+    content_html += render_background_refresh_job_script(
+        _dict(_dict(payload or {}).get("update_job")),
+        fs_div=form.fs_div,
+    )
     return render_shell(
         company_title=company_title,
         top_tabs_html=render_compare_top_tabs(form, payload),
         settings_html="",
         toolbar_html=render_compare_header(form, payload),
-        content_html=(
-            render_compare_dashboard(_dict(payload))
-            if payload is not None
-            else render_compare_empty_state(form)
-        ),
+        content_html=content_html,
         message_html=render_message(error=error),
     )
 
@@ -1934,6 +2026,76 @@ def render_shared_settings_panel(payload: dict[str, object] | None = None) -> st
     """
 
 
+def render_background_refresh_job_script(
+    update_job: dict[str, object] | None,
+    *,
+    fs_div: str,
+) -> str:
+    job = _dict(update_job)
+    job_id = int(job.get("id", 0) or 0)
+    if job_id <= 0 or str(job.get("status", "")).strip().lower() != "running":
+        return ""
+    return f"""
+    <script>
+    (() => {{
+      if (document.querySelector("[data-refresh-panel]")) {{
+        return;
+      }}
+      const jobId = {job_id};
+      const fsDiv = "{escape(fs_div or 'CFS')}";
+      let pumpTimer = null;
+      let pumpBusy = false;
+
+      const callJson = async (url, method = "GET") => {{
+        const response = await fetch(url, {{ method }});
+        const payload = await response.json();
+        if (!response.ok) {{
+          throw new Error(payload.message || "요청 처리 중 오류가 발생했습니다.");
+        }}
+        return payload;
+      }};
+
+      const schedulePump = () => {{
+        if (pumpTimer) {{
+          window.clearTimeout(pumpTimer);
+        }}
+        pumpTimer = window.setTimeout(runPump, 1500);
+      }};
+
+      const runPump = async () => {{
+        if (pumpBusy) {{
+          schedulePump();
+          return;
+        }}
+        pumpBusy = true;
+        try {{
+          const statusPayload = await callJson(`/ranking/update-jobs/${{jobId}}?fs_div=${{encodeURIComponent(fsDiv)}}`);
+          const job = statusPayload.job;
+          if (!job || job.status !== "running") {{
+            return;
+          }}
+          const nextPayload = await callJson(`/ranking/update-jobs/${{jobId}}/run-next-batch?fs_div=${{encodeURIComponent(fsDiv)}}`, "POST");
+          if (nextPayload.job && nextPayload.job.status === "running") {{
+            schedulePump();
+          }}
+        }} catch (error) {{
+          schedulePump();
+        }} finally {{
+          pumpBusy = false;
+        }}
+      }};
+
+      schedulePump();
+      window.addEventListener("beforeunload", () => {{
+        if (pumpTimer) {{
+          window.clearTimeout(pumpTimer);
+        }}
+      }});
+    }})();
+    </script>
+    """
+
+
 def render_analysis_top_tabs(
     form: AnalysisForm,
     payload: dict[str, object] | None,
@@ -1946,37 +2108,68 @@ def render_analysis_top_tabs(
         summary.get("threshold_percent", form.threshold_percent or DEFAULT_THRESHOLD_PERCENT)
     )
     fs_div = _analysis_form_fs_div(form, summary)
-    compare_href = _build_compare_href(
+    current_analysis_href = _build_analysis_href(
+        company_query=company_query,
+        recent_years=recent_years,
+        end_year=end_year,
+        fs_div=fs_div,
+        threshold_percent=threshold_percent,
+        top_tab="financials",
+        fragment="financials-details",
+    )
+    compare_href = form.return_compare or _build_compare_href(
         primary_company_query=company_query,
         recent_years=recent_years,
         end_year=end_year,
         fs_div=fs_div,
         threshold_percent=threshold_percent,
     )
-    ranking_href = _build_ranking_href(
+    ranking_href = form.return_ranking or _build_ranking_href(
         recent_years=recent_years,
         end_year=end_year,
         fs_div=fs_div,
         threshold_percent=threshold_percent,
+        return_analysis=current_analysis_href,
     )
-    db_update_href = _build_db_update_href(
+    db_update_href = form.return_db_update or _build_db_update_href(
         recent_years=recent_years,
         end_year=end_year,
         fs_div=fs_div,
         threshold_percent=threshold_percent,
+        return_analysis=current_analysis_href,
+    )
+    compare_href = _append_tab_return_params(
+        compare_href,
+        return_analysis=current_analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    ranking_href = _append_tab_return_params(
+        ranking_href,
+        return_analysis=current_analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    db_update_href = _append_tab_return_params(
+        db_update_href,
+        return_analysis=current_analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    current_analysis_href = _append_tab_return_params(
+        current_analysis_href,
+        return_analysis=current_analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
     )
     tabs = (
         (
             "재무정보",
-            _build_analysis_href(
-                company_query=company_query,
-                recent_years=recent_years,
-                end_year=end_year,
-                fs_div=fs_div,
-                threshold_percent=threshold_percent,
-                top_tab="financials",
-                fragment="financials-details",
-            ),
+            current_analysis_href,
             "financials",
         ),
         ("VS 기업비교", compare_href, "compare"),
@@ -1998,52 +2191,76 @@ def render_compare_top_tabs(
     secondary_company_query = str(
         form.secondary_company_query or _dict(secondary_company).get("corp_name", "")
     )
+    current_analysis_href = form.return_analysis or _build_analysis_href(
+        company_query=primary_company_query,
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        top_tab="financials",
+        fragment="financials-details",
+    )
+    current_compare_href = _build_compare_href(
+        primary_company_query=primary_company_query,
+        secondary_company_query=secondary_company_query,
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+    )
+    ranking_href = form.return_ranking or _build_ranking_href(
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+    )
+    db_update_href = form.return_db_update or _build_db_update_href(
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+    )
+    current_analysis_href = _append_tab_return_params(
+        current_analysis_href,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    current_compare_href = _append_tab_return_params(
+        current_compare_href,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    ranking_href = _append_tab_return_params(
+        ranking_href,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
+    db_update_href = _append_tab_return_params(
+        db_update_href,
+        return_analysis=current_analysis_href,
+        return_compare=current_compare_href,
+        return_ranking=ranking_href,
+        return_db_update=db_update_href,
+    )
     tabs = (
         (
             "재무정보",
-            _build_analysis_href(
-                company_query=primary_company_query,
-                recent_years=form.recent_years,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-                top_tab="financials",
-                fragment="financials-details",
-            ),
+            current_analysis_href,
             "financials",
         ),
-        (
-            "VS 기업비교",
-            _build_compare_href(
-                primary_company_query=primary_company_query,
-                secondary_company_query=secondary_company_query,
-                recent_years=form.recent_years,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-            ),
-            "compare",
-        ),
-        (
-            "기업필터",
-            _build_ranking_href(
-                recent_years=form.recent_years,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-            ),
-            "ranking",
-        ),
-        (
-            "DB 업데이트",
-            _build_db_update_href(
-                recent_years=form.recent_years,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-            ),
-            "db-update",
-        ),
+        ("VS 기업비교", current_compare_href, "compare"),
+        ("기업필터", ranking_href, "ranking"),
+        ("DB 업데이트", db_update_href, "db-update"),
     )
     return render_top_tabs("compare", tabs)
 
@@ -2604,7 +2821,7 @@ def _default_metric_for_period_groups(groups: list[dict[str, object]]) -> str:
 
 
 def render_snapshot_matrix(group: dict[str, object]) -> str:
-    rows = [_dict(row) for row in _list(group.get("rows"))[:5]]
+    rows = [_dict(row) for row in reversed(_list(group.get("rows"))[:5])]
     metrics = _available_metrics_for_rows(rows)
     headers = "".join(
         f"<th>{escape(str(row.get('period', '')))}</th>"
@@ -2701,7 +2918,7 @@ def render_ranking_empty_state() -> str:
     return """
     <section class="empty-state panel">
       <h2>기업필터</h2>
-      <p>DB에 저장된 재무 데이터와 시장 정보 스냅샷을 조합해 조건에 맞는 기업을 걸러냅니다.</p>
+      <p>조건을 설정한 뒤 조회를 누르면, DB에 저장된 재무 데이터와 시장 정보 스냅샷을 기준으로 조건에 맞는 기업을 보여줍니다.</p>
       <ul class="empty-list">
         <li>먼저 재무정보 화면에서 몇 개 기업을 조회해 DB 캐시를 채워 주세요.</li>
         <li>회사 목록 동기화와 배치 업데이트는 DB 업데이트 페이지에서 진행할 수 있습니다.</li>
@@ -4828,6 +5045,42 @@ def _option(value: str, label: str, selected: str) -> str:
     )
 
 
+def _normalize_return_href(value: object) -> str:
+    text = str(value or "").strip()
+    if not text.startswith("/"):
+        return ""
+    return text
+
+
+def _append_tab_return_params(
+    href: str,
+    *,
+    return_analysis: str = "",
+    return_compare: str = "",
+    return_ranking: str = "",
+    return_db_update: str = "",
+) -> str:
+    normalized_href = str(href or "").strip()
+    if not normalized_href:
+        return ""
+    split = urlsplit(normalized_href)
+    params = [
+        (key, value)
+        for key, value in parse_qsl(split.query, keep_blank_values=True)
+        if key not in TAB_RETURN_PARAM_KEYS
+    ]
+    for key, value in (
+        ("return_analysis", _normalize_return_href(return_analysis)),
+        ("return_compare", _normalize_return_href(return_compare)),
+        ("return_ranking", _normalize_return_href(return_ranking)),
+        ("return_db_update", _normalize_return_href(return_db_update)),
+    ):
+        if value:
+            params.append((key, value))
+    query = urlencode(params)
+    return urlunsplit(("", "", split.path, query, split.fragment))
+
+
 def _build_analysis_href(
     *,
     company_query: str,
@@ -5497,8 +5750,22 @@ def _page_styles() -> str:
     .matrix-check-label {
       font-weight: 600;
     }
+    .matrix-threshold-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+    }
     .matrix-period-input {
       width: 60px;
+      min-height: 30px;
+      height: 30px;
+      padding: 3px 6px;
+      font-size: 13px;
+      line-height: 1.2;
+    }
+    .matrix-threshold-input {
+      width: 58px;
       min-height: 30px;
       height: 30px;
       padding: 3px 6px;
@@ -6087,6 +6354,10 @@ def _growth_period_input_name(*, series_type: str, metric: str) -> str:
     return f"growth_period__{series_type}__{metric}"
 
 
+def _growth_threshold_input_name(*, series_type: str) -> str:
+    return f"growth_threshold__{series_type}"
+
+
 def _read_growth_period_inputs(request: Request) -> dict[str, str]:
     values: dict[str, str] = {}
     for series_type in GROWTH_CONDITION_SERIES:
@@ -6098,6 +6369,16 @@ def _read_growth_period_inputs(request: Request) -> dict[str, str]:
     return values
 
 
+def _read_growth_threshold_inputs(request: Request) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for series_type in GROWTH_CONDITION_SERIES:
+        key = _growth_threshold_input_name(series_type=series_type)
+        raw_value = request.query_params.get(key)
+        if raw_value is not None:
+            values[key] = str(raw_value).strip()
+    return values
+
+
 def _growth_period_input_map(form: RankingForm) -> dict[str, str]:
     return {
         str(key): str(value)
@@ -6106,8 +6387,17 @@ def _growth_period_input_map(form: RankingForm) -> dict[str, str]:
     }
 
 
+def _growth_threshold_input_map(form: RankingForm) -> dict[str, str]:
+    return {
+        str(key): str(value)
+        for key, value in form.growth_threshold_inputs
+        if str(key).strip()
+    }
+
+
 def _ranking_selected_conditions(form: RankingForm) -> list[dict[str, object]]:
     period_inputs = _growth_period_input_map(form)
+    threshold_inputs = _growth_threshold_input_map(form)
     raw_conditions = list(form.growth_conditions or DEFAULT_RANKING_GROWTH_CONDITIONS)
     normalized_conditions: list[dict[str, object] | str] = []
     for raw_condition in raw_conditions:
@@ -6132,7 +6422,21 @@ def _ranking_selected_conditions(form: RankingForm) -> list[dict[str, object]]:
             )
             continue
         normalized_conditions.append(text)
-    return normalize_growth_conditions(normalized_conditions)
+    selected_conditions = normalize_growth_conditions(normalized_conditions)
+    default_threshold = str(form.threshold_percent or DEFAULT_THRESHOLD_PERCENT)
+    enriched_conditions: list[dict[str, object]] = []
+    for condition in selected_conditions:
+        series_type = str(condition["series_type"])
+        enriched_conditions.append(
+            {
+                **condition,
+                "threshold_percent": threshold_inputs.get(
+                    _growth_threshold_input_name(series_type=series_type),
+                    default_threshold,
+                ),
+            }
+        )
+    return enriched_conditions
 
 
 def _ranking_condition_period_value(
@@ -6152,6 +6456,18 @@ def _ranking_condition_period_value(
         ):
             return str(condition["recent_periods"])
     return str(default_recent_periods_for_series(series_type))
+
+
+def _ranking_condition_threshold_value(
+    form: RankingForm,
+    *,
+    series_type: str,
+) -> str:
+    key = _growth_threshold_input_name(series_type=series_type)
+    threshold_inputs = _growth_threshold_input_map(form)
+    if key in threshold_inputs and str(threshold_inputs[key]).strip():
+        return str(threshold_inputs[key]).strip()
+    return str(form.threshold_percent or DEFAULT_THRESHOLD_PERCENT)
 
 
 def _ranking_recent_years_from_conditions(
@@ -6189,7 +6505,20 @@ def _analysis_recent_years_from_ranking_filters(filters: dict[str, object]) -> i
 
 
 def parse_ranking_request(form: RankingForm) -> dict[str, object]:
-    growth_conditions = _ranking_selected_conditions(form)
+    raw_growth_conditions = _ranking_selected_conditions(form)
+    growth_conditions: list[dict[str, object]] = []
+    for condition in raw_growth_conditions:
+        series_type = str(condition.get("series_type", "") or "")
+        threshold_percent = _parse_decimal(
+            condition.get("threshold_percent"),
+            field_name=f"{GROWTH_SERIES_LABELS.get(series_type, series_type)} 성장률 기준",
+        )
+        growth_conditions.append(
+            {
+                **condition,
+                "threshold_percent": str(threshold_percent),
+            }
+        )
     end_year = _parse_int(
         form.end_year or str(default_end_year()),
         field_name="기준 연도",
@@ -6223,66 +6552,93 @@ def render_ranking_page(
     *,
     form: RankingForm,
     payload: dict[str, object] | None = None,
+    update_job: dict[str, object] | None = None,
     error: str | None = None,
 ) -> str:
+    content_html = (
+        render_ranking_results(_dict(payload))
+        if payload is not None
+        else render_ranking_empty_state()
+    )
+    content_html += render_background_refresh_job_script(
+        _dict(_dict(payload or {}).get("update_job")) or _dict(update_job),
+        fs_div=form.fs_div,
+    )
     return render_shell(
         company_title="기업필터",
         top_tabs_html=render_ranking_top_tabs(form),
         settings_html="",
         toolbar_html=render_ranking_header(form, payload=_dict(payload)),
-        content_html=(
-            (
-                render_ranking_results(_dict(payload))
-                if payload is not None
-                else render_ranking_empty_state()
-            )
-        ),
+        content_html=content_html,
         message_html=render_message(error=error),
     )
 
 
 def render_ranking_top_tabs(form: RankingForm) -> str:
+    current_ranking_href = _build_ranking_href(
+        growth_conditions=form.growth_conditions,
+        growth_threshold_inputs=_growth_threshold_input_map(form),
+        market=form.market,
+        recent_years=form.recent_years,
+        display_limit=form.display_limit,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        sort_by=form.sort_by,
+        submitted=_parse_submitted(form.submitted),
+    )
+    analysis_href = form.return_analysis or "/"
+    compare_href = form.return_compare or _build_compare_href(
+        primary_company_query="",
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+    )
+    db_update_href = form.return_db_update or _build_db_update_href(
+        growth_conditions=form.growth_conditions,
+        growth_threshold_inputs=_growth_threshold_input_map(form),
+        market=form.market,
+        recent_years=form.recent_years,
+        display_limit=form.display_limit,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        sort_by=form.sort_by,
+    )
+    analysis_href = _append_tab_return_params(
+        analysis_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=current_ranking_href,
+        return_db_update=db_update_href,
+    )
+    compare_href = _append_tab_return_params(
+        compare_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=current_ranking_href,
+        return_db_update=db_update_href,
+    )
+    current_ranking_href = _append_tab_return_params(
+        current_ranking_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=current_ranking_href,
+        return_db_update=db_update_href,
+    )
+    db_update_href = _append_tab_return_params(
+        db_update_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=current_ranking_href,
+        return_db_update=db_update_href,
+    )
     tabs = (
-        ("재무정보", "/", "financials"),
-        (
-            "VS 기업비교",
-            _build_compare_href(
-                primary_company_query="",
-                recent_years=form.recent_years,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-            ),
-            "compare",
-        ),
-        (
-            "기업필터",
-            _build_ranking_href(
-                growth_conditions=form.growth_conditions,
-                market=form.market,
-                recent_years=form.recent_years,
-                display_limit=form.display_limit,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-                sort_by=form.sort_by,
-            ),
-            "ranking",
-        ),
-        (
-            "DB 업데이트",
-            _build_db_update_href(
-                growth_conditions=form.growth_conditions,
-                market=form.market,
-                recent_years=form.recent_years,
-                display_limit=form.display_limit,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-                sort_by=form.sort_by,
-            ),
-            "db-update",
-        ),
+        ("재무정보", analysis_href, "financials"),
+        ("VS 기업비교", compare_href, "compare"),
+        ("기업필터", current_ranking_href, "ranking"),
+        ("DB 업데이트", db_update_href, "db-update"),
     )
     return render_top_tabs("ranking", tabs)
 
@@ -6299,6 +6655,7 @@ def render_ranking_header(
         <span class="section-tab">결과</span>
       </div>
       <form id="ranking-form" class="query-form query-form-ranking" data-loading-form method="get" action="/ranking">
+        <input type="hidden" name="submitted" value="1">
         <label class="field">
           <span>시장</span>
           <select name="market">
@@ -6318,10 +6675,6 @@ def render_ranking_header(
             {_option("OFS", "별도", form.fs_div)}
             {_option("ALL", "전체", form.fs_div)}
           </select>
-        </label>
-        <label class="field">
-          <span>성장률 기준</span>
-          <input name="threshold_percent" value="{escape(form.threshold_percent)}" inputmode="decimal">
         </label>
         <label class="field">
           <span>정렬</span>
@@ -6346,7 +6699,7 @@ def render_ranking_header(
         </div>
       </form>
       <div class="toolbar-row toolbar-row-dense">
-        <div class="toolbar-note">선택한 성장률 조건은 모두 충족해야 통과로 계산합니다. 각 조건마다 최근 몇 년 또는 몇 분기를 따로 지정할 수 있습니다.</div>
+        <div class="toolbar-note">선택한 성장률 조건은 모두 충족해야 통과로 계산합니다. 각 조건마다 최근 몇 년 또는 몇 분기와 성장률 기준 %를 따로 지정할 수 있습니다.</div>
       </div>
       <div class="toolbar-row toolbar-row-dense">
         <div class="toolbar-note">DB 업데이트는 별도 페이지에서 관리합니다.</div>
@@ -6372,47 +6725,70 @@ def render_db_update_page(
 
 
 def render_db_update_top_tabs(form: RankingForm) -> str:
+    current_db_update_href = _build_db_update_href(
+        growth_conditions=form.growth_conditions,
+        growth_threshold_inputs=_growth_threshold_input_map(form),
+        market=form.market,
+        recent_years=form.recent_years,
+        display_limit=form.display_limit,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        sort_by=form.sort_by,
+    )
+    analysis_href = form.return_analysis or "/"
+    compare_href = form.return_compare or _build_compare_href(
+        primary_company_query="",
+        recent_years=form.recent_years,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+    )
+    ranking_href = form.return_ranking or _build_ranking_href(
+        growth_conditions=form.growth_conditions,
+        growth_threshold_inputs=_growth_threshold_input_map(form),
+        market=form.market,
+        recent_years=form.recent_years,
+        display_limit=form.display_limit,
+        end_year=form.end_year or str(default_end_year()),
+        fs_div=form.fs_div,
+        threshold_percent=form.threshold_percent,
+        sort_by=form.sort_by,
+        submitted=_parse_submitted(form.submitted),
+    )
+    analysis_href = _append_tab_return_params(
+        analysis_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=current_db_update_href,
+    )
+    compare_href = _append_tab_return_params(
+        compare_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=current_db_update_href,
+    )
+    ranking_href = _append_tab_return_params(
+        ranking_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=current_db_update_href,
+    )
+    current_db_update_href = _append_tab_return_params(
+        current_db_update_href,
+        return_analysis=analysis_href,
+        return_compare=compare_href,
+        return_ranking=ranking_href,
+        return_db_update=current_db_update_href,
+    )
     tabs = (
-        ("재무정보", "/", "financials"),
-        (
-            "VS 기업비교",
-            _build_compare_href(
-                primary_company_query="",
-                recent_years=form.recent_years,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-            ),
-            "compare",
-        ),
-        (
-            "기업필터",
-            _build_ranking_href(
-                growth_conditions=form.growth_conditions,
-                market=form.market,
-                recent_years=form.recent_years,
-                display_limit=form.display_limit,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-                sort_by=form.sort_by,
-            ),
-            "ranking",
-        ),
-        (
-            "DB 업데이트",
-            _build_db_update_href(
-                growth_conditions=form.growth_conditions,
-                market=form.market,
-                recent_years=form.recent_years,
-                display_limit=form.display_limit,
-                end_year=form.end_year or str(default_end_year()),
-                fs_div=form.fs_div,
-                threshold_percent=form.threshold_percent,
-                sort_by=form.sort_by,
-            ),
-            "db-update",
-        ),
+        ("재무정보", analysis_href, "financials"),
+        ("VS 기업비교", compare_href, "compare"),
+        ("기업필터", ranking_href, "ranking"),
+        ("DB 업데이트", current_db_update_href, "db-update"),
     )
     return render_top_tabs("db-update", tabs)
 
@@ -6452,6 +6828,11 @@ def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
     for series_type in GROWTH_CONDITION_SERIES:
         cells = []
         unit = growth_condition_period_unit(series_type)
+        threshold_input_name = _growth_threshold_input_name(series_type=series_type)
+        threshold_value = _ranking_condition_threshold_value(
+            form,
+            series_type=series_type,
+        )
         for metric in GROWTH_CONDITION_METRICS:
             value = _growth_condition_value(series_type=series_type, metric=metric)
             checked = " checked" if (series_type, metric) in selected_keys else ""
@@ -6481,6 +6862,12 @@ def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
         body_rows.append(
             "<tr>"
             f"<th>{escape(GROWTH_SERIES_LABELS.get(series_type, series_type))}</th>"
+            "<td>"
+            '<label class="matrix-threshold-label">'
+            f'<input class="matrix-threshold-input" type="number" min="0" step="0.1" name="{escape(threshold_input_name)}" value="{escape(threshold_value)}" inputmode="decimal">'
+            '<span class="matrix-period-unit">%</span>'
+            "</label>"
+            "</td>"
             f"{''.join(cells)}"
             "</tr>"
         )
@@ -6488,7 +6875,7 @@ def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
         '<div class="panel" style="margin-top:10px;padding:10px 12px;">'
         '<div class="matrix-heading">성장률 조건 선택</div>'
         '<table class="matrix-table">'
-        f"<thead><tr><th>구분</th>{header_cells}</tr></thead>"
+        f"<thead><tr><th>구분</th><th>기준</th>{header_cells}</tr></thead>"
         f"<tbody>{''.join(body_rows)}</tbody>"
         "</table>"
         "</div>"
@@ -6606,7 +6993,7 @@ def render_ranking_update_panel(
         else "회사 목록 동기화는 서울 기준 하루 한 번만 실제 API를 호출합니다."
     )
     return f"""
-    <section class="panel" id="ranking-update-panel" data-refresh-panel data-refresh-fs-div="{escape(form.fs_div)}" data-job-id="{escape(str(update_job.get('id', '')))}">
+    <section class="panel" id="ranking-update-panel" data-refresh-panel data-refresh-fs-div="{escape(form.fs_div)}" data-job-id="{escape(str(update_job.get('id', '')))}" data-job-status="{escape(job_status)}">
       <div class="panel-heading panel-heading-split">
         <div>
           <h3>DB 업데이트</h3>
@@ -6885,6 +7272,7 @@ def render_ranking_job_script(form: RankingForm) -> str:
       const yearToInput = document.getElementById("refresh-year-to");
       const batchSizeInput = document.getElementById("refresh-batch-size");
       let activeJobId = panel.getAttribute("data-job-id") || "";
+      let initialJobStatus = panel.getAttribute("data-job-status") || "";
       let pumpTimer = null;
       let pumpBusy = false;
       let syncProgressTimer = null;
@@ -7264,9 +7652,21 @@ def render_ranking_job_script(form: RankingForm) -> str:
         }});
       }}
 
-      if (activeJobId) {{
-        setMessage("진행 중인 작업 상태를 불러오는 중입니다...", "running", "배치 업데이트 진행 중");
+      if (activeJobId && initialJobStatus === "running") {{
+        setMessage("진행 중인 작업 상태를 확인하고 있습니다...", "running", "배치 업데이트 진행 중");
         schedulePump();
+      }} else if (activeJobId && initialJobStatus === "blocked") {{
+        setMessage("가장 최근 작업이 차단 상태입니다. OpenDART 키를 바꾸거나 내일 다시 이어받아 주세요.", "blocked", "작업 차단됨");
+        loadStatus().catch((error) => {{
+          setMessage(String(error.message || error), "error", "작업 상태 확인 오류");
+        }});
+      }} else if (activeJobId && initialJobStatus === "paused") {{
+        setMessage("가장 최근 작업이 일시정지 상태입니다. 이어받기를 누르면 다시 진행합니다.", "warning", "작업 일시정지");
+        loadStatus().catch((error) => {{
+          setMessage(String(error.message || error), "error", "작업 상태 확인 오류");
+        }});
+      }} else if (activeJobId && initialJobStatus === "completed") {{
+        setMessage("가장 최근 작업이 완료된 상태입니다. 새 작업을 시작하거나 필요하면 실패만 재시도를 진행해 주세요.", "success", "업데이트 완료");
       }} else {{
         setMessage("회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.", "idle", "DB 업데이트 대기 중");
         renderSummary(null);
@@ -7465,6 +7865,7 @@ def _normalize_ranking_sort(*, sort_by: str) -> str:
 def _build_ranking_href(
     *,
     growth_conditions: Iterable[str] | None = None,
+    growth_threshold_inputs: dict[str, str] | None = None,
     market: str = DEFAULT_MARKET_FILTER,
     recent_years: str,
     display_limit: str = str(DEFAULT_RANKING_DISPLAY_LIMIT),
@@ -7472,12 +7873,22 @@ def _build_ranking_href(
     fs_div: str,
     threshold_percent: str,
     sort_by: str = DEFAULT_RANKING_SORT_BY,
+    submitted: bool = False,
+    return_analysis: str = "",
+    return_compare: str = "",
+    return_ranking: str = "",
+    return_db_update: str = "",
 ) -> str:
     params: list[tuple[str, str]] = []
     for condition in growth_conditions or ():
         normalized = str(condition or "").strip()
         if normalized:
             params.append(("growth_condition", normalized))
+    for key, value in (growth_threshold_inputs or {}).items():
+        normalized_key = str(key or "").strip()
+        normalized_value = str(value or "").strip()
+        if normalized_key and normalized_value and normalized_value != str(DEFAULT_THRESHOLD_PERCENT):
+            params.append((normalized_key, normalized_value))
     if str(market).strip() and str(market).strip().upper() != "ALL":
         params.append(("market", str(market).strip()))
     for key, value in (
@@ -7493,6 +7904,17 @@ def _build_ranking_href(
     normalized_sort = _normalize_ranking_sort(sort_by=sort_by)
     if normalized_sort != DEFAULT_RANKING_SORT_BY:
         params.append(("sort_by", normalized_sort))
+    if submitted:
+        params.append(("submitted", "1"))
+    for key, value in (
+        ("return_analysis", return_analysis),
+        ("return_compare", return_compare),
+        ("return_ranking", return_ranking),
+        ("return_db_update", return_db_update),
+    ):
+        normalized_value = _normalize_return_href(value)
+        if normalized_value:
+            params.append((key, normalized_value))
     query = urlencode(params)
     return f"/ranking?{query}" if query else "/ranking"
 
@@ -7500,6 +7922,7 @@ def _build_ranking_href(
 def _build_db_update_href(
     *,
     growth_conditions: Iterable[str] | None = None,
+    growth_threshold_inputs: dict[str, str] | None = None,
     market: str = DEFAULT_MARKET_FILTER,
     recent_years: str,
     display_limit: str = str(DEFAULT_RANKING_DISPLAY_LIMIT),
@@ -7507,12 +7930,21 @@ def _build_db_update_href(
     fs_div: str,
     threshold_percent: str,
     sort_by: str = DEFAULT_RANKING_SORT_BY,
+    return_analysis: str = "",
+    return_compare: str = "",
+    return_ranking: str = "",
+    return_db_update: str = "",
 ) -> str:
     params: list[tuple[str, str]] = []
     for condition in growth_conditions or ():
         normalized = str(condition or "").strip()
         if normalized:
             params.append(("growth_condition", normalized))
+    for key, value in (growth_threshold_inputs or {}).items():
+        normalized_key = str(key or "").strip()
+        normalized_value = str(value or "").strip()
+        if normalized_key and normalized_value and normalized_value != str(DEFAULT_THRESHOLD_PERCENT):
+            params.append((normalized_key, normalized_value))
     if str(market).strip() and str(market).strip().upper() != "ALL":
         params.append(("market", str(market).strip()))
     for key, value in (
@@ -7528,6 +7960,15 @@ def _build_db_update_href(
     normalized_sort = _normalize_ranking_sort(sort_by=sort_by)
     if normalized_sort != DEFAULT_RANKING_SORT_BY:
         params.append(("sort_by", normalized_sort))
+    for key, value in (
+        ("return_analysis", return_analysis),
+        ("return_compare", return_compare),
+        ("return_ranking", return_ranking),
+        ("return_db_update", return_db_update),
+    ):
+        normalized_value = _normalize_return_href(value)
+        if normalized_value:
+            params.append((key, normalized_value))
     query = urlencode(params)
     return f"/db-update?{query}" if query else "/db-update"
 
@@ -7559,7 +8000,7 @@ def _render_ranking_update_panel_duplicate(
     stale = company_master_status.get("is_stale") is True
     job_status = str(update_job.get("status", "") or "")
     return f"""
-    <section class="panel" id="ranking-update-panel" data-refresh-panel data-refresh-fs-div="{escape(form.fs_div)}" data-job-id="{escape(str(update_job.get('id', '')))}">
+    <section class="panel" id="ranking-update-panel" data-refresh-panel data-refresh-fs-div="{escape(form.fs_div)}" data-job-id="{escape(str(update_job.get('id', '')))}" data-job-status="{escape(job_status)}">
       <div class="panel-heading panel-heading-split">
         <div>
           <h3>DB 업데이트</h3>

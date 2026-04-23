@@ -165,17 +165,15 @@ class WebTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(
-            'class="top-tab is-active" href="/analysis?company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials#financials-details"',
+            '/analysis?company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials',
             response.text,
         )
-        self.assertIn(
-            '/analysis?company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials#financials-details',
-            response.text,
-        )
+        self.assertIn("financials-details", response.text)
         self.assertIn(
             '/compare?primary_company_query=Vinatac&amp;recent_years=10&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20',
             response.text,
         )
+        self.assertIn("return_analysis=%2Fanalysis%3Fcompany_query%3DVinatac", response.text)
         self.assertIn('/ranking?', response.text)
         self.assertIn('/db-update?', response.text)
         self.assertIn(">기업필터</a>", response.text)
@@ -254,7 +252,8 @@ class WebTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Samsung Electronics", response.text)
         self.assertIn('class="top-tab is-active"', response.text)
-        self.assertIn("tab=financials#financials-details", response.text)
+        self.assertIn("tab=financials", response.text)
+        self.assertIn("financials-details", response.text)
         self.assertIn('class="growth-detail-chart amount-chart"', response.text)
         self.assertIn('class="growth-table"', response.text)
         self.assertIn('stroke="#c4b5fd"', response.text)
@@ -502,7 +501,12 @@ class WebTests(TestCase):
             response.text,
         )
         self.assertIn(
-            '/analysis?company_query=Samsung+Electronics&amp;recent_years=5&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials#financials-details',
+            '/analysis?company_query=Samsung+Electronics&amp;recent_years=5&amp;end_year=2025&amp;fs_div=CFS&amp;threshold_percent=20&amp;tab=financials',
+            response.text,
+        )
+        self.assertIn("financials-details", response.text)
+        self.assertIn(
+            "return_compare=%2Fcompare%3Fprimary_company_query%3DSamsung%2BElectronics",
             response.text,
         )
         self.assertIn("/db-update?", response.text)
@@ -916,6 +920,7 @@ class WebTests(TestCase):
                 response = client.get(
                     "/ranking",
                     params={
+                        "submitted": "1",
                         "recent_years": "2",
                         "end_year": "2025",
                         "fs_div": "CFS",
@@ -977,6 +982,7 @@ class WebTests(TestCase):
                 response = client.get(
                     "/ranking",
                     params={
+                        "submitted": "1",
                         "display_limit": "1",
                         "end_year": "2025",
                         "fs_div": "CFS",
@@ -1014,10 +1020,13 @@ class WebTests(TestCase):
         self.assertIn('name="growth_condition_key"', response.text)
         self.assertIn('name="growth_period__annual_yoy__revenue"', response.text)
         self.assertIn('value="3"', response.text)
+        self.assertIn('name="growth_threshold__annual_yoy"', response.text)
+        self.assertIn('value="20"', response.text)
         self.assertIn('name="growth_period__quarterly_qoq__net_income"', response.text)
         self.assertIn('value="12"', response.text)
         self.assertIn('name="display_limit"', response.text)
         self.assertIn(">100개</option>", response.text)
+        self.assertIn('name="submitted" value="1"', response.text)
         self.assertIn("기업필터", response.text)
         self.assertIn(">DB 업데이트</a>", response.text)
         self.assertNotIn("데이터/API 설정", response.text)
@@ -1025,9 +1034,10 @@ class WebTests(TestCase):
         self.assertNotIn('id="shared-settings-panel"', response.text)
         self.assertIn("DB 업데이트는 별도 페이지에서 관리합니다.", response.text)
         self.assertIn('class="ranking-action-row"', response.text)
-        self.assertIn("전체 최소 성장률", response.text)
+        self.assertIn("조건을 설정한 뒤 조회를 누르면", response.text)
+        self.assertNotIn("현재 조건을 통과한 기업이 없습니다", response.text)
+        self.assertNotIn("<th>조건 충족 수</th>", response.text)
         self.assertNotIn("KRX 연결 점검 실행", response.text)
-        self.assertNotIn("회사 목록 동기화", response.text)
         self.assertNotIn("전체 DB 초기화", response.text)
         self.assertNotIn("krx-diagnostic-result", response.text)
         self.assertNotIn(">요약</a>", response.text)
@@ -1061,7 +1071,10 @@ class WebTests(TestCase):
         self.assertIn("OpenDART 키 관리", response.text)
         self.assertIn("krx-diagnostic-result", response.text)
         self.assertIn('id="refresh-status-panel"', response.text)
+        self.assertIn('data-job-status=""', response.text)
         self.assertIn("DB 업데이트 대기 중", response.text)
+        self.assertNotIn("진행 중인 작업 상태를 불러오는 중입니다...", response.text)
+        self.assertIn('initialJobStatus === "running"', response.text)
         self.assertIn("window.confirm(", response.text)
 
     def test_ranking_company_master_sync_returns_korean_message_on_403(self) -> None:
@@ -1140,6 +1153,7 @@ class WebTests(TestCase):
                 response = client.get(
                     "/ranking",
                     params=[
+                        ("submitted", "1"),
                         ("end_year", "2025"),
                         ("fs_div", "CFS"),
                         ("threshold_percent", "20"),
@@ -1195,11 +1209,13 @@ class WebTests(TestCase):
                 response = client.get(
                     "/ranking",
                     params=[
+                        ("submitted", "1"),
                         ("end_year", "2025"),
                         ("fs_div", "CFS"),
                         ("threshold_percent", "20"),
                         ("growth_condition_key", "annual_yoy:revenue"),
                         ("growth_period__annual_yoy__revenue", "1"),
+                        ("growth_threshold__annual_yoy", "15"),
                     ],
                 )
 
@@ -1208,6 +1224,82 @@ class WebTests(TestCase):
         self.assertIn("조건에 맞는 기업", response.text)
         self.assertNotIn("성장률 랭킹", response.text)
         self.assertIn("growth_condition=annual_yoy%3Arevenue%3A1", str(response.url))
+        self.assertIn("growth_threshold__annual_yoy=15", str(response.url))
+
+    def test_ranking_top_tabs_restore_analysis_context(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        analysis_return = (
+            "/analysis?company_query=Vinatac&recent_years=10&end_year=2025"
+            "&fs_div=CFS&threshold_percent=20&tab=financials#financials-details"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.get(
+                    "/ranking",
+                    params=[
+                        ("submitted", "1"),
+                        ("end_year", "2025"),
+                        ("fs_div", "CFS"),
+                        ("growth_condition", "annual_yoy:revenue:3"),
+                        ("return_analysis", analysis_return),
+                    ],
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("/analysis?company_query=Vinatac", response.text)
+        self.assertIn("return_ranking=%2Franking%3F", response.text)
+        self.assertIn("submitted%3D1", response.text)
+
+    def test_ranking_page_keeps_background_batch_pump_when_job_running(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "show-me-the-per-cfs.sqlite3"
+            create_refresh_job(
+                database_path,
+                companies=[
+                    {
+                        "corp_code": "00126380",
+                        "corp_name": "Samsung Electronics",
+                        "stock_code": "005930",
+                        "market": "KOSPI",
+                    }
+                ],
+                scope="ALL",
+                fs_div="CFS",
+                year_from=2023,
+                year_to=2025,
+                batch_size=25,
+            )
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.get("/ranking")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("const jobId = 1;", response.text)
+        self.assertIn("/ranking/update-jobs/${jobId}?fs_div=${encodeURIComponent(fsDiv)}", response.text)
+        self.assertIn("/ranking/update-jobs/${jobId}/run-next-batch?fs_div=${encodeURIComponent(fsDiv)}", response.text)
 
     def test_ranking_update_job_requires_company_master_sync(self) -> None:
         client = TestClient(
