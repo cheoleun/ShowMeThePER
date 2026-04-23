@@ -2,11 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-import json
+import httpx
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import unquote
 
 from .models import KOREAN_EQUITY_MARKETS, KrxListing, normalize_stock_code, parse_decimal_amount
 
@@ -99,17 +97,22 @@ class KrxClient:
         if base_date:
             params["basDt"] = base_date
 
-        url = f"{self.endpoint}?{urlencode(params)}"
-        request = Request(url, headers=DEFAULT_KRX_REQUEST_HEADERS)
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
+            response = httpx.get(
+                self.endpoint,
+                params=params,
+                headers=DEFAULT_KRX_REQUEST_HEADERS,
+                timeout=self.timeout_seconds,
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as error:
             raise _translate_krx_http_error(
                 error,
                 action="회사 목록 조회",
             ) from error
-        except URLError as error:
+        except httpx.RequestError as error:
             raise KrxApiError(
                 "KRX 회사 목록 조회 중 네트워크 오류가 발생했습니다. "
                 "잠시 후 다시 시도해 주세요.",
@@ -145,17 +148,22 @@ class KrxStockPriceClient:
             "basDt": base_date,
             "likeSrtnCd": normalized_stock_code,
         }
-        url = f"{self.endpoint}?{urlencode(params)}"
-        request = Request(url, headers=DEFAULT_KRX_REQUEST_HEADERS)
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
+            response = httpx.get(
+                self.endpoint,
+                params=params,
+                headers=DEFAULT_KRX_REQUEST_HEADERS,
+                timeout=self.timeout_seconds,
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPStatusError as error:
             raise _translate_krx_http_error(
                 error,
                 action="시세 조회",
             ) from error
-        except URLError as error:
+        except httpx.RequestError as error:
             raise KrxApiError(
                 "KRX 시세 조회 중 네트워크 오류가 발생했습니다. "
                 "잠시 후 다시 시도해 주세요.",
@@ -229,21 +237,28 @@ def parse_stock_price_payload(payload: dict[str, Any]) -> list[KrxStockPriceSnap
 
 
 def _translate_krx_http_error(
-    error: HTTPError,
+    error: httpx.HTTPStatusError,
     *,
     action: str,
 ) -> KrxApiError:
-    if error.code == 403:
+    status_code = error.response.status_code
+    if status_code == 403:
         return KrxApiError(
             f"KRX {action}가 403으로 거부되었습니다. "
             "KRX_SERVICE_KEY 값이 올바른지, 공공데이터포털 활용신청/승인이 완료됐는지, "
             "또는 해당 API 접근이 일시적으로 제한된 것은 아닌지 확인해 주세요.",
             status_code=403,
         )
+    if status_code == 401:
+        return KrxApiError(
+            f"KRX {action}가 401로 거부되었습니다. "
+            "같은 키로 브라우저/PowerShell 호출은 정상이라면 앱 내부 HTTP 요청 방식 차이일 수 있습니다.",
+            status_code=401,
+        )
     return KrxApiError(
         f"KRX {action} 중 오류가 발생했습니다. "
-        f"응답 코드 {error.code}을(를) 받았습니다.",
-        status_code=error.code,
+        f"응답 코드 {status_code}을(를) 받았습니다.",
+        status_code=status_code,
     )
 
 
