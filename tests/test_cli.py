@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import tempfile
@@ -122,18 +122,18 @@ class CliTests(unittest.TestCase):
             growth_path.write_text(
                 json.dumps(
                     {
-                        "filter": {
-                            "results": [
-                                {
-                                    "corp_code": "00126380",
-                                    "metric": "revenue",
-                                    "series_type": "annual_yoy",
-                                    "recent_periods": 3,
-                                    "minimum_growth_rate": "25",
-                                    "passed": True,
-                                }
-                            ]
-                        }
+                        "growth_points": [
+                            {
+                                "corp_code": "00126380",
+                                "metric": "revenue",
+                                "series_type": "annual_yoy",
+                                "fiscal_year": 2025,
+                                "fiscal_quarter": None,
+                                "amount": "100",
+                                "base_amount": "80",
+                                "growth_rate": "25",
+                            }
+                        ]
                     }
                 ),
                 encoding="utf-8",
@@ -165,6 +165,8 @@ class CliTests(unittest.TestCase):
                     str(valuation_path),
                     "--output",
                     str(output_path),
+                    "--growth-condition",
+                    "annual_yoy:revenue:1",
                     "--max-per",
                     "10",
                     "--min-roe",
@@ -184,26 +186,28 @@ class CliTests(unittest.TestCase):
             growth_path.write_text(
                 json.dumps(
                     {
-                        "filter": {
-                            "results": [
-                                {
-                                    "corp_code": "00126380",
-                                    "metric": "revenue",
-                                    "series_type": "annual_yoy",
-                                    "recent_periods": 3,
-                                    "minimum_growth_rate": "25",
-                                    "passed": True,
-                                },
-                                {
-                                    "corp_code": "00126380",
-                                    "metric": "operating_income",
-                                    "series_type": "quarterly_yoy",
-                                    "recent_periods": 12,
-                                    "minimum_growth_rate": "21",
-                                    "passed": True,
-                                },
-                            ]
-                        }
+                        "growth_points": [
+                            {
+                                "corp_code": "00126380",
+                                "metric": "revenue",
+                                "series_type": "annual_yoy",
+                                "fiscal_year": 2025,
+                                "fiscal_quarter": None,
+                                "amount": "100",
+                                "base_amount": "80",
+                                "growth_rate": "25",
+                            },
+                            {
+                                "corp_code": "00126380",
+                                "metric": "operating_income",
+                                "series_type": "quarterly_yoy",
+                                "fiscal_year": 2025,
+                                "fiscal_quarter": 1,
+                                "amount": "100",
+                                "base_amount": "80",
+                                "growth_rate": "21",
+                            },
+                        ]
                     }
                 ),
                 encoding="utf-8",
@@ -217,9 +221,9 @@ class CliTests(unittest.TestCase):
                     "--output",
                     str(output_path),
                     "--growth-condition",
-                    "annual_yoy:revenue",
+                    "annual_yoy:revenue:1",
                     "--growth-condition",
-                    "quarterly_yoy:operating_income",
+                    "quarterly_yoy:operating_income:1",
                 ]
             )
 
@@ -228,8 +232,16 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             payload["filters"]["growth_conditions"],
             [
-                {"metric": "revenue", "series_type": "annual_yoy"},
-                {"metric": "operating_income", "series_type": "quarterly_yoy"},
+                {
+                    "metric": "revenue",
+                    "series_type": "annual_yoy",
+                    "recent_periods": 1,
+                },
+                {
+                    "metric": "operating_income",
+                    "series_type": "quarterly_yoy",
+                    "recent_periods": 1,
+                },
             ],
         )
         self.assertEqual(
@@ -370,6 +382,8 @@ class CliTests(unittest.TestCase):
                         "rank-growth-from-db",
                         "--database",
                         str(database_path),
+                        "--growth-condition",
+                        "annual_yoy:revenue:1",
                         "--growth-metric",
                         "revenue",
                         "--growth-series-type",
@@ -470,6 +484,8 @@ class CliTests(unittest.TestCase):
                         "growth-ranking-report",
                         "--database",
                         str(database_path),
+                        "--growth-condition",
+                        "annual_yoy:revenue:1",
                         "--growth-metric",
                         "revenue",
                         "--growth-series-type",
@@ -576,6 +592,8 @@ class CliTests(unittest.TestCase):
                         str(database_path),
                         "--output",
                         str(ranking_path),
+                        "--growth-condition",
+                        "annual_yoy:revenue:2",
                         "--recent-years",
                         "2",
                         "--end-year",

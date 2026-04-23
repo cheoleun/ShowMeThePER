@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -10,7 +10,7 @@ from typing import Callable, Iterable, Protocol
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from .growth import ANNUAL_YOY, QUARTERLY_QOQ, QUARTERLY_YOY, TRAILING_FOUR_QUARTER_YOY
 from .krx import (
@@ -51,6 +51,9 @@ from .rankings import (
     GROWTH_METRIC_LABELS,
     GROWTH_SERIES_LABELS,
     ValuationSnapshot,
+    default_recent_periods_for_series,
+    format_growth_condition_period_label,
+    growth_condition_period_unit,
     normalize_growth_conditions,
 )
 from .storage import (
@@ -89,7 +92,7 @@ DEFAULT_MARKET_FILTER = "ALL"
 DEFAULT_RANKING_GROWTH_METRIC = DEFAULT_SCREENING_GROWTH_METRIC
 DEFAULT_RANKING_GROWTH_SERIES_TYPE = DEFAULT_SCREENING_GROWTH_SERIES_TYPE
 DEFAULT_RANKING_GROWTH_CONDITIONS = tuple(
-    f"{item['series_type']}:{item['metric']}"
+    f"{item['series_type']}:{item['metric']}:{item['recent_periods']}"
     for item in DEFAULT_SCREENING_GROWTH_CONDITIONS
 )
 RANKING_SORT_OPTIONS = (
@@ -210,6 +213,7 @@ class CompareForm:
 @dataclass(frozen=True)
 class RankingForm:
     growth_conditions: tuple[str, ...] = DEFAULT_RANKING_GROWTH_CONDITIONS
+    growth_period_inputs: tuple[tuple[str, str], ...] = ()
     market: str = DEFAULT_MARKET_FILTER
     recent_years: str = str(DEFAULT_RECENT_YEARS)
     end_year: str = ""
@@ -364,7 +368,9 @@ def create_app(
 
     @app.get("/ranking", response_class=HTMLResponse)
     def ranking(
+        request: Request,
         growth_condition: list[str] = Query(default=[]),
+        growth_condition_key: list[str] = Query(default=[]),
         market: str = DEFAULT_MARKET_FILTER,
         recent_years: str = str(DEFAULT_RECENT_YEARS),
         end_year: str = "",
@@ -372,8 +378,14 @@ def create_app(
         threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
         sort_by: str = DEFAULT_RANKING_SORT_BY,
     ) -> HTMLResponse:
+        growth_period_inputs = _read_growth_period_inputs(request)
         form = RankingForm(
-            growth_conditions=tuple(growth_condition or DEFAULT_RANKING_GROWTH_CONDITIONS),
+            growth_conditions=tuple(
+                growth_condition
+                or growth_condition_key
+                or DEFAULT_RANKING_GROWTH_CONDITIONS
+            ),
+            growth_period_inputs=tuple(growth_period_inputs.items()),
             market=(market or DEFAULT_MARKET_FILTER).strip().upper() or DEFAULT_MARKET_FILTER,
             recent_years=recent_years.strip(),
             end_year=end_year.strip() or str(default_end_year()),
@@ -383,23 +395,45 @@ def create_app(
         )
 
         try:
-            request = parse_ranking_request(form)
+            ranking_request = parse_ranking_request(form)
         except ValueError as error:
             return HTMLResponse(render_ranking_page(form=form, error=str(error)))
 
-        database_path = _web_cache_database_path(str(request["fs_div"] or "ALL"))
+        if _ranking_request_requires_redirect(
+            request=request,
+            growth_condition_key=growth_condition_key,
+        ):
+            return RedirectResponse(
+                _build_ranking_href(
+                    growth_conditions=tuple(
+                        _growth_condition_value(
+                            series_type=str(condition["series_type"]),
+                            metric=str(condition["metric"]),
+                            recent_periods=int(condition["recent_periods"]),
+                        )
+                        for condition in ranking_request["growth_conditions"]
+                    ),
+                    market=form.market,
+                    recent_years=form.recent_years,
+                    end_year=form.end_year or str(default_end_year()),
+                    fs_div=form.fs_div,
+                    threshold_percent=form.threshold_percent,
+                    sort_by=form.sort_by,
+                ),
+                status_code=303,
+            )
+
+        database_path = _web_cache_database_path(str(ranking_request["fs_div"] or "ALL"))
         payload = build_database_company_screening_payload(
             database_path,
-            start_year=request["start_year"],
-            end_year=request["end_year"],
-            fs_div=request["fs_div"],
-            growth_conditions=request["growth_conditions"],
+            start_year=ranking_request["start_year"],
+            end_year=ranking_request["end_year"],
+            fs_div=ranking_request["fs_div"],
+            growth_conditions=ranking_request["growth_conditions"],
             include_failed_growth=True,
-            threshold_percent=request["threshold_percent"],
-            recent_annual_periods=request["recent_years"],
-            recent_quarterly_periods=request["recent_years"] * 4,
-            market=request["market"],
-            sort_by=request["sort_by"],
+            threshold_percent=ranking_request["threshold_percent"],
+            market=ranking_request["market"],
+            sort_by=ranking_request["sort_by"],
         )
         payload["company_master_status"] = read_company_master_status(database_path)
         payload["update_job"] = read_latest_refresh_job(database_path) or {}
@@ -5517,15 +5551,118 @@ def _page_script() -> str:
     """
 
 
-def parse_ranking_request(form: RankingForm) -> dict[str, object]:
-    recent_years = _parse_int(form.recent_years, field_name="조회 연수")
-    if recent_years <= 0:
-        raise ValueError("조회 연수는 1 이상이어야 합니다.")
+def _growth_period_input_name(*, series_type: str, metric: str) -> str:
+    return f"growth_period__{series_type}__{metric}"
 
+
+def _read_growth_period_inputs(request: Request) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for series_type in GROWTH_CONDITION_SERIES:
+        for metric in GROWTH_CONDITION_METRICS:
+            key = _growth_period_input_name(series_type=series_type, metric=metric)
+            raw_value = request.query_params.get(key)
+            if raw_value is not None:
+                values[key] = str(raw_value).strip()
+    return values
+
+
+def _growth_period_input_map(form: RankingForm) -> dict[str, str]:
+    return {
+        str(key): str(value)
+        for key, value in form.growth_period_inputs
+        if str(key).strip()
+    }
+
+
+def _ranking_selected_conditions(form: RankingForm) -> list[dict[str, object]]:
+    period_inputs = _growth_period_input_map(form)
+    raw_conditions = list(form.growth_conditions or DEFAULT_RANKING_GROWTH_CONDITIONS)
+    normalized_conditions: list[dict[str, object] | str] = []
+    for raw_condition in raw_conditions:
+        text = str(raw_condition or "").strip()
+        if not text:
+            continue
+        parts = [part.strip() for part in text.split(":")]
+        if len(parts) == 2:
+            series_type, metric = parts
+            normalized_conditions.append(
+                {
+                    "series_type": series_type,
+                    "metric": metric,
+                    "recent_periods": period_inputs.get(
+                        _growth_period_input_name(
+                            series_type=series_type,
+                            metric=metric,
+                        ),
+                        str(default_recent_periods_for_series(series_type)),
+                    ),
+                }
+            )
+            continue
+        normalized_conditions.append(text)
+    return normalize_growth_conditions(normalized_conditions)
+
+
+def _ranking_condition_period_value(
+    form: RankingForm,
+    *,
+    series_type: str,
+    metric: str,
+) -> str:
+    key = _growth_period_input_name(series_type=series_type, metric=metric)
+    period_inputs = _growth_period_input_map(form)
+    if key in period_inputs and str(period_inputs[key]).strip():
+        return str(period_inputs[key]).strip()
+    for condition in _ranking_selected_conditions(form):
+        if (
+            str(condition["series_type"]) == series_type
+            and str(condition["metric"]) == metric
+        ):
+            return str(condition["recent_periods"])
+    return str(default_recent_periods_for_series(series_type))
+
+
+def _ranking_recent_years_from_conditions(
+    growth_conditions: Iterable[dict[str, object]],
+) -> int:
+    years = []
+    for condition in growth_conditions:
+        series_type = str(condition.get("series_type", "") or "")
+        recent_periods = int(condition.get("recent_periods", 0) or 0)
+        if series_type in {ANNUAL_YOY, TRAILING_FOUR_QUARTER_YOY}:
+            years.append(recent_periods)
+        else:
+            years.append(max(1, (recent_periods + 3) // 4))
+    return max(years or [DEFAULT_RECENT_YEARS])
+
+
+def _ranking_request_requires_redirect(
+    *,
+    request: Request,
+    growth_condition_key: Iterable[str],
+) -> bool:
+    if list(growth_condition_key):
+        return True
+    if any(key.startswith("growth_period__") for key in request.query_params.keys()):
+        return True
+    return any(
+        str(value or "").strip().count(":") == 1
+        for value in request.query_params.getlist("growth_condition")
+    )
+
+
+def _analysis_recent_years_from_ranking_filters(filters: dict[str, object]) -> int:
+    selected_conditions = [_dict(item) for item in _list(filters.get("growth_conditions"))]
+    return _ranking_recent_years_from_conditions(selected_conditions)
+
+
+def parse_ranking_request(form: RankingForm) -> dict[str, object]:
+    growth_conditions = _ranking_selected_conditions(form)
     end_year = _parse_int(
         form.end_year or str(default_end_year()),
         field_name="기준 연도",
     )
+    recent_years = _ranking_recent_years_from_conditions(growth_conditions)
     start_year = max(MIN_OPENDART_YEAR, end_year - recent_years + 1)
     threshold_percent = _parse_decimal(
         form.threshold_percent,
@@ -5534,7 +5671,7 @@ def parse_ranking_request(form: RankingForm) -> dict[str, object]:
     fs_div = _parse_fs_div(form.fs_div)
 
     return {
-        "growth_conditions": normalize_growth_conditions(form.growth_conditions),
+        "growth_conditions": growth_conditions,
         "market": _parse_market(form.market),
         "recent_years": recent_years,
         "start_year": start_year,
@@ -5614,7 +5751,6 @@ def render_ranking_header(
         <span class="section-tab">DB 업데이트</span>
       </div>
       <form id="ranking-form" class="query-form query-form-ranking" data-loading-form method="get" action="/ranking">
-        <input id="ranking-recent-years" type="hidden" name="recent_years" value="{escape(form.recent_years or str(DEFAULT_RECENT_YEARS))}">
         <label class="field">
           <span>시장</span>
           <select name="market">
@@ -5654,12 +5790,7 @@ def render_ranking_header(
         </div>
       </form>
       <div class="toolbar-row toolbar-row-dense">
-        <div class="segmented" role="group" aria-label="조회 연수">
-          {render_year_preset_button("3년", "3", form.recent_years, "ranking-form", "ranking-recent-years")}
-          {render_year_preset_button("5년", "5", form.recent_years, "ranking-form", "ranking-recent-years")}
-          {render_year_preset_button("10년", "10", form.recent_years, "ranking-form", "ranking-recent-years")}
-        </div>
-        <div class="toolbar-note">선택한 성장률 조건은 모두 충족해야 통과로 계산합니다.</div>
+        <div class="toolbar-note">선택한 성장률 조건은 모두 충족해야 통과로 계산합니다. 각 조건마다 최근 몇 년 또는 몇 분기를 따로 지정할 수 있습니다.</div>
       </div>
       {render_ranking_update_panel(form, company_master_status, update_job)}
     </section>
@@ -5667,7 +5798,11 @@ def render_ranking_header(
 
 
 def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
-    selected = set(form.growth_conditions or DEFAULT_RANKING_GROWTH_CONDITIONS)
+    selected_conditions = _ranking_selected_conditions(form)
+    selected_keys = {
+        (str(condition["series_type"]), str(condition["metric"]))
+        for condition in selected_conditions
+    }
     header_cells = "".join(
         f"<th>{escape(GROWTH_METRIC_LABELS.get(metric, metric))}</th>"
         for metric in GROWTH_CONDITION_METRICS
@@ -5675,15 +5810,31 @@ def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
     body_rows = []
     for series_type in GROWTH_CONDITION_SERIES:
         cells = []
+        unit = growth_condition_period_unit(series_type)
         for metric in GROWTH_CONDITION_METRICS:
             value = _growth_condition_value(series_type=series_type, metric=metric)
-            checked = ' checked' if value in selected else ""
+            checked = " checked" if (series_type, metric) in selected_keys else ""
+            period_input_name = _growth_period_input_name(
+                series_type=series_type,
+                metric=metric,
+            )
+            period_value = _ranking_condition_period_value(
+                form,
+                series_type=series_type,
+                metric=metric,
+            )
             cells.append(
                 "<td>"
+                '<div style="display:grid;gap:8px;align-items:start;">'
                 f'<label style="display:inline-flex;align-items:center;gap:6px;font-weight:600;">'
-                f'<input type="checkbox" name="growth_condition" value="{escape(value)}"{checked}>'
-                f"<span>{escape(GROWTH_METRIC_LABELS.get(metric, metric))}</span>"
+                f'<input type="checkbox" name="growth_condition_key" value="{escape(value)}"{checked}>'
+                "<span>적용</span>"
                 "</label>"
+                '<label style="display:inline-flex;align-items:center;gap:6px;">'
+                f'<input type="number" min="1" name="{escape(period_input_name)}" value="{escape(period_value)}" inputmode="numeric" style="width:88px;">'
+                f"<span>{escape(unit)}</span>"
+                "</label>"
+                "</div>"
                 "</td>"
             )
         body_rows.append(
@@ -5708,6 +5859,8 @@ def render_ranking_update_panel(
     company_master_status: dict[str, object],
     update_job: dict[str, object],
 ) -> str:
+    selected_conditions = _ranking_selected_conditions(form)
+    ranking_recent_years = _ranking_recent_years_from_conditions(selected_conditions)
     last_synced = _format_datetime_text(company_master_status.get("last_synced_at"))
     count = company_master_status.get("count", 0)
     stale = company_master_status.get("is_stale") is True
@@ -5759,7 +5912,7 @@ def render_ranking_update_panel(
         </label>
         <label class="field">
           <span>시작 연도</span>
-          <input id="refresh-year-from" value="{escape(str(max(MIN_OPENDART_YEAR, (int(form.end_year or default_end_year()) - int(form.recent_years or DEFAULT_RECENT_YEARS) + 1))))}" inputmode="numeric">
+          <input id="refresh-year-from" value="{escape(str(max(MIN_OPENDART_YEAR, (int(form.end_year or default_end_year()) - ranking_recent_years + 1))))}" inputmode="numeric">
         </label>
         <label class="field">
           <span>기준 연도</span>
@@ -5845,11 +5998,12 @@ def render_ranking_results(payload: dict[str, object]) -> str:
         </section>
         """
 
+    analysis_recent_years = _analysis_recent_years_from_ranking_filters(filters)
     table_rows = []
     for row in rows:
         analysis_href = _build_analysis_href(
             company_query=str(row.get("corp_name", "") or row.get("stock_code", "")),
-            recent_years=str(filters.get("recent_annual_periods", DEFAULT_RECENT_YEARS)),
+            recent_years=str(analysis_recent_years),
             end_year=str(summary.get("end_year", default_end_year())),
             fs_div=str(filters.get("fs_div", "CFS") or "ALL"),
             threshold_percent=str(filters.get("threshold_percent", DEFAULT_THRESHOLD_PERCENT)),
@@ -5875,7 +6029,8 @@ def render_ranking_results(payload: dict[str, object]) -> str:
 
     condition_labels = ", ".join(
         f"{GROWTH_SERIES_LABELS.get(str(item.get('series_type', '')), str(item.get('series_type', '')))} "
-        f"{GROWTH_METRIC_LABELS.get(str(item.get('metric', '')), str(item.get('metric', '')))}"
+        f"{GROWTH_METRIC_LABELS.get(str(item.get('metric', '')), str(item.get('metric', '')))} "
+        f"({format_growth_condition_period_label(str(item.get('series_type', '')), item.get('recent_periods'))})"
         for item in selected_conditions
     )
 
@@ -5917,8 +6072,9 @@ def render_ranking_growth_checks(checks: list[object]) -> str:
     for item in checks:
         check = _dict(item)
         items.append(
-            '<div class="filter-row" style="grid-template-columns: 1fr auto auto; padding: 6px 0;">'
+            '<div class="filter-row" style="grid-template-columns: 1.2fr auto auto auto; padding: 6px 0; gap: 10px;">'
             f"<span>{escape(str(check.get('series_label', '')))} {escape(str(check.get('metric_label', '')))}</span>"
+            f"<span>{escape(str(check.get('recent_period_label', '-') or '-'))}</span>"
             f"<strong>{escape(_format_percent(check.get('minimum_growth_rate')))}</strong>"
             f'<em class="{_pass_class(check.get("passed"))}">{escape("통과" if check.get("passed") else "실패")}</em>'
             "</div>"
@@ -6241,8 +6397,15 @@ def render_ranking_job_script(form: RankingForm) -> str:
     """
 
 
-def _growth_condition_value(*, series_type: str, metric: str) -> str:
-    return f"{series_type}:{metric}"
+def _growth_condition_value(
+    *,
+    series_type: str,
+    metric: str,
+    recent_periods: int | None = None,
+) -> str:
+    if recent_periods is None:
+        return f"{series_type}:{metric}"
+    return f"{series_type}:{metric}:{int(recent_periods)}"
 
 
 async def _read_request_json(request: Request) -> dict[str, object]:
@@ -6429,7 +6592,6 @@ def _build_ranking_href(
     if str(market).strip() and str(market).strip().upper() != "ALL":
         params.append(("market", str(market).strip()))
     for key, value in (
-        ("recent_years", recent_years),
         ("end_year", end_year),
         ("fs_div", fs_div),
         ("threshold_percent", threshold_percent),

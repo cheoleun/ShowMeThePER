@@ -11,7 +11,10 @@ from .growth import (
     QUARTERLY_QOQ,
     QUARTERLY_YOY,
     TRAILING_FOUR_QUARTER_YOY,
+    minimum_recent_growth_rate,
+    passes_recent_growth_threshold,
 )
+from .models import GrowthPoint, parse_decimal_amount
 
 
 VALID_GROWTH_METRICS = ("revenue", "operating_income", "net_income")
@@ -26,10 +29,19 @@ VALID_VALUATION_SORT_KEYS = VALID_SCREENING_SORT_KEYS
 
 DEFAULT_SCREENING_GROWTH_METRIC = "revenue"
 DEFAULT_SCREENING_GROWTH_SERIES_TYPE = ANNUAL_YOY
+DEFAULT_GROWTH_CONDITION_PERIODS = {
+    ANNUAL_YOY: 3,
+    TRAILING_FOUR_QUARTER_YOY: 3,
+    QUARTERLY_YOY: 12,
+    QUARTERLY_QOQ: 12,
+}
 DEFAULT_SCREENING_GROWTH_CONDITIONS = (
     {
         "metric": DEFAULT_SCREENING_GROWTH_METRIC,
         "series_type": DEFAULT_SCREENING_GROWTH_SERIES_TYPE,
+        "recent_periods": DEFAULT_GROWTH_CONDITION_PERIODS[
+            DEFAULT_SCREENING_GROWTH_SERIES_TYPE
+        ],
     },
 )
 
@@ -43,6 +55,13 @@ GROWTH_METRIC_LABELS = {
     "revenue": "매출",
     "operating_income": "영업이익",
     "net_income": "순이익",
+}
+
+GROWTH_SERIES_PERIOD_UNITS = {
+    ANNUAL_YOY: "년",
+    TRAILING_FOUR_QUARTER_YOY: "년",
+    QUARTERLY_YOY: "분기",
+    QUARTERLY_QOQ: "분기",
 }
 
 
@@ -73,20 +92,47 @@ def read_valuation_snapshots(path: Path) -> list[ValuationSnapshot]:
     return [_parse_valuation_snapshot(item) for item in raw_values]
 
 
-def parse_growth_condition(value: str) -> dict[str, str]:
+def default_recent_periods_for_series(series_type: str) -> int:
+    return DEFAULT_GROWTH_CONDITION_PERIODS.get(
+        str(series_type or "").strip(),
+        DEFAULT_GROWTH_CONDITION_PERIODS[DEFAULT_SCREENING_GROWTH_SERIES_TYPE],
+    )
+
+
+def growth_condition_period_unit(series_type: str) -> str:
+    return GROWTH_SERIES_PERIOD_UNITS.get(str(series_type or "").strip(), "기간")
+
+
+def format_growth_condition_period_label(
+    series_type: str,
+    recent_periods: int | str | None,
+) -> str:
+    try:
+        periods = int(recent_periods or 0)
+    except (TypeError, ValueError):
+        periods = 0
+    if periods <= 0:
+        return "-"
+    return f"최근 {periods}{growth_condition_period_unit(series_type)}"
+
+
+def parse_growth_condition(value: str) -> dict[str, object]:
     text = str(value or "").strip()
     if not text:
         raise ValueError("growth condition is required")
 
-    series_type, separator, metric = text.partition(":")
-    if separator != ":":
+    parts = [part.strip() for part in text.split(":")]
+    if len(parts) not in {2, 3}:
         raise ValueError(
-            "growth condition must use the form '<series_type>:<metric>'"
+            "growth condition must use the form '<series_type>:<metric>' or "
+            "'<series_type>:<metric>:<recent_periods>'"
         )
-    normalized = {
-        "series_type": series_type.strip(),
-        "metric": metric.strip(),
+    normalized: dict[str, object] = {
+        "series_type": parts[0],
+        "metric": parts[1],
     }
+    if len(parts) == 3:
+        normalized["recent_periods"] = parts[2]
     return _validate_growth_condition(normalized)
 
 
@@ -95,8 +141,8 @@ def normalize_growth_conditions(
     *,
     growth_metric: str | None = None,
     growth_series_type: str | None = None,
-) -> list[dict[str, str]]:
-    normalized: list[dict[str, str]] = []
+) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
 
     raw_conditions: list[dict[str, object] | str] = list(growth_conditions or [])
@@ -105,6 +151,9 @@ def normalize_growth_conditions(
             {
                 "metric": growth_metric or DEFAULT_SCREENING_GROWTH_METRIC,
                 "series_type": growth_series_type or DEFAULT_SCREENING_GROWTH_SERIES_TYPE,
+                "recent_periods": default_recent_periods_for_series(
+                    growth_series_type or DEFAULT_SCREENING_GROWTH_SERIES_TYPE
+                ),
             }
         ]
 
@@ -116,6 +165,7 @@ def normalize_growth_conditions(
                 {
                     "metric": str(item.get("metric", "")).strip(),
                     "series_type": str(item.get("series_type", "")).strip(),
+                    "recent_periods": item.get("recent_periods"),
                 }
             )
         else:
@@ -140,6 +190,7 @@ def build_ranking_payload(
     growth_metric: str | None = None,
     growth_series_type: str | None = None,
     include_failed_growth: bool = False,
+    threshold_percent: Decimal = Decimal("20"),
     max_per: Decimal | None = None,
     max_pbr: Decimal | None = None,
     min_roe: Decimal | None = None,
@@ -152,11 +203,11 @@ def build_ranking_payload(
         growth_series_type=growth_series_type,
     )
     primary_condition = normalized_conditions[0]
-    growth_rankings = rank_growth_filter_results(
-        _growth_filter_results(growth_metrics_payload),
-        metric=primary_condition["metric"],
-        series_type=primary_condition["series_type"],
+    growth_rankings = _build_growth_rankings_from_points(
+        _growth_points(growth_metrics_payload),
+        condition=primary_condition,
         include_failed=include_failed_growth,
+        threshold_percent=threshold_percent,
     )
     filtered_valuations = filter_valuation_snapshots(
         valuation_list,
@@ -169,11 +220,12 @@ def build_ranking_payload(
         rank_by=rank_valuation_by,
     )
     screening_rows = build_screening_rows(
-        _growth_filter_results(growth_metrics_payload),
+        _growth_points(growth_metrics_payload),
         valuation_list,
         growth_conditions=normalized_conditions,
         include_failed_growth=include_failed_growth,
         sort_by="market_cap",
+        threshold_percent=threshold_percent,
     )
 
     return {
@@ -188,6 +240,7 @@ def build_ranking_payload(
             "growth_metric": primary_condition["metric"],
             "growth_series_type": primary_condition["series_type"],
             "include_failed_growth": include_failed_growth,
+            "threshold_percent": _decimal_to_string(threshold_percent),
             "max_per": _decimal_to_string(max_per),
             "max_pbr": _decimal_to_string(max_pbr),
             "min_roe": _decimal_to_string(min_roe),
@@ -334,7 +387,7 @@ def rank_valuation_snapshots(
 
 
 def build_screening_rows(
-    filter_results: Iterable[dict[str, object]],
+    growth_points: Iterable[GrowthPoint | dict[str, object]],
     valuation_snapshots: Iterable[ValuationSnapshot],
     *,
     company_index: dict[str, dict[str, str]] | None = None,
@@ -348,6 +401,7 @@ def build_screening_rows(
     min_roe: Decimal | None = None,
     market: str | None = None,
     sort_by: str = "market_cap",
+    threshold_percent: Decimal = Decimal("20"),
 ) -> list[dict[str, object]]:
     normalized_conditions = normalize_growth_conditions(
         growth_conditions,
@@ -362,13 +416,14 @@ def build_screening_rows(
     company_profiles = company_index or {}
     latest_valuations = _latest_snapshots_by_corp_code(valuation_snapshots)
     normalized_market = (market or "").strip().upper()
-    grouped_results = _group_filter_results_by_company(filter_results)
+    grouped_points = _group_growth_points_by_company(growth_points)
     rows: list[dict[str, object]] = []
 
-    for corp_code in sorted(grouped_results):
+    for corp_code in sorted(grouped_points):
         checks = _build_growth_checks(
-            grouped_results.get(corp_code, {}),
+            grouped_points.get(corp_code, {}),
             growth_conditions=normalized_conditions,
+            threshold_percent=threshold_percent,
         )
         passed = bool(checks) and all(check["passed"] is True for check in checks)
         if not include_failed_growth and not passed:
@@ -433,9 +488,11 @@ def build_screening_rows(
         if len(normalized_conditions) == 1:
             row["metric"] = normalized_conditions[0]["metric"]
             row["series_type"] = normalized_conditions[0]["series_type"]
+            row["recent_periods"] = normalized_conditions[0]["recent_periods"]
         else:
             row["metric"] = ""
             row["series_type"] = ""
+            row["recent_periods"] = None
         rows.append(row)
 
     rows.sort(key=lambda row: _screening_sort_key(row, sort_by))
@@ -445,44 +502,60 @@ def build_screening_rows(
 
 
 def _build_growth_checks(
-    result_index: dict[tuple[str, str], dict[str, object]],
+    point_index: dict[tuple[str, str], list[GrowthPoint]],
     *,
-    growth_conditions: list[dict[str, str]],
+    growth_conditions: list[dict[str, object]],
+    threshold_percent: Decimal,
 ) -> list[dict[str, object]]:
     checks: list[dict[str, object]] = []
     for condition in growth_conditions:
-        series_type = condition["series_type"]
-        metric = condition["metric"]
-        result = result_index.get((series_type, metric))
-        minimum_growth_rate = None if result is None else result.get("minimum_growth_rate")
+        series_type = str(condition["series_type"])
+        metric = str(condition["metric"])
+        recent_periods = int(condition["recent_periods"])
+        points = point_index.get((series_type, metric), [])
+        minimum_growth_rate = minimum_recent_growth_rate(
+            points,
+            recent_periods=recent_periods,
+        )
         check = {
             "metric": metric,
             "metric_label": GROWTH_METRIC_LABELS.get(metric, metric),
             "series_type": series_type,
             "series_label": GROWTH_SERIES_LABELS.get(series_type, series_type),
-            "recent_periods": (
-                0 if result is None else int(result.get("recent_periods", 0) or 0)
+            "recent_periods": recent_periods,
+            "recent_period_label": format_growth_condition_period_label(
+                series_type,
+                recent_periods,
             ),
             "minimum_growth_rate": None
-            if minimum_growth_rate in {None, ""}
+            if minimum_growth_rate is None
             else str(minimum_growth_rate),
-            "passed": result.get("passed") is True if result is not None else False,
+            "passed": passes_recent_growth_threshold(
+                points,
+                threshold_percent=threshold_percent,
+                recent_periods=recent_periods,
+            ),
         }
         checks.append(check)
     return checks
 
 
-def _group_filter_results_by_company(
-    filter_results: Iterable[dict[str, object]],
-) -> dict[str, dict[tuple[str, str], dict[str, object]]]:
-    grouped: dict[str, dict[tuple[str, str], dict[str, object]]] = {}
-    for result in filter_results:
-        corp_code = str(result.get("corp_code", "")).strip()
-        metric = str(result.get("metric", "")).strip()
-        series_type = str(result.get("series_type", "")).strip()
+def _group_growth_points_by_company(
+    growth_points: Iterable[GrowthPoint | dict[str, object]],
+) -> dict[str, dict[tuple[str, str], list[GrowthPoint]]]:
+    grouped: dict[str, dict[tuple[str, str], list[GrowthPoint]]] = {}
+    for point in growth_points:
+        normalized_point = _normalize_growth_point(point)
+        if normalized_point is None:
+            continue
+        corp_code = normalized_point.corp_code.strip()
+        metric = normalized_point.metric.strip()
+        series_type = normalized_point.series_type.strip()
         if not corp_code or not metric or not series_type:
             continue
-        grouped.setdefault(corp_code, {})[(series_type, metric)] = result
+        grouped.setdefault(corp_code, {}).setdefault((series_type, metric), []).append(
+            normalized_point
+        )
     return grouped
 
 
@@ -543,9 +616,53 @@ def _coalesce_decimal(*values: Decimal | None) -> Decimal | None:
     return None
 
 
-def _validate_growth_condition(condition: dict[str, str]) -> dict[str, str]:
-    metric = condition.get("metric", "").strip()
-    series_type = condition.get("series_type", "").strip()
+def _normalize_growth_point(
+    point: GrowthPoint | dict[str, object],
+) -> GrowthPoint | None:
+    if isinstance(point, GrowthPoint):
+        return point
+
+    corp_code = str(point.get("corp_code", "")).strip()
+    metric = str(point.get("metric", "")).strip()
+    series_type = str(point.get("series_type", "")).strip()
+    try:
+        fiscal_year = int(point.get("fiscal_year", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+
+    fiscal_quarter_raw = point.get("fiscal_quarter")
+    try:
+        fiscal_quarter = (
+            None if fiscal_quarter_raw in {None, ""} else int(fiscal_quarter_raw)
+        )
+    except (TypeError, ValueError):
+        return None
+
+    amount = parse_decimal_amount(
+        None if point.get("amount") is None else str(point.get("amount"))
+    )
+    if amount is None:
+        return None
+
+    return GrowthPoint(
+        corp_code=corp_code,
+        metric=metric,
+        series_type=series_type,
+        fiscal_year=fiscal_year,
+        fiscal_quarter=fiscal_quarter,
+        amount=amount,
+        base_amount=parse_decimal_amount(
+            None if point.get("base_amount") is None else str(point.get("base_amount"))
+        ),
+        growth_rate=parse_decimal_amount(
+            None if point.get("growth_rate") is None else str(point.get("growth_rate"))
+        ),
+    )
+
+
+def _validate_growth_condition(condition: dict[str, object]) -> dict[str, object]:
+    metric = str(condition.get("metric", "")).strip()
+    series_type = str(condition.get("series_type", "")).strip()
     if metric not in VALID_GROWTH_METRICS:
         raise ValueError(
             f"unsupported growth metric: {metric or '-'}"
@@ -554,9 +671,24 @@ def _validate_growth_condition(condition: dict[str, str]) -> dict[str, str]:
         raise ValueError(
             f"unsupported growth series type: {series_type or '-'}"
         )
+    raw_recent_periods = condition.get("recent_periods")
+    if raw_recent_periods in {None, ""}:
+        recent_periods = default_recent_periods_for_series(series_type)
+    else:
+        try:
+            recent_periods = int(str(raw_recent_periods).strip())
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"growth recent periods must be a positive integer: {raw_recent_periods}"
+            ) from None
+    if recent_periods <= 0:
+        raise ValueError(
+            f"growth recent periods must be a positive integer: {recent_periods}"
+        )
     return {
         "metric": metric,
         "series_type": series_type,
+        "recent_periods": recent_periods,
     }
 
 
@@ -572,6 +704,67 @@ def _growth_filter_results(payload: dict[str, object]) -> list[dict[str, object]
     if not isinstance(results, list):
         return []
     return [result for result in results if isinstance(result, dict)]
+
+
+def _growth_points(payload: dict[str, object]) -> list[dict[str, object]]:
+    points = payload.get("growth_points", [])
+    if not isinstance(points, list):
+        return []
+    return [point for point in points if isinstance(point, dict)]
+
+
+def _build_growth_rankings_from_points(
+    growth_points: Iterable[GrowthPoint | dict[str, object]],
+    *,
+    condition: dict[str, object],
+    include_failed: bool,
+    threshold_percent: Decimal,
+) -> list[dict[str, object]]:
+    grouped_points = _group_growth_points_by_company(growth_points)
+    rankings: list[tuple[Decimal, dict[str, object]]] = []
+    metric = str(condition["metric"])
+    series_type = str(condition["series_type"])
+    recent_periods = int(condition["recent_periods"])
+
+    for corp_code, point_index in grouped_points.items():
+        points = point_index.get((series_type, metric), [])
+        minimum_growth_rate = minimum_recent_growth_rate(
+            points,
+            recent_periods=recent_periods,
+        )
+        passed = passes_recent_growth_threshold(
+            points,
+            threshold_percent=threshold_percent,
+            recent_periods=recent_periods,
+        )
+        if minimum_growth_rate is None:
+            continue
+        if not include_failed and not passed:
+            continue
+        rankings.append(
+            (
+                minimum_growth_rate,
+                {
+                    "corp_code": corp_code,
+                    "metric": metric,
+                    "series_type": series_type,
+                    "recent_periods": recent_periods,
+                    "minimum_growth_rate": str(minimum_growth_rate),
+                    "passed": passed,
+                },
+            )
+        )
+
+    return [
+        {
+            "rank": rank,
+            **result,
+        }
+        for rank, (_, result) in enumerate(
+            sorted(rankings, key=lambda item: item[0], reverse=True),
+            start=1,
+        )
+    ]
 
 
 def _parse_valuation_snapshot(item: dict[str, object]) -> ValuationSnapshot:

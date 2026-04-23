@@ -252,7 +252,10 @@ def main(argv: list[str] | None = None) -> None:
         "--growth-condition",
         action="append",
         default=[],
-        help="Growth condition in the form annual_yoy:revenue. May be repeated.",
+        help=(
+            "Growth condition in the form annual_yoy:revenue[:recent_periods]. "
+            "May be repeated."
+        ),
     )
     ranking_parser.add_argument(
         "--growth-metric",
@@ -454,7 +457,10 @@ def main(argv: list[str] | None = None) -> None:
         "--growth-condition",
         action="append",
         default=[],
-        help="Growth condition in the form annual_yoy:revenue. May be repeated.",
+        help=(
+            "Growth condition in the form annual_yoy:revenue[:recent_periods]. "
+            "May be repeated."
+        ),
     )
     db_growth_rank_parser.add_argument(
         "--growth-metric",
@@ -512,6 +518,15 @@ def main(argv: list[str] | None = None) -> None:
         type=Path,
         required=True,
         help="SQLite database path.",
+    )
+    growth_ranking_report_parser.add_argument(
+        "--growth-condition",
+        action="append",
+        default=[],
+        help=(
+            "Growth condition in the form annual_yoy:revenue[:recent_periods]. "
+            "May be repeated."
+        ),
     )
     growth_ranking_report_parser.add_argument(
         "--growth-metric",
@@ -697,7 +712,11 @@ def run_rank_companies(args: argparse.Namespace) -> None:
 
     if args.database is not None:
         end_year = args.end_year or datetime_now_year()
-        start_year = end_year - max(args.recent_years, 1) + 1
+        screening_recent_years = max(
+            max(args.recent_years, 1),
+            derive_recent_years_from_growth_conditions(growth_conditions),
+        )
+        start_year = end_year - screening_recent_years + 1
         payload = build_database_company_screening_payload(
             args.database,
             start_year=start_year,
@@ -817,6 +836,7 @@ def run_company_growth_report(args: argparse.Namespace) -> None:
 def run_growth_ranking_report(args: argparse.Namespace) -> None:
     payload = build_growth_ranking_report_payload(
         args.database,
+        growth_conditions=args.growth_condition,
         growth_metric=args.growth_metric,
         growth_series_type=args.growth_series_type,
         include_failed_growth=args.include_failed_growth,
@@ -901,6 +921,25 @@ def cli_valuation_snapshot_from_company(
 
 def datetime_now_year() -> int:
     return date.today().year
+
+
+def derive_recent_years_from_growth_conditions(
+    growth_conditions: list[dict[str, object]],
+) -> int:
+    recent_years = 1
+    for condition in growth_conditions:
+        try:
+            recent_periods = int(condition.get("recent_periods", 0))
+        except (TypeError, ValueError):
+            continue
+        if recent_periods <= 0:
+            continue
+        series_type = str(condition.get("series_type", "")).strip()
+        if series_type in {"annual_yoy", "trailing_four_quarter_yoy"}:
+            recent_years = max(recent_years, recent_periods)
+        else:
+            recent_years = max(recent_years, max(1, (recent_periods + 3) // 4))
+    return recent_years
 
 
 def write_or_print_json(payload: dict[str, object], output: Path | None) -> None:

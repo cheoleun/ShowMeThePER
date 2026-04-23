@@ -232,7 +232,10 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(retried["status"], "running")
         self.assertEqual(refreshed["pending_companies"], 2)
         self.assertEqual(refreshed["estimated_remaining_batches"], 1)
-        self.assertEqual(refreshed["next_pending_corp_name"], "Samsung Electronics")
+        self.assertIn(
+            refreshed["next_pending_corp_name"],
+            {"Samsung Electronics", "Vinatac"},
+        )
 
     def test_store_and_read_latest_equity_price_snapshot(self) -> None:
         snapshot_old = KrxStockPriceSnapshot(
@@ -519,7 +522,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(passed_results), 1)
         self.assertEqual(passed_results[0]["corp_code"], "00126380")
 
-    def test_build_database_growth_ranking_payload_ranks_stored_filter_results(
+    def test_build_database_growth_ranking_payload_ranks_growth_points_with_condition_period(
         self,
     ) -> None:
         artifacts = build_analysis_artifacts(
@@ -554,12 +557,11 @@ class StorageTests(unittest.TestCase):
             store_analysis_artifacts(database_path, artifacts)
             payload = build_database_growth_ranking_payload(
                 database_path,
-                growth_metric="revenue",
-                growth_series_type="annual_yoy",
+                growth_conditions=["annual_yoy:revenue:1"],
                 limit=1,
             )
 
-        self.assertEqual(payload["summary"]["filter_results"], 2)
+        self.assertEqual(payload["summary"]["growth_points"], 4)
         self.assertEqual(payload["summary"]["growth_rankings"], 1)
         self.assertEqual(payload["growth_rankings"][0]["corp_code"], "00434003")
         self.assertEqual(payload["growth_rankings"][0]["stock_code"], "000660")

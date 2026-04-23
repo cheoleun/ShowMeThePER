@@ -939,6 +939,11 @@ class WebTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('value="annual_yoy:revenue"', response.text)
         self.assertIn('value="quarterly_qoq:net_income"', response.text)
+        self.assertIn('name="growth_condition_key"', response.text)
+        self.assertIn('name="growth_period__annual_yoy__revenue"', response.text)
+        self.assertIn('value="3"', response.text)
+        self.assertIn('name="growth_period__quarterly_qoq__net_income"', response.text)
+        self.assertIn('value="12"', response.text)
         self.assertIn("DB 업데이트", response.text)
         self.assertIn("KRX 연결 문제 진단", response.text)
         self.assertIn("KRX 연결 점검 실행", response.text)
@@ -1025,7 +1030,6 @@ class WebTests(TestCase):
                 response = client.get(
                     "/ranking",
                     params=[
-                        ("recent_years", "2"),
                         ("end_year", "2025"),
                         ("fs_div", "CFS"),
                         ("threshold_percent", "20"),
@@ -1038,9 +1042,63 @@ class WebTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('value="annual_yoy:revenue" checked', response.text)
         self.assertIn('value="quarterly_yoy:operating_income" checked', response.text)
-        self.assertIn("1/2", response.text)
         self.assertIn("0/2", response.text)
         self.assertIn("조건별 확인", response.text)
+        self.assertIn("최근 3년", response.text)
+        self.assertIn("최근 12분기", response.text)
+        self.assertIn("growth_condition=annual_yoy%3Arevenue%3A3", str(response.url))
+        self.assertIn(
+            "growth_condition=quarterly_yoy%3Aoperating_income%3A12",
+            str(response.url),
+        )
+
+    def test_ranking_page_uses_condition_specific_period_inputs(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "3",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.get(
+                    "/ranking",
+                    params=[
+                        ("end_year", "2025"),
+                        ("fs_div", "CFS"),
+                        ("threshold_percent", "20"),
+                        ("growth_condition_key", "annual_yoy:revenue"),
+                        ("growth_period__annual_yoy__revenue", "1"),
+                    ],
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("최근 1년", response.text)
+        self.assertIn("growth_condition=annual_yoy%3Arevenue%3A1", str(response.url))
 
     def test_ranking_update_job_requires_company_master_sync(self) -> None:
         client = TestClient(

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .financials import read_financial_statement_rows
-from .growth import build_growth_metrics_payload, read_financial_period_values
+from .growth import read_financial_period_values
 from .krx import KrxStockPriceSnapshot
 from .models import DartCompany, FinancialPeriodValue, FinancialStatementRow, GrowthPoint
 from .pipeline import AnalysisArtifacts, CollectionError
@@ -16,7 +16,6 @@ from .rankings import (
     ValuationSnapshot,
     build_screening_rows,
     normalize_growth_conditions,
-    rank_growth_filter_results,
 )
 
 
@@ -1527,35 +1526,43 @@ def build_database_growth_ranking_payload(
         growth_series_type=growth_series_type,
     )
     primary_condition = normalized_conditions[0]
-    filter_results = read_growth_filter_results_from_database(
+    growth_points = read_growth_points_from_database(
         database_path,
         metric=primary_condition["metric"],
         series_type=primary_condition["series_type"],
-        passed=None if include_failed_growth else True,
     )
-    rankings = rank_growth_filter_results(
-        filter_results,
-        metric=primary_condition["metric"],
-        series_type=primary_condition["series_type"],
-        include_failed=include_failed_growth,
+    company_index = _read_company_index(database_path)
+    rows = build_screening_rows(
+        growth_points,
+        (),
+        company_index=company_index,
+        growth_conditions=[primary_condition],
+        include_failed_growth=include_failed_growth,
+        sort_by="overall_minimum_growth_rate",
+        threshold_percent=Decimal("20"),
     )
+    rankings = [
+        {
+            "rank": index,
+            "corp_code": row["corp_code"],
+            "corp_name": row["corp_name"],
+            "stock_code": row["stock_code"],
+            "metric": row["metric"],
+            "series_type": row["series_type"],
+            "recent_periods": row.get("recent_periods"),
+            "minimum_growth_rate": row["minimum_growth_rate"],
+            "passed": row["passed"],
+        }
+        for index, row in enumerate(rows, start=1)
+    ]
     if limit is not None:
         rankings = rankings[:limit]
-
-    company_index = _read_company_index(database_path)
-    enriched_rankings = [
-        {
-            **ranking,
-            **company_index.get(str(ranking["corp_code"]), {}),
-        }
-        for ranking in rankings
-    ]
 
     return {
         "summary": {
             "database": str(database_path),
-            "filter_results": len(filter_results),
-            "growth_rankings": len(enriched_rankings),
+            "growth_points": len(growth_points),
+            "growth_rankings": len(rankings),
         },
         "filters": {
             "growth_conditions": normalized_conditions,
@@ -1564,7 +1571,7 @@ def build_database_growth_ranking_payload(
             "include_failed_growth": include_failed_growth,
             "limit": limit,
         },
-        "growth_rankings": enriched_rankings,
+        "growth_rankings": rankings,
     }
 
 
@@ -1589,22 +1596,16 @@ def build_database_company_screening_payload(
 ) -> dict[str, object]:
     initialize_database(database_path)
     calculation_start_year = max(0, start_year - 1)
-    values = [
-        value
-        for value in read_financial_period_values_from_database(database_path)
-        if calculation_start_year <= value.fiscal_year <= end_year
-    ]
     normalized_conditions = normalize_growth_conditions(
         growth_conditions,
         growth_metric=growth_metric,
         growth_series_type=growth_series_type,
     )
-    growth_payload = build_growth_metrics_payload(
-        values,
-        threshold_percent=threshold_percent,
-        recent_annual_periods=recent_annual_periods,
-        recent_quarterly_periods=recent_quarterly_periods,
-    )
+    growth_points = [
+        point
+        for point in read_growth_points_from_database(database_path)
+        if calculation_start_year <= point.fiscal_year <= end_year
+    ]
     valuation_snapshots = read_latest_valuation_snapshots(database_path)
     company_index = _read_company_index(database_path)
     latest_equity_price_snapshots = read_latest_equity_price_snapshots(database_path)
@@ -1622,7 +1623,7 @@ def build_database_company_screening_payload(
     }
 
     rows = build_screening_rows(
-        growth_payload.get("filter", {}).get("results", []),  # type: ignore[arg-type]
+        growth_points,
         valuation_snapshots,
         company_index=company_index,
         price_index=price_index,
@@ -1630,12 +1631,13 @@ def build_database_company_screening_payload(
         include_failed_growth=include_failed_growth,
         market=market,
         sort_by=sort_by,
+        threshold_percent=threshold_percent,
     )
 
     return {
         "summary": {
             "database": str(database_path),
-            "values": len(values),
+            "growth_points": len(growth_points),
             "valuation_snapshots": len(valuation_snapshots),
             "screening_rows": len(rows),
             "start_year": start_year,

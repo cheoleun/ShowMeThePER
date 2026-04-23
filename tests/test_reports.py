@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import tempfile
 import unittest
@@ -80,6 +80,7 @@ class ReportTests(unittest.TestCase):
 
             payload = build_growth_ranking_report_payload(
                 database_path,
+                growth_conditions=["annual_yoy:revenue:1"],
                 growth_metric="revenue",
                 growth_series_type="annual_yoy",
                 limit=1,
@@ -95,6 +96,7 @@ class ReportTests(unittest.TestCase):
             database_path = build_ranking_database(Path(directory))
             payload = build_growth_ranking_report_payload(
                 database_path,
+                growth_conditions=["annual_yoy:revenue:1"],
                 growth_metric="revenue",
                 growth_series_type="annual_yoy",
             )
@@ -113,6 +115,7 @@ class ReportTests(unittest.TestCase):
             database_path = build_ranking_database(base)
             payload = build_growth_ranking_report_payload(
                 database_path,
+                growth_conditions=["annual_yoy:revenue:1"],
                 growth_metric="revenue",
                 growth_series_type="annual_yoy",
             )
