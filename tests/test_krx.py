@@ -133,7 +133,8 @@ class KrxParserTests(unittest.TestCase):
     def test_encoded_service_key_is_normalized_before_urlencode(self) -> None:
         captured: dict[str, str] = {}
 
-        def fake_urlopen(url: str, timeout: int = 30) -> object:
+        def fake_urlopen(request: object, timeout: int = 30) -> object:
+            url = getattr(request, "full_url", str(request))
             captured["url"] = url
             raise HTTPError(url, 403, "Forbidden", None, None)
 
@@ -145,6 +146,23 @@ class KrxParserTests(unittest.TestCase):
 
         self.assertIn("serviceKey=abc%2Bdef%3D%3D", captured["url"])
         self.assertNotIn("%252B", captured["url"])
+
+    def test_fetch_listings_adds_browser_like_headers(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request: object, timeout: int = 30) -> object:
+            captured["request"] = request
+            raise HTTPError(request.full_url, 403, "Forbidden", None, None)
+
+        client = KrxClient("test-key")
+
+        with patch("show_me_the_per.krx.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(KrxApiError):
+                client.fetch_listings()
+
+        request = captured["request"]
+        self.assertEqual(request.get_header("User-agent"), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+        self.assertEqual(request.get_header("Accept"), "application/json,text/plain,*/*")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import json
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from .models import KOREAN_EQUITY_MARKETS, KrxListing, normalize_stock_code, parse_decimal_amount
 
@@ -19,6 +19,14 @@ DEFAULT_KRX_STOCK_PRICE_ENDPOINT = (
     "https://apis.data.go.kr/1160100/service/"
     "GetStockSecuritiesInfoService/getStockPriceInfo"
 )
+DEFAULT_KRX_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/136.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+}
 
 
 class KrxApiError(RuntimeError):
@@ -92,8 +100,9 @@ class KrxClient:
             params["basDt"] = base_date
 
         url = f"{self.endpoint}?{urlencode(params)}"
+        request = Request(url, headers=DEFAULT_KRX_REQUEST_HEADERS)
         try:
-            with urlopen(url, timeout=self.timeout_seconds) as response:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             raise _translate_krx_http_error(
@@ -137,8 +146,9 @@ class KrxStockPriceClient:
             "likeSrtnCd": normalized_stock_code,
         }
         url = f"{self.endpoint}?{urlencode(params)}"
+        request = Request(url, headers=DEFAULT_KRX_REQUEST_HEADERS)
         try:
-            with urlopen(url, timeout=self.timeout_seconds) as response:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             raise _translate_krx_http_error(
