@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Callable, Iterable, Protocol
 from urllib.parse import urlencode
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from .growth import ANNUAL_YOY, QUARTERLY_YOY, TRAILING_FOUR_QUARTER_YOY
-from .krx import KrxStockPriceClient, KrxStockPriceSnapshot
+from .growth import ANNUAL_YOY, QUARTERLY_QOQ, QUARTERLY_YOY, TRAILING_FOUR_QUARTER_YOY
+from .krx import KrxClient, KrxStockPriceClient, KrxStockPriceSnapshot
+from .matching import match_listings_to_dart
 from .naver_finance import NaverFinanceClient
 from .models import (
     DartCompany,
@@ -38,20 +39,34 @@ from .reports import (
     _format_percent,
 )
 from .rankings import (
+    DEFAULT_SCREENING_GROWTH_CONDITIONS,
     DEFAULT_SCREENING_GROWTH_METRIC,
     DEFAULT_SCREENING_GROWTH_SERIES_TYPE,
+    GROWTH_METRIC_LABELS,
+    GROWTH_SERIES_LABELS,
     ValuationSnapshot,
+    normalize_growth_conditions,
 )
 from .storage import (
     build_database_company_screening_payload,
+    create_refresh_job,
+    read_company_master_entries,
+    read_company_master_status,
     read_dart_companies_from_database,
+    read_latest_refresh_job,
     read_latest_equity_price_snapshot,
     read_latest_valuation_snapshot,
     read_financial_statement_rows_from_database,
+    read_refresh_job,
+    read_refresh_job_items,
     replace_company_analysis_artifacts,
+    record_refresh_job_item_result,
+    retry_failed_refresh_job_items,
     store_equity_price_snapshot,
     store_analysis_artifacts,
+    store_company_master_entries,
     store_valuation_snapshot,
+    update_refresh_job_status,
 )
 
 
@@ -66,6 +81,21 @@ DEFAULT_RANKING_SORT_BY = "market_cap"
 DEFAULT_MARKET_FILTER = "ALL"
 DEFAULT_RANKING_GROWTH_METRIC = DEFAULT_SCREENING_GROWTH_METRIC
 DEFAULT_RANKING_GROWTH_SERIES_TYPE = DEFAULT_SCREENING_GROWTH_SERIES_TYPE
+DEFAULT_RANKING_GROWTH_CONDITIONS = tuple(
+    f"{item['series_type']}:{item['metric']}"
+    for item in DEFAULT_SCREENING_GROWTH_CONDITIONS
+)
+RANKING_SORT_OPTIONS = (
+    ("market_cap", "시가총액"),
+    ("overall_minimum_growth_rate", "전체 최소 성장률"),
+)
+GROWTH_CONDITION_SERIES = (
+    ANNUAL_YOY,
+    QUARTERLY_YOY,
+    QUARTERLY_QOQ,
+    TRAILING_FOUR_QUARTER_YOY,
+)
+GROWTH_CONDITION_METRICS = ("revenue", "operating_income", "net_income")
 METRIC_SEQUENCE = ("revenue", "operating_income", "net_income", "eps")
 PERIOD_METRIC_SEQUENCE = {
     "quarterly": ("revenue", "operating_income", "net_income"),
@@ -131,6 +161,16 @@ class StockPriceClient(Protocol):
         ...
 
 
+class ListingClient(Protocol):
+    def fetch_listings(
+        self,
+        base_date: str | None = None,
+        page_size: int = 1000,
+        max_pages: int | None = None,
+    ) -> list[object]:
+        ...
+
+
 class ValuationClient(Protocol):
     def fetch_snapshot(
         self,
@@ -162,14 +202,12 @@ class CompareForm:
 
 @dataclass(frozen=True)
 class RankingForm:
+    growth_conditions: tuple[str, ...] = DEFAULT_RANKING_GROWTH_CONDITIONS
     market: str = DEFAULT_MARKET_FILTER
     recent_years: str = str(DEFAULT_RECENT_YEARS)
     end_year: str = ""
     fs_div: str = "CFS"
     threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT)
-    max_per: str = ""
-    max_pbr: str = ""
-    min_roe: str = ""
     sort_by: str = DEFAULT_RANKING_SORT_BY
 
 
@@ -177,6 +215,7 @@ def create_app(
     client_factory: Callable[[str], MajorAccountClient] = OpenDartClient,
     stock_client_factory: Callable[[str], StockPriceClient] = KrxStockPriceClient,
     valuation_client_factory: Callable[[], ValuationClient] = NaverFinanceClient,
+    listing_client_factory: Callable[[str], ListingClient] = KrxClient,
 ) -> FastAPI:
     app = FastAPI(title="ShowMeThePER")
 
@@ -318,25 +357,21 @@ def create_app(
 
     @app.get("/ranking", response_class=HTMLResponse)
     def ranking(
+        growth_condition: list[str] = Query(default=[]),
         market: str = DEFAULT_MARKET_FILTER,
         recent_years: str = str(DEFAULT_RECENT_YEARS),
         end_year: str = "",
         fs_div: str = "CFS",
         threshold_percent: str = str(DEFAULT_THRESHOLD_PERCENT),
-        max_per: str = "",
-        max_pbr: str = "",
-        min_roe: str = "",
         sort_by: str = DEFAULT_RANKING_SORT_BY,
     ) -> HTMLResponse:
         form = RankingForm(
+            growth_conditions=tuple(growth_condition or DEFAULT_RANKING_GROWTH_CONDITIONS),
             market=(market or DEFAULT_MARKET_FILTER).strip().upper() or DEFAULT_MARKET_FILTER,
             recent_years=recent_years.strip(),
             end_year=end_year.strip() or str(default_end_year()),
             fs_div=fs_div.strip().upper() or "CFS",
             threshold_percent=threshold_percent.strip(),
-            max_per=max_per.strip(),
-            max_pbr=max_pbr.strip(),
-            min_roe=min_roe.strip(),
             sort_by=sort_by.strip() or DEFAULT_RANKING_SORT_BY,
         )
 
@@ -351,18 +386,188 @@ def create_app(
             start_year=request["start_year"],
             end_year=request["end_year"],
             fs_div=request["fs_div"],
-            growth_metric=DEFAULT_RANKING_GROWTH_METRIC,
-            growth_series_type=DEFAULT_RANKING_GROWTH_SERIES_TYPE,
+            growth_conditions=request["growth_conditions"],
+            include_failed_growth=True,
             threshold_percent=request["threshold_percent"],
             recent_annual_periods=request["recent_years"],
             recent_quarterly_periods=request["recent_years"] * 4,
-            max_per=request["max_per"],
-            max_pbr=request["max_pbr"],
-            min_roe=request["min_roe"],
             market=request["market"],
             sort_by=request["sort_by"],
         )
+        payload["company_master_status"] = read_company_master_status(database_path)
+        payload["update_job"] = read_latest_refresh_job(database_path) or {}
         return HTMLResponse(render_ranking_page(form=form, payload=payload))
+
+    @app.post("/ranking/company-master/sync")
+    async def ranking_company_master_sync(
+        request: Request,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        api_key = os.getenv("OPENDART_API_KEY", "").strip()
+        service_key = os.getenv("KRX_SERVICE_KEY", "").strip()
+        if not api_key:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "OPENDART_API_KEY가 필요합니다."},
+            )
+        if not service_key:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "KRX_SERVICE_KEY가 필요합니다."},
+            )
+        _ = await _read_request_json(request)
+        try:
+            summary = _sync_company_master_for_database(
+                database_path=database_path,
+                opendart_client=client_factory(api_key),
+                listing_client=listing_client_factory(service_key),
+            )
+        except Exception as error:
+            return JSONResponse(
+                status_code=500,
+                content={"status": "error", "message": str(error)},
+            )
+        return JSONResponse({"status": "ok", **summary})
+
+    @app.post("/ranking/update-jobs")
+    async def create_ranking_update_job(
+        request: Request,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        payload = await _read_request_json(request)
+        scope = _normalize_refresh_scope(str(payload.get("scope", "ALL")))
+        job_fs_div = _normalize_refresh_job_fs_div(
+            str(payload.get("fs_div", fs_div or "CFS"))
+        )
+        year_from = int(payload.get("year_from", default_end_year() - DEFAULT_RECENT_YEARS + 1))
+        year_to = int(payload.get("year_to", default_end_year()))
+        batch_size = _normalize_refresh_batch_size(int(payload.get("batch_size", 25)))
+        master_status = read_company_master_status(database_path)
+        if master_status.get("count", 0) == 0 or master_status.get("is_stale") is True:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "requires_company_sync",
+                    "message": "회사 목록 동기화가 먼저 필요합니다.",
+                    "company_master_status": master_status,
+                },
+            )
+
+        companies = read_company_master_entries(
+            database_path,
+            market=None if scope == "ALL" else scope,
+        )
+        try:
+            job = create_refresh_job(
+                database_path,
+                scope=scope,
+                fs_div=job_fs_div,
+                year_from=year_from,
+                year_to=year_to,
+                batch_size=batch_size,
+                companies=companies,
+                status="running",
+            )
+        except ValueError as error:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": str(error)},
+            )
+        return JSONResponse({"status": "ok", "job": job})
+
+    @app.get("/ranking/update-jobs/{job_id}")
+    def ranking_update_job_status(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = read_refresh_job(database_path, job_id=job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        return JSONResponse({"status": "ok", "job": job})
+
+    @app.post("/ranking/update-jobs/{job_id}/run-next-batch")
+    def ranking_run_next_batch(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = read_refresh_job(database_path, job_id=job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        if str(job.get("status", "")) == "paused":
+            return JSONResponse({"status": "ok", "job": job})
+
+        api_key = os.getenv("OPENDART_API_KEY", "").strip()
+        if not api_key:
+            return JSONResponse(
+                status_code=400,
+                content={"status": "error", "message": "OPENDART_API_KEY가 필요합니다."},
+            )
+
+        update_refresh_job_status(
+            database_path,
+            job_id=job_id,
+            status="running",
+            last_error="",
+        )
+        client = client_factory(api_key)
+        result_job = _run_refresh_job_batch(
+            database_path=database_path,
+            job_id=job_id,
+            client=client,
+        )
+        return JSONResponse({"status": "ok", "job": result_job})
+
+    @app.post("/ranking/update-jobs/{job_id}/pause")
+    def ranking_pause_update_job(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = update_refresh_job_status(database_path, job_id=job_id, status="paused")
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        return JSONResponse({"status": "ok", "job": job})
+
+    @app.post("/ranking/update-jobs/{job_id}/resume")
+    def ranking_resume_update_job(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = update_refresh_job_status(database_path, job_id=job_id, status="running")
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        return JSONResponse({"status": "ok", "job": job})
+
+    @app.post("/ranking/update-jobs/{job_id}/retry-failed")
+    def ranking_retry_failed_update_job(
+        job_id: int,
+        fs_div: str = "CFS",
+    ) -> JSONResponse:
+        database_path = _web_cache_database_path(fs_div)
+        job = retry_failed_refresh_job_items(database_path, job_id=job_id)
+        if job is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "message": "작업을 찾을 수 없습니다."},
+            )
+        return JSONResponse({"status": "ok", "job": job})
 
     return app
 
@@ -5131,3 +5336,893 @@ def _page_script() -> str:
       });
     })();
     """
+
+
+def parse_ranking_request(form: RankingForm) -> dict[str, object]:
+    recent_years = _parse_int(form.recent_years, field_name="조회 연수")
+    if recent_years <= 0:
+        raise ValueError("조회 연수는 1 이상이어야 합니다.")
+
+    end_year = _parse_int(
+        form.end_year or str(default_end_year()),
+        field_name="기준 연도",
+    )
+    start_year = max(MIN_OPENDART_YEAR, end_year - recent_years + 1)
+    threshold_percent = _parse_decimal(
+        form.threshold_percent,
+        field_name="성장률 기준",
+    )
+    fs_div = _parse_fs_div(form.fs_div)
+
+    return {
+        "growth_conditions": normalize_growth_conditions(form.growth_conditions),
+        "market": _parse_market(form.market),
+        "recent_years": recent_years,
+        "start_year": start_year,
+        "end_year": end_year,
+        "fs_div": fs_div,
+        "threshold_percent": threshold_percent,
+        "sort_by": _normalize_ranking_sort(sort_by=form.sort_by),
+    }
+
+
+def render_ranking_page(
+    *,
+    form: RankingForm,
+    payload: dict[str, object] | None = None,
+    error: str | None = None,
+) -> str:
+    return render_shell(
+        company_title="랭킹/검색",
+        top_tabs_html=render_ranking_top_tabs(form),
+        toolbar_html=render_ranking_header(form, payload=_dict(payload)),
+        content_html=(
+            (
+                render_ranking_results(_dict(payload))
+                if payload is not None
+                else render_ranking_empty_state()
+            )
+            + render_ranking_job_script(form)
+        ),
+        message_html=render_message(error=error),
+    )
+
+
+def render_ranking_top_tabs(form: RankingForm) -> str:
+    tabs = (
+        ("요약", "/", "overview"),
+        ("재무정보", "/", "financials"),
+        ("성장률", "/", "growth"),
+        (
+            "VS 기업비교",
+            _build_compare_href(
+                primary_company_query="",
+                recent_years=form.recent_years,
+                end_year=form.end_year or str(default_end_year()),
+                fs_div=form.fs_div,
+                threshold_percent=form.threshold_percent,
+            ),
+            "compare",
+        ),
+        (
+            "랭킹/검색",
+            _build_ranking_href(
+                growth_conditions=form.growth_conditions,
+                market=form.market,
+                recent_years=form.recent_years,
+                end_year=form.end_year or str(default_end_year()),
+                fs_div=form.fs_div,
+                threshold_percent=form.threshold_percent,
+                sort_by=form.sort_by,
+            ),
+            "ranking",
+        ),
+    )
+    return render_top_tabs("ranking", tabs)
+
+
+def render_ranking_header(
+    form: RankingForm,
+    payload: dict[str, object] | None = None,
+) -> str:
+    company_master_status = _dict((payload or {}).get("company_master_status"))
+    update_job = _dict((payload or {}).get("update_job"))
+    return f"""
+    <section class="toolbar-surface">
+      <div class="section-tabs">
+        <span class="section-tab is-active">랭킹/검색</span>
+        <span class="section-tab">성장률 매트릭스</span>
+        <span class="section-tab">DB 업데이트</span>
+      </div>
+      <form id="ranking-form" class="query-form query-form-ranking" data-loading-form method="get" action="/ranking">
+        <input id="ranking-recent-years" type="hidden" name="recent_years" value="{escape(form.recent_years or str(DEFAULT_RECENT_YEARS))}">
+        <label class="field">
+          <span>시장</span>
+          <select name="market">
+            {_option("ALL", "전체", form.market)}
+            {_option("KOSPI", "KOSPI", form.market)}
+            {_option("KOSDAQ", "KOSDAQ", form.market)}
+          </select>
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input name="end_year" value="{escape(form.end_year or str(default_end_year()))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select name="fs_div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>성장률 기준</span>
+          <input name="threshold_percent" value="{escape(form.threshold_percent)}" inputmode="decimal">
+        </label>
+        <label class="field">
+          <span>정렬</span>
+          <select name="sort_by">
+            {"".join(_option(value, label, form.sort_by) for value, label in RANKING_SORT_OPTIONS)}
+          </select>
+        </label>
+        <button id="ranking-submit-button" type="submit" class="primary-button">
+          <span data-submit-label>조회</span>
+          <span data-submit-loading hidden>조회 중...</span>
+        </button>
+        <div style="grid-column: 1 / -1;">
+          {render_ranking_growth_condition_matrix(form)}
+        </div>
+      </form>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="segmented" role="group" aria-label="조회 연수">
+          {render_year_preset_button("3년", "3", form.recent_years, "ranking-form", "ranking-recent-years")}
+          {render_year_preset_button("5년", "5", form.recent_years, "ranking-form", "ranking-recent-years")}
+          {render_year_preset_button("10년", "10", form.recent_years, "ranking-form", "ranking-recent-years")}
+        </div>
+        <div class="toolbar-note">선택한 성장률 조건은 모두 충족해야 통과로 계산합니다.</div>
+      </div>
+      {render_ranking_update_panel(form, company_master_status, update_job)}
+    </section>
+    """
+
+
+def render_ranking_growth_condition_matrix(form: RankingForm) -> str:
+    selected = set(form.growth_conditions or DEFAULT_RANKING_GROWTH_CONDITIONS)
+    header_cells = "".join(
+        f"<th>{escape(GROWTH_METRIC_LABELS.get(metric, metric))}</th>"
+        for metric in GROWTH_CONDITION_METRICS
+    )
+    body_rows = []
+    for series_type in GROWTH_CONDITION_SERIES:
+        cells = []
+        for metric in GROWTH_CONDITION_METRICS:
+            value = _growth_condition_value(series_type=series_type, metric=metric)
+            checked = ' checked' if value in selected else ""
+            cells.append(
+                "<td>"
+                f'<label style="display:inline-flex;align-items:center;gap:6px;font-weight:600;">'
+                f'<input type="checkbox" name="growth_condition" value="{escape(value)}"{checked}>'
+                f"<span>{escape(GROWTH_METRIC_LABELS.get(metric, metric))}</span>"
+                "</label>"
+                "</td>"
+            )
+        body_rows.append(
+            "<tr>"
+            f"<th>{escape(GROWTH_SERIES_LABELS.get(series_type, series_type))}</th>"
+            f"{''.join(cells)}"
+            "</tr>"
+        )
+    return (
+        '<div class="panel" style="margin-top:12px;padding:14px 16px;">'
+        '<div class="matrix-heading">성장률 조건 선택</div>'
+        '<table class="matrix-table">'
+        f"<thead><tr><th>구분</th>{header_cells}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
+def render_ranking_update_panel(
+    form: RankingForm,
+    company_master_status: dict[str, object],
+    update_job: dict[str, object],
+) -> str:
+    last_synced = _format_datetime_text(company_master_status.get("last_synced_at"))
+    count = company_master_status.get("count", 0)
+    stale = company_master_status.get("is_stale") is True
+    job_status = str(update_job.get("status", "") or "")
+    return f"""
+    <section class="panel" id="ranking-update-panel" data-refresh-panel data-refresh-fs-div="{escape(form.fs_div)}" data-job-id="{escape(str(update_job.get('id', '')))}">
+      <div class="panel-heading panel-heading-split">
+        <div>
+          <h3>DB 업데이트</h3>
+          <p>전체 상장사를 한 번에 끝까지 돌리지 않고, 배치 단위로 끊어서 진행합니다. 중간 정지와 이어받기가 가능합니다.</p>
+        </div>
+        <div class="toolbar-meta">
+          <span class="inline-pill{ ' inline-pill-contrast' if stale else ' inline-pill-accent' }">회사 목록 {escape(str(count))}개</span>
+          <span class="inline-pill">마지막 동기화 {escape(last_synced or '-')}</span>
+          <span class="inline-pill">작업 상태 {escape(job_status or '-')}</span>
+        </div>
+      </div>
+      <div class="query-form" style="grid-template-columns: repeat(5, minmax(120px, 1fr)); margin-top: 6px;">
+        <label class="field">
+          <span>대상 범위</span>
+          <select id="refresh-scope">
+            <option value="ALL">전체</option>
+            <option value="KOSPI">KOSPI</option>
+            <option value="KOSDAQ">KOSDAQ</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select id="refresh-fs-div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>시작 연도</span>
+          <input id="refresh-year-from" value="{escape(str(max(MIN_OPENDART_YEAR, (int(form.end_year or default_end_year()) - int(form.recent_years or DEFAULT_RECENT_YEARS) + 1))))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input id="refresh-year-to" value="{escape(form.end_year or str(default_end_year()))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>배치 크기</span>
+          <select id="refresh-batch-size">
+            <option value="10">10</option>
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
+      </div>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="segmented">
+          <button type="button" class="segmented-button" id="sync-company-master-button">회사 목록 동기화</button>
+          <button type="button" class="segmented-button" id="create-refresh-job-button">새 작업 시작</button>
+          <button type="button" class="segmented-button" id="pause-refresh-job-button">일시정지</button>
+          <button type="button" class="segmented-button" id="resume-refresh-job-button">이어받기</button>
+          <button type="button" class="segmented-button" id="retry-refresh-job-button">실패만 재시도</button>
+        </div>
+        <div class="toolbar-note" id="refresh-job-message">회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.</div>
+      </div>
+      <div class="toolbar-row toolbar-row-dense" id="refresh-job-summary">
+        {render_refresh_job_status_summary(update_job)}
+      </div>
+    </section>
+    """
+
+
+def render_refresh_job_status_summary(job: dict[str, object]) -> str:
+    if not job:
+        return (
+            '<span class="inline-pill inline-pill-muted">진행 중인 작업 없음</span>'
+        )
+    return "".join(
+        [
+            f'<span class="inline-pill">전체 {escape(str(job.get("total_companies", 0)))}개</span>',
+            f'<span class="inline-pill inline-pill-accent">완료 {escape(str(job.get("completed_companies", 0)))}개</span>',
+            f'<span class="inline-pill inline-pill-contrast">실패 {escape(str(job.get("failed_companies", 0)))}개</span>',
+            f'<span class="inline-pill">남음 {escape(str(job.get("remaining_companies", 0)))}개</span>',
+            f'<span class="inline-pill">최근 회사 {escape(str(job.get("last_processed_corp_name", "") or "-"))}</span>',
+            f'<span class="inline-pill">최근 오류 {escape(str(job.get("last_error", "") or "-"))}</span>',
+        ]
+    )
+
+
+def render_ranking_results(payload: dict[str, object]) -> str:
+    summary = _dict(payload.get("summary"))
+    filters = _dict(payload.get("filters"))
+    rows = [_dict(row) for row in _list(payload.get("screening_rows"))]
+    company_master_status = _dict(payload.get("company_master_status"))
+    selected_conditions = [
+        _dict(item) for item in _list(filters.get("growth_conditions"))
+    ]
+    info_html = (
+        f'<div class="toolbar-note">DB {escape(str(summary.get("database", "")))} 기준, '
+        f'{escape(str(summary.get("screening_rows", 0)))}개 기업을 표시합니다. '
+        f'회사 목록 {escape(str(company_master_status.get("count", 0)))}개 동기화됨</div>'
+    )
+    if not rows:
+        return f"""
+        <section class="panel">
+          <div class="panel-heading">
+            <h3>조건을 평가할 기업이 아직 충분하지 않습니다</h3>
+            <p>회사 목록을 동기화하고, DB 업데이트 패널에서 배치 작업을 시작하면 랭킹 데이터가 차곡차곡 쌓입니다.</p>
+          </div>
+          {info_html}
+        </section>
+        """
+
+    table_rows = []
+    for row in rows:
+        analysis_href = _build_analysis_href(
+            company_query=str(row.get("corp_name", "") or row.get("stock_code", "")),
+            recent_years=str(filters.get("recent_annual_periods", DEFAULT_RECENT_YEARS)),
+            end_year=str(summary.get("end_year", default_end_year())),
+            fs_div=str(filters.get("fs_div", "CFS") or "ALL"),
+            threshold_percent=str(filters.get("threshold_percent", DEFAULT_THRESHOLD_PERCENT)),
+            top_tab="financials",
+            fragment="financials-details",
+        )
+        total_checks = int(row.get("total_growth_condition_count", 0) or 0)
+        matched_checks = int(row.get("matched_growth_condition_count", 0) or 0)
+        details_html = render_ranking_growth_checks(_list(row.get("growth_checks")))
+        table_rows.append(
+            "<tr>"
+            f'<td><a class="table-link" href="{escape(analysis_href)}">{escape(str(row.get("corp_name", "")))}</a></td>'
+            f'<td>{escape(str(row.get("market", "") or "-"))}</td>'
+            f'<td>{escape(_format_won(row.get("close_price")))}</td>'
+            f'<td>{escape(_format_market_cap(row.get("market_cap")))}</td>'
+            f'<td>{escape(_format_ratio(row.get("eps"), suffix="원"))}</td>'
+            f'<td>{matched_checks}/{total_checks}</td>'
+            f'<td>{escape(_format_percent(row.get("overall_minimum_growth_rate")))}</td>'
+            f'<td>{escape("통과" if row.get("passed") else "미통과")}</td>'
+            f'<td>{details_html}</td>'
+            "</tr>"
+        )
+
+    condition_labels = ", ".join(
+        f"{GROWTH_SERIES_LABELS.get(str(item.get('series_type', '')), str(item.get('series_type', '')))} "
+        f"{GROWTH_METRIC_LABELS.get(str(item.get('metric', '')), str(item.get('metric', '')))}"
+        for item in selected_conditions
+    )
+
+    return f"""
+    <section class="panel">
+      <div class="panel-heading panel-heading-split">
+        <div>
+          <h3>성장률 랭킹</h3>
+          <p>선택 조건: {escape(condition_labels or "연간 YoY 매출")}. 통과 여부는 AND 기준으로 계산합니다.</p>
+        </div>
+        {info_html}
+      </div>
+      <div class="table-scroll">
+        <table class="screening-table">
+          <thead>
+            <tr>
+              <th>기업명</th>
+              <th>시장</th>
+              <th>전일 종가</th>
+              <th>시가총액</th>
+              <th>EPS</th>
+              <th>조건 통과 수</th>
+              <th>전체 최소 성장률</th>
+              <th>통과</th>
+              <th>상세</th>
+            </tr>
+          </thead>
+          <tbody>{''.join(table_rows)}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def render_ranking_growth_checks(checks: list[object]) -> str:
+    if not checks:
+        return '<span class="empty">-</span>'
+    items = []
+    for item in checks:
+        check = _dict(item)
+        items.append(
+            '<div class="filter-row" style="grid-template-columns: 1fr auto auto; padding: 6px 0;">'
+            f"<span>{escape(str(check.get('series_label', '')))} {escape(str(check.get('metric_label', '')))}</span>"
+            f"<strong>{escape(_format_percent(check.get('minimum_growth_rate')))}</strong>"
+            f'<em class="{_pass_class(check.get("passed"))}">{escape("통과" if check.get("passed") else "실패")}</em>'
+            "</div>"
+        )
+    return (
+        "<details>"
+        "<summary>조건별 확인</summary>"
+        f'<div class="filter-list">{"".join(items)}</div>'
+        "</details>"
+    )
+
+
+def render_ranking_job_script(form: RankingForm) -> str:
+    fs_div = escape(form.fs_div or "CFS")
+    return f"""
+    <script>
+    (() => {{
+      const panel = document.querySelector("[data-refresh-panel]");
+      if (!panel) {{
+        return;
+      }}
+      const summaryNode = document.getElementById("refresh-job-summary");
+      const messageNode = document.getElementById("refresh-job-message");
+      const syncButton = document.getElementById("sync-company-master-button");
+      const createButton = document.getElementById("create-refresh-job-button");
+      const pauseButton = document.getElementById("pause-refresh-job-button");
+      const resumeButton = document.getElementById("resume-refresh-job-button");
+      const retryButton = document.getElementById("retry-refresh-job-button");
+      const scopeInput = document.getElementById("refresh-scope");
+      const fsDivInput = document.getElementById("refresh-fs-div");
+      const yearFromInput = document.getElementById("refresh-year-from");
+      const yearToInput = document.getElementById("refresh-year-to");
+      const batchSizeInput = document.getElementById("refresh-batch-size");
+      let activeJobId = panel.getAttribute("data-job-id") || "";
+      let pumpTimer = null;
+      let pumpBusy = false;
+
+      const escapeHtml = (value) =>
+        String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+
+      const renderSummary = (job) => {{
+        if (!summaryNode) {{
+          return;
+        }}
+        if (!job) {{
+          summaryNode.innerHTML = '<span class="inline-pill inline-pill-muted">진행 중인 작업 없음</span>';
+          return;
+        }}
+        summaryNode.innerHTML = [
+          `<span class="inline-pill">전체 ${{escapeHtml(job.total_companies || 0)}}개</span>`,
+          `<span class="inline-pill inline-pill-accent">완료 ${{escapeHtml(job.completed_companies || 0)}}개</span>`,
+          `<span class="inline-pill inline-pill-contrast">실패 ${{escapeHtml(job.failed_companies || 0)}}개</span>`,
+          `<span class="inline-pill">남음 ${{escapeHtml(job.remaining_companies || 0)}}개</span>`,
+          `<span class="inline-pill">최근 회사 ${{escapeHtml(job.last_processed_corp_name || "-")}}</span>`,
+          `<span class="inline-pill">최근 오류 ${{escapeHtml(job.last_error || "-")}}</span>`
+        ].join("");
+      }};
+
+      const setMessage = (value) => {{
+        if (messageNode) {{
+          messageNode.textContent = value;
+        }}
+      }};
+
+      const currentFsDiv = () => (fsDivInput && fsDivInput.value) || "{fs_div}";
+
+      const callJson = async (url, method = "GET", body = null) => {{
+        const response = await fetch(url, {{
+          method,
+          headers: body ? {{ "Content-Type": "application/json" }} : {{}},
+          body: body ? JSON.stringify(body) : undefined,
+        }});
+        const payload = await response.json();
+        if (!response.ok) {{
+          throw new Error(payload.message || "요청 처리 중 오류가 발생했습니다.");
+        }}
+        return payload;
+      }};
+
+      const loadStatus = async () => {{
+        if (!activeJobId) {{
+          renderSummary(null);
+          return null;
+        }}
+        const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}?fs_div=${{encodeURIComponent(currentFsDiv())}}`);
+        renderSummary(payload.job);
+        return payload.job;
+      }};
+
+      const stopPump = () => {{
+        if (pumpTimer !== null) {{
+          window.clearTimeout(pumpTimer);
+          pumpTimer = null;
+        }}
+      }};
+
+      const schedulePump = () => {{
+        stopPump();
+        pumpTimer = window.setTimeout(runPump, 350);
+      }};
+
+      const runPump = async () => {{
+        if (!activeJobId || pumpBusy) {{
+          return;
+        }}
+        pumpBusy = true;
+        try {{
+          const statusPayload = await callJson(`/ranking/update-jobs/${{activeJobId}}?fs_div=${{encodeURIComponent(currentFsDiv())}}`);
+          const job = statusPayload.job;
+          renderSummary(job);
+          if (!job || job.status !== "running") {{
+            pumpBusy = false;
+            return;
+          }}
+          const nextPayload = await callJson(`/ranking/update-jobs/${{activeJobId}}/run-next-batch?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
+          renderSummary(nextPayload.job);
+          setMessage(`배치 업데이트 진행 중: 완료 ${{nextPayload.job.completed_companies || 0}}개, 실패 ${{nextPayload.job.failed_companies || 0}}개`);
+          if (nextPayload.job && nextPayload.job.status === "running") {{
+            schedulePump();
+          }}
+        }} catch (error) {{
+          setMessage(String(error.message || error));
+        }} finally {{
+          pumpBusy = false;
+        }}
+      }};
+
+      if (syncButton) {{
+        syncButton.addEventListener("click", async () => {{
+          setMessage("회사 목록을 동기화하고 있습니다...");
+          try {{
+            const payload = await callJson(`/ranking/company-master/sync?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST", {{}});
+            const summary = payload.company_master_status || {{}};
+            setMessage(`회사 목록 동기화 완료: ${{summary.count || 0}}개`);
+            activeJobId = "";
+            renderSummary(null);
+          }} catch (error) {{
+            setMessage(String(error.message || error));
+          }}
+        }});
+      }}
+
+      if (createButton) {{
+        createButton.addEventListener("click", async () => {{
+          setMessage("새 DB 업데이트 작업을 만들고 있습니다...");
+          try {{
+            const payload = await callJson(`/ranking/update-jobs?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST", {{
+              scope: scopeInput ? scopeInput.value : "ALL",
+              fs_div: currentFsDiv(),
+              year_from: yearFromInput ? Number(yearFromInput.value) : {default_end_year() - DEFAULT_RECENT_YEARS + 1},
+              year_to: yearToInput ? Number(yearToInput.value) : {default_end_year()},
+              batch_size: batchSizeInput ? Number(batchSizeInput.value) : 25
+            }});
+            activeJobId = String((payload.job && payload.job.id) || "");
+            panel.setAttribute("data-job-id", activeJobId);
+            renderSummary(payload.job);
+            setMessage("새 작업을 시작했습니다.");
+            schedulePump();
+          }} catch (error) {{
+            setMessage(String(error.message || error));
+          }}
+        }});
+      }}
+
+      if (pauseButton) {{
+        pauseButton.addEventListener("click", async () => {{
+          if (!activeJobId) {{
+            return;
+          }}
+          stopPump();
+          try {{
+            const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}/pause?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
+            renderSummary(payload.job);
+            setMessage("작업을 일시정지했습니다.");
+          }} catch (error) {{
+            setMessage(String(error.message || error));
+          }}
+        }});
+      }}
+
+      if (resumeButton) {{
+        resumeButton.addEventListener("click", async () => {{
+          if (!activeJobId) {{
+            return;
+          }}
+          try {{
+            const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}/resume?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
+            renderSummary(payload.job);
+            setMessage("작업을 이어받습니다.");
+            schedulePump();
+          }} catch (error) {{
+            setMessage(String(error.message || error));
+          }}
+        }});
+      }}
+
+      if (retryButton) {{
+        retryButton.addEventListener("click", async () => {{
+          if (!activeJobId) {{
+            return;
+          }}
+          try {{
+            const payload = await callJson(`/ranking/update-jobs/${{activeJobId}}/retry-failed?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
+            renderSummary(payload.job);
+            setMessage("실패 항목만 다시 대기열에 넣었습니다.");
+            schedulePump();
+          }} catch (error) {{
+            setMessage(String(error.message || error));
+          }}
+        }});
+      }}
+
+      if (activeJobId) {{
+        schedulePump();
+      }} else {{
+        renderSummary(null);
+      }}
+    }})();
+    </script>
+    """
+
+
+def _growth_condition_value(*, series_type: str, metric: str) -> str:
+    return f"{series_type}:{metric}"
+
+
+async def _read_request_json(request: Request) -> dict[str, object]:
+    try:
+        payload = await request.json()
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _sync_company_master_for_database(
+    *,
+    database_path: Path,
+    opendart_client: MajorAccountClient,
+    listing_client: ListingClient,
+) -> dict[str, object]:
+    listings = listing_client.fetch_listings()
+    dart_companies = opendart_client.fetch_companies()
+    match_result = match_listings_to_dart(listings, dart_companies)
+    dart_index = {company.corp_code: company for company in dart_companies}
+    entries = [
+        {
+            "corp_code": company.corp_code,
+            "corp_name": company.corp_name,
+            "stock_code": company.stock_code,
+            "market": company.market,
+            "item_name": company.item_name,
+            "modify_date": dart_index.get(company.corp_code, DartCompany("", "", "", "")).modify_date,
+        }
+        for company in match_result.matched
+    ]
+    company_master_status = store_company_master_entries(database_path, entries)
+    return {
+        "company_master_status": company_master_status,
+        "matched": len(match_result.matched),
+        "unmatched": len(match_result.unmatched_listings),
+        "ambiguous": len(match_result.ambiguous_matches),
+    }
+
+
+def _run_refresh_job_batch(
+    *,
+    database_path: Path,
+    job_id: int,
+    client: MajorAccountClient,
+) -> dict[str, object]:
+    job = read_refresh_job(database_path, job_id=job_id)
+    if job is None:
+        return {}
+    items = read_refresh_job_items(
+        database_path,
+        job_id=job_id,
+        statuses=["pending"],
+        limit=int(job.get("batch_size", 25) or 25),
+    )
+    if not items:
+        return job
+
+    business_years = [
+        str(year)
+        for year in range(
+            int(job.get("year_from", default_end_year() - DEFAULT_RECENT_YEARS + 1)),
+            int(job.get("year_to", default_end_year())) + 1,
+        )
+    ]
+    fs_div = _parse_fs_div(str(job.get("fs_div", "CFS")))
+    for item in items:
+        corp_code = str(item.get("corp_code", "")).strip()
+        corp_name = str(item.get("corp_name", "")).strip()
+        if not corp_code:
+            record_refresh_job_item_result(
+                database_path,
+                job_id=job_id,
+                corp_code=corp_code,
+                corp_name=corp_name,
+                status="skipped",
+                last_error="corp_code is missing",
+            )
+            continue
+        try:
+            run = collect_financial_statement_run(
+                client,
+                corp_codes=[corp_code],
+                business_years=business_years,
+                report_codes=DEFAULT_REPORT_CODES,
+                fs_div=fs_div,
+                continue_on_error=True,
+            )
+            artifacts = build_analysis_artifacts(
+                run.rows,
+                collection_errors=run.errors,
+                expected_corp_codes=[corp_code],
+                expected_business_years=business_years,
+                expected_report_codes=DEFAULT_REPORT_CODES,
+                threshold_percent=Decimal("20"),
+                recent_annual_periods=3,
+                recent_quarterly_periods=12,
+            )
+            if run.errors or artifacts.collection_errors:
+                raise RuntimeError(_summarize_collection_errors(run.errors, artifacts))
+            if not artifacts.financial_statement_rows:
+                raise RuntimeError("재무 데이터를 가져오지 못했습니다.")
+            replace_company_analysis_artifacts(
+                database_path,
+                corp_code=corp_code,
+                artifacts=artifacts,
+            )
+            record_refresh_job_item_result(
+                database_path,
+                job_id=job_id,
+                corp_code=corp_code,
+                corp_name=corp_name,
+                status="success",
+            )
+        except Exception as error:
+            record_refresh_job_item_result(
+                database_path,
+                job_id=job_id,
+                corp_code=corp_code,
+                corp_name=corp_name,
+                status="failed",
+                last_error=str(error),
+            )
+    return read_refresh_job(database_path, job_id=job_id) or {}
+
+
+def _normalize_refresh_scope(value: str) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized in {"", "ALL"}:
+        return "ALL"
+    if normalized not in {"KOSPI", "KOSDAQ"}:
+        return "ALL"
+    return normalized
+
+
+def _normalize_refresh_job_fs_div(value: str) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized in {"", "CFS"}:
+        return "CFS"
+    if normalized not in {"OFS", "ALL"}:
+        return "CFS"
+    return normalized
+
+
+def _normalize_refresh_batch_size(value: int) -> int:
+    if value in {10, 25, 50, 100}:
+        return value
+    return 25
+
+
+def _normalize_ranking_sort(*, sort_by: str) -> str:
+    normalized = sort_by.strip().lower()
+    if normalized in {"market_cap", "overall_minimum_growth_rate"}:
+        return normalized
+    return DEFAULT_RANKING_SORT_BY
+
+
+def _build_ranking_href(
+    *,
+    growth_conditions: Iterable[str] | None = None,
+    market: str = DEFAULT_MARKET_FILTER,
+    recent_years: str,
+    end_year: str,
+    fs_div: str,
+    threshold_percent: str,
+    sort_by: str = DEFAULT_RANKING_SORT_BY,
+) -> str:
+    params: list[tuple[str, str]] = []
+    for condition in growth_conditions or ():
+        normalized = str(condition or "").strip()
+        if normalized:
+            params.append(("growth_condition", normalized))
+    if str(market).strip() and str(market).strip().upper() != "ALL":
+        params.append(("market", str(market).strip()))
+    for key, value in (
+        ("recent_years", recent_years),
+        ("end_year", end_year),
+        ("fs_div", fs_div),
+        ("threshold_percent", threshold_percent),
+    ):
+        if str(value).strip():
+            params.append((key, str(value).strip()))
+    normalized_sort = _normalize_ranking_sort(sort_by=sort_by)
+    if normalized_sort != DEFAULT_RANKING_SORT_BY:
+        params.append(("sort_by", normalized_sort))
+    query = urlencode(params)
+    return f"/ranking?{query}" if query else "/ranking"
+
+
+def _format_datetime_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = text[:-1] if text.endswith("Z") else text
+    try:
+        return normalized.replace("T", " ")
+    except Exception:
+        return text
+
+
+def render_ranking_update_panel(
+    form: RankingForm,
+    company_master_status: dict[str, object],
+    update_job: dict[str, object],
+) -> str:
+    default_year_to = _safe_int(form.end_year, default_end_year())
+    default_recent_years = _safe_int(form.recent_years, DEFAULT_RECENT_YEARS)
+    default_year_from = max(
+        MIN_OPENDART_YEAR,
+        default_year_to - default_recent_years + 1,
+    )
+    last_synced = _format_datetime_text(company_master_status.get("last_synced_at"))
+    count = company_master_status.get("count", 0)
+    stale = company_master_status.get("is_stale") is True
+    job_status = str(update_job.get("status", "") or "")
+    return f"""
+    <section class="panel" id="ranking-update-panel" data-refresh-panel data-refresh-fs-div="{escape(form.fs_div)}" data-job-id="{escape(str(update_job.get('id', '')))}">
+      <div class="panel-heading panel-heading-split">
+        <div>
+          <h3>DB 업데이트</h3>
+          <p>전체 상장사를 한 번에 끝까지 돌리지 않고, 배치 단위로 끊어서 진행합니다. 중간 정지와 이어받기가 가능합니다.</p>
+        </div>
+        <div class="toolbar-meta">
+          <span class="inline-pill{ ' inline-pill-contrast' if stale else ' inline-pill-accent' }">회사 목록 {escape(str(count))}개</span>
+          <span class="inline-pill">마지막 동기화 {escape(last_synced or '-')}</span>
+          <span class="inline-pill">작업 상태 {escape(job_status or '-')}</span>
+        </div>
+      </div>
+      <div class="query-form" style="grid-template-columns: repeat(5, minmax(120px, 1fr)); margin-top: 6px;">
+        <label class="field">
+          <span>대상 범위</span>
+          <select id="refresh-scope">
+            <option value="ALL">전체</option>
+            <option value="KOSPI">KOSPI</option>
+            <option value="KOSDAQ">KOSDAQ</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>재무제표</span>
+          <select id="refresh-fs-div">
+            {_option("CFS", "연결", form.fs_div)}
+            {_option("OFS", "별도", form.fs_div)}
+            {_option("ALL", "전체", form.fs_div)}
+          </select>
+        </label>
+        <label class="field">
+          <span>시작 연도</span>
+          <input id="refresh-year-from" value="{escape(str(default_year_from))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>기준 연도</span>
+          <input id="refresh-year-to" value="{escape(str(default_year_to))}" inputmode="numeric">
+        </label>
+        <label class="field">
+          <span>배치 크기</span>
+          <select id="refresh-batch-size">
+            <option value="10">10</option>
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
+      </div>
+      <div class="toolbar-row toolbar-row-dense">
+        <div class="segmented">
+          <button type="button" class="segmented-button" id="sync-company-master-button">회사 목록 동기화</button>
+          <button type="button" class="segmented-button" id="create-refresh-job-button">새 작업 시작</button>
+          <button type="button" class="segmented-button" id="pause-refresh-job-button">일시정지</button>
+          <button type="button" class="segmented-button" id="resume-refresh-job-button">이어받기</button>
+          <button type="button" class="segmented-button" id="retry-refresh-job-button">실패만 재시도</button>
+        </div>
+        <div class="toolbar-note" id="refresh-job-message">회사 목록을 먼저 맞춰 두면 전체 업데이트를 훨씬 안정적으로 이어갈 수 있습니다.</div>
+      </div>
+      <div class="toolbar-row toolbar-row-dense" id="refresh-job-summary">
+        {render_refresh_job_status_summary(update_job)}
+      </div>
+    </section>
+    """
+
+
+def _safe_int(value: object, default: int) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default

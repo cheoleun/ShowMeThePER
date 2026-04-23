@@ -13,6 +13,7 @@ from .models import FinancialPeriodValue, GrowthPoint
 ANNUAL_YOY = "annual_yoy"
 QUARTERLY_YOY = "quarterly_yoy"
 TRAILING_FOUR_QUARTER_YOY = "trailing_four_quarter_yoy"
+QUARTERLY_QOQ = "quarterly_qoq"
 FILTERABLE_METRICS = frozenset({"revenue", "operating_income", "net_income"})
 
 
@@ -124,6 +125,40 @@ def calculate_trailing_four_quarter_yoy_growth(
     return points
 
 
+def calculate_quarterly_qoq_growth(
+    values: Iterable[FinancialPeriodValue],
+) -> list[GrowthPoint]:
+    quarterly_values = _quarterly_values_by_identity(values)
+    points: list[GrowthPoint] = []
+
+    for _, grouped_values in quarterly_values:
+        by_period = {
+            _quarter_index(value.fiscal_year, value.fiscal_quarter): value
+            for value in grouped_values
+            if value.fiscal_quarter is not None
+        }
+        for period_index in sorted(by_period):
+            current = by_period[period_index]
+            previous = by_period.get(period_index - 1)
+            points.append(
+                GrowthPoint(
+                    corp_code=current.corp_code,
+                    metric=current.metric,
+                    series_type=QUARTERLY_QOQ,
+                    fiscal_year=current.fiscal_year,
+                    fiscal_quarter=current.fiscal_quarter,
+                    amount=current.amount,
+                    base_amount=None if previous is None else previous.amount,
+                    growth_rate=_calculate_growth_rate(
+                        current.amount,
+                        None if previous is None else previous.amount,
+                    ),
+                )
+            )
+
+    return points
+
+
 def build_default_growth_points(
     values: Iterable[FinancialPeriodValue],
 ) -> list[GrowthPoint]:
@@ -132,6 +167,7 @@ def build_default_growth_points(
         *calculate_annual_yoy_growth(copied_values),
         *calculate_quarterly_yoy_growth(copied_values),
         *calculate_trailing_four_quarter_yoy_growth(copied_values),
+        *calculate_quarterly_qoq_growth(copied_values),
     ]
 
 

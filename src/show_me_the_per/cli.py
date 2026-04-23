@@ -32,6 +32,7 @@ from .rankings import (
     DEFAULT_SCREENING_GROWTH_METRIC,
     DEFAULT_SCREENING_GROWTH_SERIES_TYPE,
     ValuationSnapshot,
+    normalize_growth_conditions,
     read_growth_metrics_payload,
     read_valuation_snapshots,
     write_ranking_payload,
@@ -248,6 +249,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to write ranking JSON.",
     )
     ranking_parser.add_argument(
+        "--growth-condition",
+        action="append",
+        default=[],
+        help="Growth condition in the form annual_yoy:revenue. May be repeated.",
+    )
+    ranking_parser.add_argument(
         "--growth-metric",
         help="Optional growth metric to rank, for example revenue.",
     )
@@ -299,7 +306,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     ranking_parser.add_argument(
         "--sort-by",
-        choices=["market_cap", "per", "pbr", "roe"],
+        choices=["market_cap", "overall_minimum_growth_rate"],
         default="market_cap",
         help="Sort key for combined database screening. Defaults to market_cap.",
     )
@@ -442,6 +449,12 @@ def main(argv: list[str] | None = None) -> None:
         "--output",
         type=Path,
         help="Optional path to write growth ranking JSON.",
+    )
+    db_growth_rank_parser.add_argument(
+        "--growth-condition",
+        action="append",
+        default=[],
+        help="Growth condition in the form annual_yoy:revenue. May be repeated.",
     )
     db_growth_rank_parser.add_argument(
         "--growth-metric",
@@ -674,9 +687,12 @@ def run_financial_period_values(args: argparse.Namespace) -> None:
 
 
 def run_rank_companies(args: argparse.Namespace) -> None:
-    growth_metric = args.growth_metric or DEFAULT_SCREENING_GROWTH_METRIC
-    growth_series_type = (
-        args.growth_series_type or DEFAULT_SCREENING_GROWTH_SERIES_TYPE
+    growth_conditions = normalize_growth_conditions(
+        args.growth_condition,
+        growth_metric=args.growth_metric or DEFAULT_SCREENING_GROWTH_METRIC,
+        growth_series_type=(
+            args.growth_series_type or DEFAULT_SCREENING_GROWTH_SERIES_TYPE
+        ),
     )
 
     if args.database is not None:
@@ -687,15 +703,11 @@ def run_rank_companies(args: argparse.Namespace) -> None:
             start_year=start_year,
             end_year=end_year,
             fs_div="CFS",
-            growth_metric=growth_metric,
-            growth_series_type=growth_series_type,
+            growth_conditions=growth_conditions,
             include_failed_growth=args.include_failed_growth,
             threshold_percent=Decimal("20"),
             recent_annual_periods=max(args.recent_years, 1),
             recent_quarterly_periods=max(args.recent_years, 1) * 4,
-            max_per=args.max_per,
-            max_pbr=args.max_pbr,
-            min_roe=args.min_roe,
             market=args.market,
             sort_by=args.sort_by,
         )
@@ -715,8 +727,7 @@ def run_rank_companies(args: argparse.Namespace) -> None:
         args.output,
         growth_payload,
         valuations,
-        growth_metric=growth_metric,
-        growth_series_type=growth_series_type,
+        growth_conditions=growth_conditions,
         include_failed_growth=args.include_failed_growth,
         max_per=args.max_per,
         max_pbr=args.max_pbr,
@@ -785,6 +796,7 @@ def run_database_summary(args: argparse.Namespace) -> None:
 def run_rank_growth_from_db(args: argparse.Namespace) -> None:
     payload = build_database_growth_ranking_payload(
         args.database,
+        growth_conditions=args.growth_condition,
         growth_metric=args.growth_metric,
         growth_series_type=args.growth_series_type,
         include_failed_growth=args.include_failed_growth,

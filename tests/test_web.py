@@ -10,8 +10,13 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from show_me_the_per.krx import KrxStockPriceSnapshot
-from show_me_the_per.models import DartCompany, FinancialStatementRow
-from show_me_the_per.storage import read_financial_period_values_from_database
+from show_me_the_per.models import DartCompany, FinancialStatementRow, KrxListing
+from show_me_the_per.storage import (
+    read_company_master_entries,
+    read_financial_period_values_from_database,
+    read_refresh_job,
+    read_refresh_job_items,
+)
 from show_me_the_per.web import (
     _format_won,
     _web_cache_database_path,
@@ -911,6 +916,272 @@ class WebTests(TestCase):
         self.assertNotIn("<th>PBR</th>", response.text)
         self.assertNotIn("<th>ROE</th>", response.text)
 
+    def test_ranking_page_renders_growth_condition_matrix_and_update_panel(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.get("/ranking")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('value="annual_yoy:revenue"', response.text)
+        self.assertIn('value="quarterly_qoq:net_income"', response.text)
+        self.assertIn("DB 업데이트", response.text)
+        self.assertIn("회사 목록 동기화", response.text)
+        self.assertIn("전체 최소 성장률", response.text)
+
+    def test_ranking_page_supports_repeated_growth_conditions(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Samsung Electronics",
+                        "recent_years": "3",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+                client.get(
+                    "/analysis",
+                    params={
+                        "company_query": "Vinatac",
+                        "recent_years": "3",
+                        "end_year": "2025",
+                        "fs_div": "CFS",
+                        "threshold_percent": "20",
+                    },
+                )
+
+            with patch.dict(
+                os.environ,
+                {"SHOW_ME_THE_PER_WEB_CACHE_DIR": directory},
+                clear=True,
+            ):
+                response = client.get(
+                    "/ranking",
+                    params=[
+                        ("recent_years", "2"),
+                        ("end_year", "2025"),
+                        ("fs_div", "CFS"),
+                        ("threshold_percent", "20"),
+                        ("sort_by", "overall_minimum_growth_rate"),
+                        ("growth_condition", "annual_yoy:revenue"),
+                        ("growth_condition", "quarterly_yoy:operating_income"),
+                    ],
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('value="annual_yoy:revenue" checked', response.text)
+        self.assertIn('value="quarterly_yoy:operating_income" checked', response.text)
+        self.assertIn("1/2", response.text)
+        self.assertIn("0/2", response.text)
+        self.assertIn("조건별 확인", response.text)
+
+    def test_ranking_update_job_requires_company_master_sync(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                response = client.post(
+                    "/ranking/update-jobs",
+                    params={"fs_div": "CFS"},
+                    json={
+                        "scope": "ALL",
+                        "fs_div": "CFS",
+                        "year_from": 2024,
+                        "year_to": 2025,
+                        "batch_size": 25,
+                    },
+                )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["status"], "requires_company_sync")
+
+    def test_ranking_company_master_sync_and_job_lifecycle(self) -> None:
+        client = TestClient(
+            create_app(
+                FakeOpenDartClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "show-me-the-per-cfs.sqlite3"
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                sync_response = client.post(
+                    "/ranking/company-master/sync",
+                    params={"fs_div": "CFS"},
+                    json={},
+                )
+                create_response = client.post(
+                    "/ranking/update-jobs",
+                    params={"fs_div": "CFS"},
+                    json={
+                        "scope": "ALL",
+                        "fs_div": "CFS",
+                        "year_from": 2024,
+                        "year_to": 2025,
+                        "batch_size": 1,
+                    },
+                )
+
+                job_id = int(create_response.json()["job"]["id"])
+                status_response = client.get(
+                    f"/ranking/update-jobs/{job_id}",
+                    params={"fs_div": "CFS"},
+                )
+                batch_response = client.post(
+                    f"/ranking/update-jobs/{job_id}/run-next-batch",
+                    params={"fs_div": "CFS"},
+                )
+                pause_response = client.post(
+                    f"/ranking/update-jobs/{job_id}/pause",
+                    params={"fs_div": "CFS"},
+                )
+                resume_response = client.post(
+                    f"/ranking/update-jobs/{job_id}/resume",
+                    params={"fs_div": "CFS"},
+                )
+
+            entries = read_company_master_entries(database_path)
+            job = read_refresh_job(database_path, job_id=job_id)
+            success_items = read_refresh_job_items(
+                database_path,
+                job_id=job_id,
+                statuses=["success"],
+            )
+
+        self.assertEqual(sync_response.status_code, 200)
+        self.assertEqual(sync_response.json()["company_master_status"]["count"], 2)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(create_response.status_code, 200)
+        self.assertEqual(create_response.json()["job"]["total_companies"], 2)
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(status_response.json()["job"]["status"], "running")
+        self.assertEqual(batch_response.status_code, 200)
+        self.assertEqual(batch_response.json()["job"]["completed_companies"], 2)
+        self.assertEqual(batch_response.json()["job"]["remaining_companies"], 0)
+        self.assertEqual(len(success_items), 2)
+        self.assertEqual(pause_response.status_code, 200)
+        self.assertEqual(pause_response.json()["job"]["status"], "paused")
+        self.assertEqual(resume_response.status_code, 200)
+        self.assertEqual(resume_response.json()["job"]["status"], "running")
+        self.assertIsNotNone(job)
+        self.assertEqual(job["pending_companies"], 0)
+
+    def test_ranking_retry_failed_update_job_requeues_failed_items(self) -> None:
+        client = TestClient(
+            create_app(
+                FailingFinancialClient,
+                FakeKrxStockPriceClient,
+                FakeNaverFinanceClient,
+                FakeKrxListingClient,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "show-me-the-per-cfs.sqlite3"
+            with patch.dict(
+                os.environ,
+                {
+                    "OPENDART_API_KEY": "test-key",
+                    "KRX_SERVICE_KEY": "krx-test-key",
+                    "SHOW_ME_THE_PER_WEB_CACHE_DIR": directory,
+                },
+            ):
+                client.post(
+                    "/ranking/company-master/sync",
+                    params={"fs_div": "CFS"},
+                    json={},
+                )
+                create_response = client.post(
+                    "/ranking/update-jobs",
+                    params={"fs_div": "CFS"},
+                    json={
+                        "scope": "ALL",
+                        "fs_div": "CFS",
+                        "year_from": 2024,
+                        "year_to": 2025,
+                        "batch_size": 1,
+                    },
+                )
+                job_id = int(create_response.json()["job"]["id"])
+                batch_response = client.post(
+                    f"/ranking/update-jobs/{job_id}/run-next-batch",
+                    params={"fs_div": "CFS"},
+                )
+                failed_items = read_refresh_job_items(
+                    database_path,
+                    job_id=job_id,
+                    statuses=["failed"],
+                )
+                retry_response = client.post(
+                    f"/ranking/update-jobs/{job_id}/retry-failed",
+                    params={"fs_div": "CFS"},
+                )
+
+            pending_items = read_refresh_job_items(
+                database_path,
+                job_id=job_id,
+                statuses=["pending"],
+            )
+
+        self.assertEqual(batch_response.status_code, 200)
+        self.assertEqual(batch_response.json()["job"]["failed_companies"], 2)
+        self.assertEqual(len(failed_items), 2)
+        self.assertEqual(retry_response.status_code, 200)
+        self.assertEqual(retry_response.json()["job"]["status"], "running")
+        self.assertEqual(len(pending_items), 2)
+
 
 class FakeOpenDartClient:
     def __init__(self, api_key: str) -> None:
@@ -1145,6 +1416,33 @@ class CorrectedSamsungOpenDartClient(FakeOpenDartClient):
                 )
             )
         return rows
+
+
+class FakeKrxListingClient:
+    def __init__(self, service_key: str) -> None:
+        self.service_key = service_key
+
+    def fetch_listings(self) -> list[KrxListing]:
+        return [
+            KrxListing(
+                base_date="20260422",
+                short_code="005930",
+                isin_code="KR7005930003",
+                market="KOSPI",
+                item_name="Samsung Electronics",
+                corporation_registration_number="1301110006246",
+                corporation_name="Samsung Electronics",
+            ),
+            KrxListing(
+                base_date="20260422",
+                short_code="126340",
+                isin_code="KR7126340004",
+                market="KOSDAQ",
+                item_name="Vinatac",
+                corporation_registration_number="1101112345678",
+                corporation_name="Vinatac",
+            ),
+        ]
 
 
 class FakeKrxStockPriceClient:

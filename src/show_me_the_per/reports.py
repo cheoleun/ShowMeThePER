@@ -8,6 +8,7 @@ from typing import Iterable
 
 from .growth import (
     ANNUAL_YOY,
+    QUARTERLY_QOQ,
     QUARTERLY_YOY,
     TRAILING_FOUR_QUARTER_YOY,
 )

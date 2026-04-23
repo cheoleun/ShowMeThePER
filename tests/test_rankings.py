@@ -11,6 +11,7 @@ from show_me_the_per.rankings import (
     build_screening_rows,
     build_ranking_payload,
     filter_valuation_snapshots,
+    normalize_growth_conditions,
     rank_growth_filter_results,
     rank_valuation_snapshots,
     read_valuation_snapshots,
@@ -81,11 +82,13 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["valuation_rankings"], 1)
         self.assertEqual(payload["summary"]["screening_rows"], 1)
 
-    def test_build_screening_rows_applies_market_and_sorting(self) -> None:
+    def test_build_screening_rows_applies_market_and_multiple_growth_conditions(self) -> None:
         rows = build_screening_rows(
             [
                 growth_result("00126380", "revenue", "annual_yoy", "25", True),
+                growth_result("00126380", "operating_income", "quarterly_yoy", "21", True),
                 growth_result("00434003", "revenue", "annual_yoy", "30", True),
+                growth_result("00434003", "operating_income", "quarterly_yoy", "19", False),
             ],
             [
                 valuation(
@@ -105,13 +108,30 @@ class RankingTests(unittest.TestCase):
                     market="KOSPI",
                 ),
             ],
+            growth_conditions=[
+                "annual_yoy:revenue",
+                "quarterly_yoy:operating_income",
+            ],
+            include_failed_growth=True,
             market="KOSPI",
-            min_roe=Decimal("20"),
-            sort_by="market_cap",
+            sort_by="overall_minimum_growth_rate",
         )
 
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["corp_code"], "00126380")
+        self.assertEqual(rows[0]["matched_growth_condition_count"], 2)
+        self.assertEqual(rows[0]["overall_minimum_growth_rate"], "21")
+        self.assertTrue(rows[0]["passed"])
+        self.assertFalse(rows[1]["passed"])
+        self.assertEqual(len(rows[0]["growth_checks"]), 2)
+
+    def test_normalize_growth_conditions_uses_default_when_empty(self) -> None:
+        conditions = normalize_growth_conditions()
+
+        self.assertEqual(
+            conditions,
+            [{"metric": "revenue", "series_type": "annual_yoy"}],
+        )
 
     def test_read_and_write_ranking_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

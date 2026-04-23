@@ -177,6 +177,66 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["growth_rankings"][0]["corp_code"], "00126380")
         self.assertEqual(payload["valuation_rankings"][0]["rank_value"], "22")
 
+    def test_rank_companies_command_accepts_repeated_growth_conditions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            growth_path = Path(directory) / "growth.json"
+            output_path = Path(directory) / "rankings.json"
+            growth_path.write_text(
+                json.dumps(
+                    {
+                        "filter": {
+                            "results": [
+                                {
+                                    "corp_code": "00126380",
+                                    "metric": "revenue",
+                                    "series_type": "annual_yoy",
+                                    "recent_periods": 3,
+                                    "minimum_growth_rate": "25",
+                                    "passed": True,
+                                },
+                                {
+                                    "corp_code": "00126380",
+                                    "metric": "operating_income",
+                                    "series_type": "quarterly_yoy",
+                                    "recent_periods": 12,
+                                    "minimum_growth_rate": "21",
+                                    "passed": True,
+                                },
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            main(
+                [
+                    "rank-companies",
+                    "--growth-input",
+                    str(growth_path),
+                    "--output",
+                    str(output_path),
+                    "--growth-condition",
+                    "annual_yoy:revenue",
+                    "--growth-condition",
+                    "quarterly_yoy:operating_income",
+                ]
+            )
+
+            payload = json.loads(output_path.read_text("utf-8"))
+
+        self.assertEqual(
+            payload["filters"]["growth_conditions"],
+            [
+                {"metric": "revenue", "series_type": "annual_yoy"},
+                {"metric": "operating_income", "series_type": "quarterly_yoy"},
+            ],
+        )
+        self.assertEqual(
+            payload["screening_rows"][0]["matched_growth_condition_count"],
+            2,
+        )
+
     def test_collect_analysis_command_writes_pipeline_outputs(self) -> None:
         original_client = cli.OpenDartClient
         cli.OpenDartClient = FakeOpenDartClient

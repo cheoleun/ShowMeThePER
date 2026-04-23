@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 import json
 import sqlite3
 from decimal import Decimal, InvalidOperation
@@ -14,11 +15,13 @@ from .pipeline import AnalysisArtifacts, CollectionError
 from .rankings import (
     ValuationSnapshot,
     build_screening_rows,
+    normalize_growth_conditions,
     rank_growth_filter_results,
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+COMPANY_MASTER_STALE_DAYS = 7
 
 
 SCHEMA_STATEMENTS = (
@@ -155,6 +158,51 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS company_master_entries (
+        corp_code TEXT PRIMARY KEY,
+        corp_name TEXT NOT NULL,
+        stock_code TEXT NOT NULL,
+        market TEXT NOT NULL,
+        item_name TEXT NOT NULL,
+        modify_date TEXT NOT NULL,
+        matched_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS refresh_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT NOT NULL,
+        fs_div TEXT NOT NULL,
+        year_from INTEGER NOT NULL,
+        year_to INTEGER NOT NULL,
+        batch_size INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        total_companies INTEGER NOT NULL,
+        completed_companies INTEGER NOT NULL DEFAULT 0,
+        failed_companies INTEGER NOT NULL DEFAULT 0,
+        skipped_companies INTEGER NOT NULL DEFAULT 0,
+        last_processed_corp_code TEXT NOT NULL DEFAULT '',
+        last_processed_corp_name TEXT NOT NULL DEFAULT '',
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS refresh_job_items (
+        job_id INTEGER NOT NULL,
+        corp_code TEXT NOT NULL,
+        corp_name TEXT NOT NULL,
+        stock_code TEXT NOT NULL,
+        market TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, corp_code)
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_financial_rows_corp_year
     ON financial_statement_rows (corp_code, business_year)
     """,
@@ -173,6 +221,18 @@ SCHEMA_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS idx_valuation_snapshots_stock_code
     ON valuation_snapshots (stock_code, base_date DESC, fetched_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_company_master_entries_market
+    ON company_master_entries (market, corp_name)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_refresh_jobs_updated_at
+    ON refresh_jobs (updated_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_refresh_job_items_status
+    ON refresh_job_items (job_id, status, updated_at ASC)
     """,
 )
 
@@ -528,6 +588,515 @@ def store_valuation_snapshot(
                 snapshot.fetched_at or "",
             ),
         )
+
+
+def store_company_master_entries(
+    database_path: Path,
+    entries: Iterable[dict[str, object]],
+) -> dict[str, object]:
+    initialize_database(database_path)
+    matched_at = _utc_now_text()
+    normalized_entries = [
+        {
+            "corp_code": str(entry.get("corp_code", "")).strip(),
+            "corp_name": str(entry.get("corp_name", "")).strip(),
+            "stock_code": str(entry.get("stock_code", "")).strip(),
+            "market": str(entry.get("market", "")).strip().upper(),
+            "item_name": str(entry.get("item_name", "")).strip(),
+            "modify_date": str(entry.get("modify_date", "")).strip(),
+            "matched_at": str(entry.get("matched_at", "")).strip() or matched_at,
+        }
+        for entry in entries
+        if str(entry.get("corp_code", "")).strip()
+    ]
+
+    with sqlite3.connect(database_path) as connection:
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO company_master_entries (
+                corp_code,
+                corp_name,
+                stock_code,
+                market,
+                item_name,
+                modify_date,
+                matched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    entry["corp_code"],
+                    entry["corp_name"],
+                    entry["stock_code"],
+                    entry["market"],
+                    entry["item_name"],
+                    entry["modify_date"],
+                    entry["matched_at"],
+                )
+                for entry in normalized_entries
+            ],
+        )
+
+    return read_company_master_status(database_path)
+
+
+def read_company_master_entries(
+    database_path: Path,
+    *,
+    market: str | None = None,
+) -> list[dict[str, str]]:
+    initialize_database(database_path)
+    clauses: list[str] = []
+    params: list[object] = []
+    normalized_market = (market or "").strip().upper()
+    if normalized_market:
+        clauses.append("market = ?")
+        params.append(normalized_market)
+
+    query = """
+        SELECT
+            corp_code,
+            corp_name,
+            stock_code,
+            market,
+            item_name,
+            modify_date,
+            matched_at
+        FROM company_master_entries
+    """
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY corp_name ASC, corp_code ASC"
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(query, params).fetchall()
+
+    return [
+        {
+            "corp_code": row[0],
+            "corp_name": row[1],
+            "stock_code": row[2],
+            "market": row[3],
+            "item_name": row[4],
+            "modify_date": row[5],
+            "matched_at": row[6],
+        }
+        for row in rows
+    ]
+
+
+def read_company_master_status(
+    database_path: Path,
+    *,
+    today: date | None = None,
+) -> dict[str, object]:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*), MAX(matched_at)
+            FROM company_master_entries
+            """
+        ).fetchone()
+
+    count = int(row[0] or 0)
+    last_synced_at = str(row[1] or "")
+    stale = True
+    if count > 0 and last_synced_at:
+        stale = _is_timestamp_stale(
+            last_synced_at,
+            days=COMPANY_MASTER_STALE_DAYS,
+            today=today,
+        )
+    return {
+        "count": count,
+        "last_synced_at": last_synced_at,
+        "is_stale": stale if count > 0 else True,
+    }
+
+
+def create_refresh_job(
+    database_path: Path,
+    *,
+    scope: str,
+    fs_div: str,
+    year_from: int,
+    year_to: int,
+    batch_size: int,
+    companies: Iterable[dict[str, object]],
+    status: str = "running",
+) -> dict[str, object]:
+    initialize_database(database_path)
+    normalized_companies = [
+        {
+            "corp_code": str(company.get("corp_code", "")).strip(),
+            "corp_name": str(company.get("corp_name", "")).strip(),
+            "stock_code": str(company.get("stock_code", "")).strip(),
+            "market": str(company.get("market", "")).strip().upper(),
+        }
+        for company in companies
+        if str(company.get("corp_code", "")).strip()
+    ]
+    if not normalized_companies:
+        raise ValueError("no companies available for the refresh job")
+
+    timestamp = _utc_now_text()
+    with sqlite3.connect(database_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO refresh_jobs (
+                scope,
+                fs_div,
+                year_from,
+                year_to,
+                batch_size,
+                status,
+                total_companies,
+                completed_companies,
+                failed_companies,
+                skipped_companies,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)
+            """,
+            (
+                scope,
+                fs_div,
+                year_from,
+                year_to,
+                batch_size,
+                status,
+                len(normalized_companies),
+                timestamp,
+                timestamp,
+            ),
+        )
+        job_id = int(cursor.lastrowid)
+        connection.executemany(
+            """
+            INSERT INTO refresh_job_items (
+                job_id,
+                corp_code,
+                corp_name,
+                stock_code,
+                market,
+                status,
+                attempt_count,
+                last_error,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 0, '', ?)
+            """,
+            [
+                (
+                    job_id,
+                    company["corp_code"],
+                    company["corp_name"],
+                    company["stock_code"],
+                    company["market"],
+                    timestamp,
+                )
+                for company in normalized_companies
+            ],
+        )
+
+    return read_refresh_job(database_path, job_id=job_id) or {}
+
+
+def read_refresh_job(
+    database_path: Path,
+    *,
+    job_id: int,
+) -> dict[str, object] | None:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                id,
+                scope,
+                fs_div,
+                year_from,
+                year_to,
+                batch_size,
+                status,
+                total_companies,
+                completed_companies,
+                failed_companies,
+                skipped_companies,
+                last_processed_corp_code,
+                last_processed_corp_name,
+                last_error,
+                created_at,
+                updated_at
+            FROM refresh_jobs
+            WHERE id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        item_counts = connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END)
+            FROM refresh_job_items
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        recent_item = connection.execute(
+            """
+            SELECT corp_name, corp_code, last_error, status
+            FROM refresh_job_items
+            WHERE job_id = ?
+            ORDER BY updated_at DESC, corp_code ASC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+
+    pending_count = int(item_counts[0] or 0)
+    success_count = int(item_counts[1] or 0)
+    failed_count = int(item_counts[2] or 0)
+    skipped_count = int(item_counts[3] or 0)
+    total_count = int(row[7] or 0)
+    remaining_count = max(
+        total_count - success_count - failed_count - skipped_count,
+        0,
+    )
+
+    return {
+        "id": int(row[0]),
+        "scope": row[1],
+        "fs_div": row[2],
+        "year_from": int(row[3]),
+        "year_to": int(row[4]),
+        "batch_size": int(row[5]),
+        "status": row[6],
+        "total_companies": total_count,
+        "completed_companies": success_count,
+        "failed_companies": failed_count,
+        "skipped_companies": skipped_count,
+        "pending_companies": pending_count,
+        "remaining_companies": remaining_count,
+        "last_processed_corp_code": row[11],
+        "last_processed_corp_name": row[12],
+        "last_error": row[13],
+        "created_at": row[14],
+        "updated_at": row[15],
+        "recent_item": (
+            None
+            if recent_item is None
+            else {
+                "corp_name": recent_item[0],
+                "corp_code": recent_item[1],
+                "last_error": recent_item[2],
+                "status": recent_item[3],
+            }
+        ),
+    }
+
+
+def read_latest_refresh_job(database_path: Path) -> dict[str, object] | None:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT id
+            FROM refresh_jobs
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    if row is None:
+        return None
+    return read_refresh_job(database_path, job_id=int(row[0]))
+
+
+def read_refresh_job_items(
+    database_path: Path,
+    *,
+    job_id: int,
+    statuses: Iterable[str] | None = None,
+    limit: int | None = None,
+) -> list[dict[str, object]]:
+    initialize_database(database_path)
+    clauses = ["job_id = ?"]
+    params: list[object] = [job_id]
+    status_values = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+    if status_values:
+        placeholders = ", ".join("?" for _ in status_values)
+        clauses.append(f"status IN ({placeholders})")
+        params.extend(status_values)
+
+    query = """
+        SELECT
+            job_id,
+            corp_code,
+            corp_name,
+            stock_code,
+            market,
+            status,
+            attempt_count,
+            last_error,
+            updated_at
+        FROM refresh_job_items
+        WHERE
+    """ + " AND ".join(clauses) + " ORDER BY updated_at ASC, corp_code ASC"
+    if limit is not None:
+        query += f" LIMIT {int(limit)}"
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(query, params).fetchall()
+
+    return [
+        {
+            "job_id": int(row[0]),
+            "corp_code": row[1],
+            "corp_name": row[2],
+            "stock_code": row[3],
+            "market": row[4],
+            "status": row[5],
+            "attempt_count": int(row[6] or 0),
+            "last_error": row[7],
+            "updated_at": row[8],
+        }
+        for row in rows
+    ]
+
+
+def update_refresh_job_status(
+    database_path: Path,
+    *,
+    job_id: int,
+    status: str,
+    last_error: str | None = None,
+) -> dict[str, object] | None:
+    initialize_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE refresh_jobs
+            SET status = ?,
+                last_error = CASE
+                    WHEN ? IS NULL THEN last_error
+                    ELSE ?
+                END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (status, last_error, last_error or "", _utc_now_text(), job_id),
+        )
+    return read_refresh_job(database_path, job_id=job_id)
+
+
+def record_refresh_job_item_result(
+    database_path: Path,
+    *,
+    job_id: int,
+    corp_code: str,
+    corp_name: str,
+    status: str,
+    last_error: str = "",
+) -> dict[str, object] | None:
+    initialize_database(database_path)
+    timestamp = _utc_now_text()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE refresh_job_items
+            SET status = ?,
+                attempt_count = attempt_count + 1,
+                last_error = ?,
+                updated_at = ?
+            WHERE job_id = ? AND corp_code = ?
+            """,
+            (status, last_error, timestamp, job_id, corp_code),
+        )
+        counts = connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)
+            FROM refresh_job_items
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+
+        success_count = int(counts[0] or 0)
+        failed_count = int(counts[1] or 0)
+        skipped_count = int(counts[2] or 0)
+        pending_count = int(counts[3] or 0)
+
+        job_status = "running"
+        if pending_count == 0:
+            job_status = "failed" if failed_count > 0 else "completed"
+
+        connection.execute(
+            """
+            UPDATE refresh_jobs
+            SET status = ?,
+                completed_companies = ?,
+                failed_companies = ?,
+                skipped_companies = ?,
+                last_processed_corp_code = ?,
+                last_processed_corp_name = ?,
+                last_error = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                job_status,
+                success_count,
+                failed_count,
+                skipped_count,
+                corp_code,
+                corp_name,
+                last_error,
+                timestamp,
+                job_id,
+            ),
+        )
+
+    return read_refresh_job(database_path, job_id=job_id)
+
+
+def retry_failed_refresh_job_items(
+    database_path: Path,
+    *,
+    job_id: int,
+) -> dict[str, object] | None:
+    initialize_database(database_path)
+    timestamp = _utc_now_text()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE refresh_job_items
+            SET status = 'pending',
+                last_error = '',
+                updated_at = ?
+            WHERE job_id = ? AND status = 'failed'
+            """,
+            (timestamp, job_id),
+        )
+        connection.execute(
+            """
+            UPDATE refresh_jobs
+            SET status = 'running',
+                last_error = '',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, job_id),
+        )
+    return read_refresh_job(database_path, job_id=job_id)
 
 
 def read_financial_statement_rows_from_database(
@@ -908,21 +1477,29 @@ def read_growth_filter_results_from_database(
 def build_database_growth_ranking_payload(
     database_path: Path,
     *,
+    growth_conditions: Iterable[dict[str, object] | str] | None = None,
     growth_metric: str | None = None,
     growth_series_type: str | None = None,
     include_failed_growth: bool = False,
     limit: int | None = None,
 ) -> dict[str, object]:
+    initialize_database(database_path)
+    normalized_conditions = normalize_growth_conditions(
+        growth_conditions,
+        growth_metric=growth_metric,
+        growth_series_type=growth_series_type,
+    )
+    primary_condition = normalized_conditions[0]
     filter_results = read_growth_filter_results_from_database(
         database_path,
-        metric=growth_metric,
-        series_type=growth_series_type,
+        metric=primary_condition["metric"],
+        series_type=primary_condition["series_type"],
         passed=None if include_failed_growth else True,
     )
     rankings = rank_growth_filter_results(
         filter_results,
-        metric=growth_metric,
-        series_type=growth_series_type,
+        metric=primary_condition["metric"],
+        series_type=primary_condition["series_type"],
         include_failed=include_failed_growth,
     )
     if limit is not None:
@@ -944,8 +1521,9 @@ def build_database_growth_ranking_payload(
             "growth_rankings": len(enriched_rankings),
         },
         "filters": {
-            "growth_metric": growth_metric,
-            "growth_series_type": growth_series_type,
+            "growth_conditions": normalized_conditions,
+            "growth_metric": primary_condition["metric"],
+            "growth_series_type": primary_condition["series_type"],
             "include_failed_growth": include_failed_growth,
             "limit": limit,
         },
@@ -959,6 +1537,7 @@ def build_database_company_screening_payload(
     start_year: int,
     end_year: int,
     fs_div: str | None = None,
+    growth_conditions: Iterable[dict[str, object] | str] | None = None,
     growth_metric: str | None = None,
     growth_series_type: str | None = None,
     include_failed_growth: bool = False,
@@ -971,12 +1550,18 @@ def build_database_company_screening_payload(
     market: str | None = None,
     sort_by: str = "market_cap",
 ) -> dict[str, object]:
+    initialize_database(database_path)
     calculation_start_year = max(0, start_year - 1)
     values = [
         value
         for value in read_financial_period_values_from_database(database_path)
         if calculation_start_year <= value.fiscal_year <= end_year
     ]
+    normalized_conditions = normalize_growth_conditions(
+        growth_conditions,
+        growth_metric=growth_metric,
+        growth_series_type=growth_series_type,
+    )
     growth_payload = build_growth_metrics_payload(
         values,
         threshold_percent=threshold_percent,
@@ -1004,12 +1589,8 @@ def build_database_company_screening_payload(
         valuation_snapshots,
         company_index=company_index,
         price_index=price_index,
-        growth_metric=growth_metric,
-        growth_series_type=growth_series_type,
+        growth_conditions=normalized_conditions,
         include_failed_growth=include_failed_growth,
-        max_per=max_per,
-        max_pbr=max_pbr,
-        min_roe=min_roe,
         market=market,
         sort_by=sort_by,
     )
@@ -1025,15 +1606,13 @@ def build_database_company_screening_payload(
         },
         "filters": {
             "fs_div": fs_div,
-            "growth_metric": growth_metric,
-            "growth_series_type": growth_series_type,
+            "growth_conditions": normalized_conditions,
+            "growth_metric": normalized_conditions[0]["metric"],
+            "growth_series_type": normalized_conditions[0]["series_type"],
             "include_failed_growth": include_failed_growth,
             "threshold_percent": str(threshold_percent),
             "recent_annual_periods": recent_annual_periods,
             "recent_quarterly_periods": recent_quarterly_periods,
-            "max_per": _decimal_to_text(max_per),
-            "max_pbr": _decimal_to_text(max_pbr),
-            "min_roe": _decimal_to_text(min_roe),
             "market": (market or "").strip().upper(),
             "sort_by": sort_by,
         },
@@ -1053,13 +1632,25 @@ def read_company_profile_from_database(
 
 
 def read_dart_companies_from_database(database_path: Path) -> list[DartCompany]:
+    company_master_entries = read_company_master_entries(database_path)
+    if company_master_entries:
+        return [
+            DartCompany(
+                corp_code=str(entry.get("corp_code", "")),
+                corp_name=str(entry.get("corp_name", "")),
+                stock_code=str(entry.get("stock_code", "")),
+                modify_date=str(entry.get("modify_date", "")),
+            )
+            for entry in company_master_entries
+        ]
+
     company_index = _read_company_index(database_path)
     return [
         DartCompany(
             corp_code=corp_code,
             corp_name=profile.get("corp_name", ""),
             stock_code=profile.get("stock_code", ""),
-            modify_date="",
+            modify_date=profile.get("modify_date", ""),
         )
         for corp_code, profile in sorted(
             company_index.items(),
@@ -1100,11 +1691,24 @@ def summarize_database(database_path: Path) -> dict[str, int]:
                 connection,
                 "valuation_snapshots",
             ),
+            "company_master_entries": _table_count(
+                connection,
+                "company_master_entries",
+            ),
+            "refresh_jobs": _table_count(connection, "refresh_jobs"),
+            "refresh_job_items": _table_count(connection, "refresh_job_items"),
         }
 
 
 def _read_company_index(database_path: Path) -> dict[str, dict[str, str]]:
     with sqlite3.connect(database_path) as connection:
+        master_rows = connection.execute(
+            """
+            SELECT corp_code, corp_name, stock_code, market, item_name, modify_date
+            FROM company_master_entries
+            ORDER BY corp_code ASC
+            """
+        ).fetchall()
         rows = connection.execute(
             """
             SELECT corp_code, corp_name, stock_code
@@ -1114,14 +1718,23 @@ def _read_company_index(database_path: Path) -> dict[str, dict[str, str]]:
         ).fetchall()
 
     companies: dict[str, dict[str, str]] = {}
-    for corp_code, corp_name, stock_code in rows:
+    for corp_code, corp_name, stock_code, market, item_name, modify_date in master_rows:
         companies.setdefault(
             corp_code,
             {
                 "corp_name": corp_name,
                 "stock_code": stock_code,
+                "market": market,
+                "item_name": item_name,
+                "modify_date": modify_date,
             },
         )
+    for corp_code, corp_name, stock_code in rows:
+        profile = companies.setdefault(corp_code, {})
+        if not profile.get("corp_name"):
+            profile["corp_name"] = corp_name
+        if not profile.get("stock_code"):
+            profile["stock_code"] = stock_code
     return companies
 
 
@@ -1234,3 +1847,25 @@ def _optional_text(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _utc_now_text() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _is_timestamp_stale(
+    value: str,
+    *,
+    days: int,
+    today: date | None = None,
+) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    normalized = text[:-1] if text.endswith("Z") else text
+    try:
+        timestamp = datetime.fromisoformat(normalized)
+    except ValueError:
+        return True
+    current = today or date.today()
+    return timestamp.date() < (current - timedelta(days=days))

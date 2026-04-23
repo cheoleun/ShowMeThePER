@@ -15,15 +15,23 @@ from show_me_the_per.pipeline import (
 from show_me_the_per.storage import (
     build_database_company_screening_payload,
     build_database_growth_ranking_payload,
+    create_refresh_job,
     read_dart_companies_from_database,
+    read_company_master_entries,
+    read_company_master_status,
     read_financial_statement_rows_from_database,
     read_latest_equity_price_snapshot,
     read_latest_valuation_snapshot,
     read_financial_period_values_from_database,
+    read_refresh_job,
+    read_refresh_job_items,
     read_growth_filter_results_from_database,
     read_growth_points_from_database,
+    record_refresh_job_item_result,
+    retry_failed_refresh_job_items,
     store_analysis_artifacts,
     store_analysis_directory,
+    store_company_master_entries,
     store_equity_price_snapshot,
     store_valuation_snapshot,
     summarize_database,
@@ -139,6 +147,89 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(companies[0].corp_name, "Samsung Electronics")
         self.assertEqual({company.stock_code for company in companies}, {"005930", "000660"})
 
+    def test_store_company_master_entries_and_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            summary = store_company_master_entries(
+                database_path,
+                [
+                    {
+                        "corp_code": "00126380",
+                        "corp_name": "Samsung Electronics",
+                        "stock_code": "005930",
+                        "market": "KOSPI",
+                        "item_name": "Samsung Electronics",
+                        "modify_date": "20260422",
+                    },
+                    {
+                        "corp_code": "00888888",
+                        "corp_name": "Vinatac",
+                        "stock_code": "126340",
+                        "market": "KOSDAQ",
+                        "item_name": "Vinatac",
+                        "modify_date": "20260422",
+                    },
+                ],
+            )
+            entries = read_company_master_entries(database_path, market="KOSDAQ")
+            status = read_company_master_status(database_path)
+
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["corp_code"], "00888888")
+        self.assertEqual(status["count"], 2)
+        self.assertFalse(status["is_stale"])
+
+    def test_create_refresh_job_and_retry_failed_items(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "analysis.sqlite3"
+            job = create_refresh_job(
+                database_path,
+                scope="ALL",
+                fs_div="CFS",
+                year_from=2016,
+                year_to=2025,
+                batch_size=25,
+                companies=[
+                    {
+                        "corp_code": "00126380",
+                        "corp_name": "Samsung Electronics",
+                        "stock_code": "005930",
+                        "market": "KOSPI",
+                    },
+                    {
+                        "corp_code": "00888888",
+                        "corp_name": "Vinatac",
+                        "stock_code": "126340",
+                        "market": "KOSDAQ",
+                    },
+                ],
+            )
+            pending_items = read_refresh_job_items(
+                database_path,
+                job_id=int(job["id"]),
+                statuses=["pending"],
+                limit=1,
+            )
+            record_refresh_job_item_result(
+                database_path,
+                job_id=int(job["id"]),
+                corp_code="00126380",
+                corp_name="Samsung Electronics",
+                status="failed",
+                last_error="temporary failure",
+            )
+            retried = retry_failed_refresh_job_items(
+                database_path,
+                job_id=int(job["id"]),
+            )
+            refreshed = read_refresh_job(database_path, job_id=int(job["id"]))
+
+        self.assertEqual(len(pending_items), 1)
+        self.assertEqual(pending_items[0]["corp_code"], "00126380")
+        self.assertEqual(retried["status"], "running")
+        self.assertEqual(refreshed["pending_companies"], 2)
+
     def test_store_and_read_latest_equity_price_snapshot(self) -> None:
         snapshot_old = KrxStockPriceSnapshot(
             base_date="20260418",
@@ -244,6 +335,9 @@ class StorageTests(unittest.TestCase):
                 "collection_errors": 0,
                 "equity_price_snapshots": 0,
                 "valuation_snapshots": 0,
+                "company_master_entries": 0,
+                "refresh_jobs": 0,
+                "refresh_job_items": 0,
             },
         )
 
