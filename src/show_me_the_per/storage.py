@@ -870,6 +870,16 @@ def read_refresh_job(
             """,
             (job_id,),
         ).fetchone()
+        next_pending_item = connection.execute(
+            """
+            SELECT corp_name, corp_code
+            FROM refresh_job_items
+            WHERE job_id = ? AND status = 'pending'
+            ORDER BY updated_at ASC, corp_code ASC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
 
     pending_count = int(item_counts[0] or 0)
     success_count = int(item_counts[1] or 0)
@@ -879,6 +889,10 @@ def read_refresh_job(
     remaining_count = max(
         total_count - success_count - failed_count - skipped_count,
         0,
+    )
+    batch_size = max(int(row[5] or 0), 1)
+    estimated_remaining_batches = (
+        (remaining_count + batch_size - 1) // batch_size if remaining_count else 0
     )
 
     return {
@@ -895,11 +909,22 @@ def read_refresh_job(
         "skipped_companies": skipped_count,
         "pending_companies": pending_count,
         "remaining_companies": remaining_count,
+        "estimated_remaining_batches": estimated_remaining_batches,
         "last_processed_corp_code": row[11],
         "last_processed_corp_name": row[12],
         "last_error": row[13],
         "created_at": row[14],
         "updated_at": row[15],
+        "next_pending_corp_name": (
+            ""
+            if next_pending_item is None
+            else str(next_pending_item[0] or "")
+        ),
+        "next_pending_corp_code": (
+            ""
+            if next_pending_item is None
+            else str(next_pending_item[1] or "")
+        ),
         "recent_item": (
             None
             if recent_item is None

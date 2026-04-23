@@ -1077,12 +1077,13 @@ class WebTests(TestCase):
         self.assertEqual(response.json()["status"], "requires_company_sync")
 
     def test_ranking_company_master_sync_and_job_lifecycle(self) -> None:
+        RecordingKrxListingClient.called_base_dates = []
         client = TestClient(
             create_app(
                 FakeOpenDartClient,
                 FakeKrxStockPriceClient,
                 FakeNaverFinanceClient,
-                FakeKrxListingClient,
+                RecordingKrxListingClient,
             )
         )
 
@@ -1141,14 +1142,24 @@ class WebTests(TestCase):
 
         self.assertEqual(sync_response.status_code, 200)
         self.assertEqual(sync_response.json()["company_master_status"]["count"], 2)
+        self.assertTrue(sync_response.json()["krx_base_date"])
+        self.assertEqual(sync_response.json()["krx_listing_count"], 2)
+        self.assertEqual(sync_response.json()["dart_company_count"], 2)
+        self.assertEqual(
+            sync_response.json()["krx_base_date"],
+            RecordingKrxListingClient.called_base_dates[0],
+        )
         self.assertEqual(len(entries), 2)
         self.assertEqual(create_response.status_code, 200)
         self.assertEqual(create_response.json()["job"]["total_companies"], 2)
+        self.assertEqual(create_response.json()["job"]["estimated_remaining_batches"], 1)
+        self.assertEqual(create_response.json()["job"]["next_pending_corp_name"], "Samsung Electronics")
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(status_response.json()["job"]["status"], "running")
         self.assertEqual(batch_response.status_code, 200)
         self.assertEqual(batch_response.json()["job"]["completed_companies"], 2)
         self.assertEqual(batch_response.json()["job"]["remaining_companies"], 0)
+        self.assertEqual(batch_response.json()["job"]["estimated_remaining_batches"], 0)
         self.assertEqual(len(success_items), 2)
         self.assertEqual(pause_response.status_code, 200)
         self.assertEqual(pause_response.json()["job"]["status"], "paused")
@@ -1574,7 +1585,12 @@ class FakeKrxListingClient:
     def __init__(self, service_key: str) -> None:
         self.service_key = service_key
 
-    def fetch_listings(self) -> list[KrxListing]:
+    def fetch_listings(
+        self,
+        base_date: str | None = None,
+        page_size: int = 1000,
+        max_pages: int | None = None,
+    ) -> list[KrxListing]:
         return [
             KrxListing(
                 base_date="20260422",
@@ -1597,11 +1613,33 @@ class FakeKrxListingClient:
         ]
 
 
+class RecordingKrxListingClient(FakeKrxListingClient):
+    called_base_dates: list[str | None] = []
+
+    def fetch_listings(
+        self,
+        base_date: str | None = None,
+        page_size: int = 1000,
+        max_pages: int | None = None,
+    ) -> list[KrxListing]:
+        type(self).called_base_dates.append(base_date)
+        return super().fetch_listings(
+            base_date=base_date,
+            page_size=page_size,
+            max_pages=max_pages,
+        )
+
+
 class ForbiddenKrxListingClient:
     def __init__(self, service_key: str) -> None:
         self.service_key = service_key
 
-    def fetch_listings(self) -> list[KrxListing]:
+    def fetch_listings(
+        self,
+        base_date: str | None = None,
+        page_size: int = 1000,
+        max_pages: int | None = None,
+    ) -> list[KrxListing]:
         raise KrxApiError(
             "KRX 회사 목록 조회가 403으로 거부되었습니다. "
             "KRX_SERVICE_KEY 값이 올바른지, 공공데이터포털 활용신청/승인이 완료됐는지, "

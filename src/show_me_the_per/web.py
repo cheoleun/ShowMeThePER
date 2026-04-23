@@ -5798,13 +5798,24 @@ def render_refresh_job_status_summary(job: dict[str, object]) -> str:
         return (
             '<span class="inline-pill inline-pill-muted">진행 중인 작업 없음</span>'
         )
+    recent_item = _dict(job.get("recent_item"))
+    recent_status = str(recent_item.get("status", "") or "")
+    recent_status_label = {
+        "success": "최근 성공",
+        "failed": "최근 실패",
+        "skipped": "최근 건너뜀",
+        "pending": "최근 대기",
+    }.get(recent_status, "최근 상태")
     return "".join(
         [
             f'<span class="inline-pill">전체 {escape(str(job.get("total_companies", 0)))}개</span>',
             f'<span class="inline-pill inline-pill-accent">완료 {escape(str(job.get("completed_companies", 0)))}개</span>',
             f'<span class="inline-pill inline-pill-contrast">실패 {escape(str(job.get("failed_companies", 0)))}개</span>',
             f'<span class="inline-pill">남음 {escape(str(job.get("remaining_companies", 0)))}개</span>',
+            f'<span class="inline-pill">예상 남은 배치 {escape(str(job.get("estimated_remaining_batches", 0)))}개</span>',
+            f'<span class="inline-pill">다음 회사 {escape(str(job.get("next_pending_corp_name", "") or "-"))}</span>',
             f'<span class="inline-pill">최근 회사 {escape(str(job.get("last_processed_corp_name", "") or "-"))}</span>',
+            f'<span class="inline-pill">{escape(recent_status_label)} {escape(str(recent_item.get("corp_name", "") or "-"))}</span>',
             f'<span class="inline-pill">최근 오류 {escape(str(job.get("last_error", "") or "-"))}</span>',
         ]
     )
@@ -5947,6 +5958,8 @@ def render_ranking_job_script(form: RankingForm) -> str:
       let activeJobId = panel.getAttribute("data-job-id") || "";
       let pumpTimer = null;
       let pumpBusy = false;
+      let syncProgressTimer = null;
+      let syncStartedAt = 0;
 
       const escapeHtml = (value) =>
         String(value ?? "")
@@ -5963,12 +5976,23 @@ def render_ranking_job_script(form: RankingForm) -> str:
           summaryNode.innerHTML = '<span class="inline-pill inline-pill-muted">진행 중인 작업 없음</span>';
           return;
         }}
+        const recentItem = job.recent_item || {{}};
+        const recentStatus = recentItem.status || "";
+        const recentStatusLabel = {{
+          success: "최근 성공",
+          failed: "최근 실패",
+          skipped: "최근 건너뜀",
+          pending: "최근 대기",
+        }}[recentStatus] || "최근 상태";
         summaryNode.innerHTML = [
           `<span class="inline-pill">전체 ${{escapeHtml(job.total_companies || 0)}}개</span>`,
           `<span class="inline-pill inline-pill-accent">완료 ${{escapeHtml(job.completed_companies || 0)}}개</span>`,
           `<span class="inline-pill inline-pill-contrast">실패 ${{escapeHtml(job.failed_companies || 0)}}개</span>`,
           `<span class="inline-pill">남음 ${{escapeHtml(job.remaining_companies || 0)}}개</span>`,
+          `<span class="inline-pill">예상 남은 배치 ${{escapeHtml(job.estimated_remaining_batches || 0)}}개</span>`,
+          `<span class="inline-pill">다음 회사 ${{escapeHtml(job.next_pending_corp_name || "-")}}</span>`,
           `<span class="inline-pill">최근 회사 ${{escapeHtml(job.last_processed_corp_name || "-")}}</span>`,
+          `<span class="inline-pill">${{escapeHtml(recentStatusLabel)}} ${{escapeHtml(recentItem.corp_name || "-")}}</span>`,
           `<span class="inline-pill">최근 오류 ${{escapeHtml(job.last_error || "-")}}</span>`
         ].join("");
       }};
@@ -5983,6 +6007,31 @@ def render_ranking_job_script(form: RankingForm) -> str:
         if (diagnosticResultNode) {{
           diagnosticResultNode.textContent = value;
         }}
+      }};
+
+      const stopSyncProgress = () => {{
+        if (syncProgressTimer !== null) {{
+          window.clearInterval(syncProgressTimer);
+          syncProgressTimer = null;
+        }}
+      }};
+
+      const startSyncProgress = () => {{
+        stopSyncProgress();
+        syncStartedAt = Date.now();
+        const updateSyncMessage = () => {{
+          const elapsedSeconds = Math.max(1, Math.floor((Date.now() - syncStartedAt) / 1000));
+          let phase = "1/3 KRX 상장사 목록을 가져오는 중";
+          if (elapsedSeconds >= 4) {{
+            phase = "2/3 OpenDART 기업 목록을 가져오는 중";
+          }}
+          if (elapsedSeconds >= 8) {{
+            phase = "3/3 종목을 매칭하고 DB에 저장하는 중";
+          }}
+          setMessage(`회사 목록 동기화 진행 중... ${{phase}} (${{elapsedSeconds}}초 경과)`);
+        }};
+        updateSyncMessage();
+        syncProgressTimer = window.setInterval(updateSyncMessage, 1000);
       }};
 
       const currentFsDiv = () => (fsDivInput && fsDivInput.value) || "{fs_div}";
@@ -6035,9 +6084,14 @@ def render_ranking_job_script(form: RankingForm) -> str:
             pumpBusy = false;
             return;
           }}
+          setMessage(
+            `배치 업데이트 진행 중... 다음 회사 ${{job.next_pending_corp_name || "-"}} / 예상 남은 배치 ${{job.estimated_remaining_batches || 0}}개`
+          );
           const nextPayload = await callJson(`/ranking/update-jobs/${{activeJobId}}/run-next-batch?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST");
           renderSummary(nextPayload.job);
-          setMessage(`배치 업데이트 진행 중: 완료 ${{nextPayload.job.completed_companies || 0}}개, 실패 ${{nextPayload.job.failed_companies || 0}}개`);
+          setMessage(
+            `배치 업데이트 진행 중: 완료 ${{nextPayload.job.completed_companies || 0}}개, 실패 ${{nextPayload.job.failed_companies || 0}}개, 최근 회사 ${{nextPayload.job.last_processed_corp_name || "-"}}, 예상 남은 배치 ${{nextPayload.job.estimated_remaining_batches || 0}}개`
+          );
           if (nextPayload.job && nextPayload.job.status === "running") {{
             schedulePump();
           }}
@@ -6050,14 +6104,18 @@ def render_ranking_job_script(form: RankingForm) -> str:
 
       if (syncButton) {{
         syncButton.addEventListener("click", async () => {{
-          setMessage("회사 목록을 동기화하고 있습니다...");
+          startSyncProgress();
           try {{
             const payload = await callJson(`/ranking/company-master/sync?fs_div=${{encodeURIComponent(currentFsDiv())}}`, "POST", {{}});
             const summary = payload.company_master_status || {{}};
-            setMessage(`회사 목록 동기화 완료: ${{summary.count || 0}}개`);
+            stopSyncProgress();
+            setMessage(
+              `회사 목록 동기화 완료: ${{summary.count || 0}}개 저장, KRX ${{payload.krx_listing_count || 0}}개 / OpenDART ${{payload.dart_company_count || 0}}개 / 기준일 ${{payload.krx_base_date || "-"}}`
+            );
             activeJobId = "";
             renderSummary(null);
           }} catch (error) {{
+            stopSyncProgress();
             setMessage(String(error.message || error));
           }}
         }});
@@ -6201,7 +6259,15 @@ def _sync_company_master_for_database(
     opendart_client: MajorAccountClient,
     listing_client: ListingClient,
 ) -> dict[str, object]:
-    listings = listing_client.fetch_listings()
+    selected_base_date = ""
+    listings: list[object] = []
+    for candidate_date in _candidate_market_dates(date.today()):
+        listings = listing_client.fetch_listings(base_date=candidate_date)
+        if listings:
+            selected_base_date = candidate_date
+            break
+    if not listings:
+        raise RuntimeError("최근 거래일 기준 KRX 상장사 목록을 가져오지 못했습니다.")
     dart_companies = opendart_client.fetch_companies()
     match_result = match_listings_to_dart(listings, dart_companies)
     dart_index = {company.corp_code: company for company in dart_companies}
@@ -6219,6 +6285,9 @@ def _sync_company_master_for_database(
     company_master_status = store_company_master_entries(database_path, entries)
     return {
         "company_master_status": company_master_status,
+        "krx_base_date": selected_base_date,
+        "krx_listing_count": len(listings),
+        "dart_company_count": len(dart_companies),
         "matched": len(match_result.matched),
         "unmatched": len(match_result.unmatched_listings),
         "ambiguous": len(match_result.ambiguous_matches),

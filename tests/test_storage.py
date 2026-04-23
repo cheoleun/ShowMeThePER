@@ -231,6 +231,8 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(pending_items[0]["corp_code"], "00126380")
         self.assertEqual(retried["status"], "running")
         self.assertEqual(refreshed["pending_companies"], 2)
+        self.assertEqual(refreshed["estimated_remaining_batches"], 1)
+        self.assertEqual(refreshed["next_pending_corp_name"], "Samsung Electronics")
 
     def test_store_and_read_latest_equity_price_snapshot(self) -> None:
         snapshot_old = KrxStockPriceSnapshot(
