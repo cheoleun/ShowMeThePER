@@ -60,7 +60,7 @@ python -m show_me_the_per.cli collect-analysis `
 python -m show_me_the_per.cli web --host 127.0.0.1 --port 8000
 ```
 
-브라우저에서 `http://127.0.0.1:8000`을 열고 기업 이름 `삼성전자`, 조회 연수 `1`, 기준 연도 `2025`, 재무제표 `연결`을 입력합니다. 결과 화면에서 연간 금액, 분기 금액, 성장률 필터 결과, 성장률 차트를 확인합니다.
+브라우저에서 `http://127.0.0.1:8000`을 열고 기업 이름 `삼성전자`, 조회 연수 `1`, 기준 연도 `2025`, 재무제표 `연결`을 입력합니다. 결과 화면의 `재무정보` 탭에서 연간 금액, 분기 금액, 성장률 요약, 차트를 확인합니다.
 
 ## 최근 10년 확인
 
@@ -113,7 +113,7 @@ python -m show_me_the_per.cli database-summary `
   --output data/db-summary.json
 ```
 
-성장률 필터 결과를 DB에서 바로 랭킹으로 조회합니다.
+성장률 필터 결과를 DB 기준으로 바로 확인합니다.
 
 ```powershell
 python -m show_me_the_per.cli rank-growth-from-db `
@@ -123,7 +123,7 @@ python -m show_me_the_per.cli rank-growth-from-db `
   --output data/db-growth-ranking.json
 ```
 
-스모크런처럼 기업 수가 적고 필터를 통과한 기업이 없을 수 있는 경우에는 `--include-failed-growth`를 붙여 전체 결과를 확인합니다.
+스모크런처럼 기업 수가 적고 조건을 통과한 기업이 없을 수 있는 경우에는 `--include-failed-growth`를 붙여 전체 결과를 확인합니다.
 
 ```powershell
 python -m show_me_the_per.cli rank-growth-from-db `
@@ -144,7 +144,7 @@ python -m show_me_the_per.cli company-growth-report `
   --output data/samsung-growth-report.html
 ```
 
-여러 회사를 성장률 조건으로 비교할 때는 HTML 랭킹 리포트를 생성합니다.
+여러 회사를 성장률 조건으로 비교할 때는 HTML 결과 리포트를 생성합니다.
 
 ```powershell
 python -m show_me_the_per.cli growth-ranking-report `
