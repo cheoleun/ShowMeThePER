@@ -1303,12 +1303,14 @@ class WebTests(TestCase):
                     "status_code": 401,
                     "result_code": "99",
                     "result_message": "AUTH ERROR",
+                    "response_preview": '{"error":"bad key"}',
                 },
                 {
                     "name": "stock_price",
                     "status_code": 200,
                     "result_code": "00",
                     "result_message": "NORMAL SERVICE.",
+                    "response_preview": '{"response":{"header":{"resultCode":"00"}}}',
                 },
             ],
         }
@@ -1329,6 +1331,8 @@ class WebTests(TestCase):
         self.assertEqual(response.json()["status"], "ok")
         self.assertIn("회사목록 401", response.json()["message"])
         self.assertIn("시세 200", response.json()["message"])
+        self.assertIn("abcd********wxyz", response.json()["message"])
+        self.assertIn("preview", response.json()["message"])
 
 
 class FakeOpenDartClient:

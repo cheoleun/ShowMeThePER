@@ -485,20 +485,55 @@ def create_app(
         if not service_key:
             return JSONResponse(
                 status_code=400,
-                content={"status": "error", "message": "KRX_SERVICE_KEY가 필요합니다."},
+                content={
+                    "status": "error",
+                    "message": "KRX_SERVICE_KEY가 필요합니다.",
+                },
             )
         diagnostics = diagnose_krx_service(service_key)
         probes = diagnostics.get("probes", [])
         parts: list[str] = []
+        detail_lines: list[str] = [
+            (
+                "서버 KRX 키: "
+                f"{diagnostics.get('service_key_masked') or '-'} "
+                f"(길이 {diagnostics.get('service_key_length') or 0})"
+            )
+        ]
+        status_codes: list[int] = []
         for probe in probes:
             if not isinstance(probe, dict):
                 continue
             probe_name = "회사목록" if probe.get("name") == "company_list" else "시세"
+            status_code = probe.get("status_code")
+            if isinstance(status_code, int):
+                status_codes.append(status_code)
             parts.append(
                 f"{probe_name} {probe.get('status_code') or '-'} "
                 f"({probe.get('result_code') or '-'} {probe.get('result_message') or ''})".strip()
             )
-        message = " | ".join(parts) if parts else "KRX 연결 점검 결과를 확인해 주세요."
+            preview = str(probe.get("response_preview") or "").strip()
+            if len(preview) > 180:
+                preview = preview[:177] + "..."
+            if preview:
+                detail_lines.append(
+                    f"- {probe_name}: HTTP {probe.get('status_code') or '-'} / "
+                    f"result {probe.get('result_code') or '-'} / preview {preview}"
+                )
+            else:
+                detail_lines.append(
+                    f"- {probe_name}: HTTP {probe.get('status_code') or '-'} / "
+                    f"result {probe.get('result_code') or '-'}"
+                )
+        summary = " | ".join(parts) if parts else "KRX 연결 점검 결과를 확인해 주세요."
+        if status_codes and all(code == 401 for code in status_codes):
+            detail_lines.append(
+                "두 API가 모두 401이면 현재 서버 프로세스가 다른 KRX_SERVICE_KEY를 보고 있을 가능성이 큽니다. "
+                "같은 터미널 창에서 KRX_SERVICE_KEY를 다시 설정한 뒤 서버를 재시작해 주세요."
+            )
+        message = summary
+        if detail_lines:
+            message += "\n" + "\n".join(detail_lines)
         return JSONResponse(
             {
                 "status": "ok",
@@ -4854,6 +4889,7 @@ def _page_styles() -> str:
       font-size: 13px;
       color: #2f4259;
       word-break: break-word;
+      white-space: pre-wrap;
     }
     .notice {
       padding: 12px 14px;
