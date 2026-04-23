@@ -1,5 +1,9 @@
 # ShowMeThePER
 
+## Getting Started
+
+- 처음 설치하고 실행하는 방법: [docs/getting-started.md](docs/getting-started.md)
+
 한국 상장기업의 재무제표와 성장률 지표를 수집하고 보여주는 프로젝트입니다.
 
 ## 현재 구현 범위
